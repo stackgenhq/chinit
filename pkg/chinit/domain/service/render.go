@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -152,18 +153,36 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 // reads with nothing in the log pointing at the cause.
 // - static identity → static lists, no warning: every static node
 // is a real machine, so the reserved list IS the member list.
+func isNilLister(l port.LeaseLister) bool {
+	if l == nil {
+		return true
+	}
+	v := reflect.ValueOf(l)
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
+func (b *Boot) usesLeaseInventory() bool {
+	if b.Spec.IdentityMode == model.IdentityLease {
+		return true
+	}
+	return b.Spec.Role == model.RoleBackup && b.Spec.ClaimerTableName != "" && b.Spec.WriterMax > 0
+}
+
 func (b *Boot) clusterHostsWithSource() (hosts []domain.HostIdentity, note string) {
-	if b.Spec.IdentityMode != model.IdentityLease {
+	if !b.usesLeaseInventory() {
 		return staticSpecInventory(b), ""
+	}
+	lister := port.AsLeaseLister(b.Provider)
+	if isNilLister(lister) {
+		if b.Spec.IdentityMode != model.IdentityLease {
+			return staticSpecInventory(b), ""
+		}
+		return staticSpecInventory(b),
+			fmt.Sprintf("WARNING: cloud %s has no lease-listing capability; inventory enumerated from static spec (may include vacant slots)", b.Provider.Name())
 	}
 	table := b.Identity.LeaseTable
 	if table == "" {
 		table = b.Spec.ClaimerTableName
-	}
-	lister := port.AsLeaseLister(b.Provider)
-	if lister == nil {
-		return staticSpecInventory(b),
-			fmt.Sprintf("WARNING: cloud %s has no lease-listing capability; inventory enumerated from static spec (may include vacant slots)", b.Provider.Name())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -488,6 +507,24 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 	return nil
 }
 
+// clickhouseDataDir is the seam for persistent-volume metadata reset tests.
+var clickhouseDataDir = func() string { return "/var/lib/clickhouse" }
+
+func (b *Boot) reconcilePersistentBucketEpoch(ctx context.Context) {
+	reconciler := NewPersistentEpochReconciler(newOSClickHouseDataStore(), func(c context.Context) {
+		_, _ = runCommand(c, "systemctl", "stop", "clickhouse-server")
+	})
+	reconciler.Reconcile(ctx, b.Spec)
+}
+
+// DropDNSCache issues SYSTEM DROP DNS CACHE (best-effort) so ClickHouse's
+// in-memory DNSResolver drops stale peer IPs immediately when /etc/hosts changes.
+func DropDNSCache(ctx context.Context) {
+	if _, err := execAdminQuery(ctx, "SYSTEM DROP DNS CACHE"); err != nil {
+		logger.GetLogger(ctx).Warn("peer-hosts: SYSTEM DROP DNS CACHE failed", "err", err)
+	}
+}
+
 // startClickhouse enables and starts the server, waits for /ping, and
 // verifies the S3 disk is not broken. Keepers return immediately
 // (clickhouse-server on a keeper node is wrong AND fails on
@@ -497,11 +534,13 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 		return nil
 	}
 
+	b.reconcilePersistentBucketEpoch(ctx)
+
 	// First-boot metadata cleanup (UNKNOWN_DISK avoidance): a blank
 	// metadata disk with stale system tables from image-baking wedges
 	// the first start. Skipped on refresh — wiping /var/lib/clickhouse
 	// on a live node would delete the very data the node serves.
-	marker := "/var/lib/clickhouse/first_boot_done"
+	marker := filepath.Join(clickhouseDataDir(), "first_boot_done")
 	if b.Refresh {
 		// fall through to the restart below
 	} else if _, err := os.Stat(marker); os.IsNotExist(err) {
@@ -516,6 +555,10 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 			return err
 		}
 	}
+
+	// Reconcile on-disk .sql storage_policy ('tiered' <-> 'tiered_cas')
+	// BEFORE clickhouse-server starts so persistent disks attach cleanly.
+	reconcileStoragePolicyMetadata(ctx)
 
 	// The golden AMI bakes the distro unit masked (the random-package-uuid
 	// boot race — see the packer template comment): enable silently

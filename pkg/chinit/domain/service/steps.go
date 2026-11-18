@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/port"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/system"
@@ -871,17 +873,16 @@ var chStorePath = func() string { return "/var/lib/clickhouse/store" }
 // ("CAS server-root is owned by a different server").
 func deterministicServerUUID(clusterName, hostname string) string {
 	sum := sha256.Sum256([]byte("chinit-server-uuid:" + clusterName + "/" + hostname))
-	b := sum[:16]
-	b[6] = (b[6] & 0x0f) | 0x50 // version 5
-	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	sum[6] = (sum[6] & 0x0f) | 0x50 // RFC 4122 version 5
+	sum[8] = (sum[8] & 0x3f) | 0x80 // RFC 4122 variant
+	u, err := uuid.FromBytes(sum[:16])
+	if err != nil {
+		return ""
+	}
+	return u.String()
 }
 
-// CAS root identifier. A server-root anchor exists only BEFORE ClickHouse
-// writes its first blob (fresh roots with no data mount cleanly — the
-// 2026-11-18 ch-int-dev roll proved both), so a machine with CH state
-// keeps its existing uuid line and the step only records the divergence.
+// serverRootID derives the node's deterministic CAS server-root identity.
 func (b *Boot) serverRootID() string {
 	cluster := b.Spec.ClusterName
 	if cluster == "" {
@@ -890,54 +891,36 @@ func (b *Boot) serverRootID() string {
 	return deterministicServerUUID(cluster, b.Identity.Hostname)
 }
 
-// adoptServerUUID aligns /var/lib/clickhouse/uuid with the deterministic
-// root id, with adoption semantics that mirror CAS's own claim guard:
-// the uuid line is rewritten ONLY when the machine carries no ClickHouse
-// state (fresh EBS — the exact Code 246 window); a stateful node keeps
-// its existing lineage (its server-root anchor already records the old
-// uuid) and the divergence is journaled instead of silently breaking the
-// mounted identity.
+// adoptServerUUID aligns /var/lib/clickhouse/uuid with the deterministic root
+// id on stateless boots while preserving existing lineage over stateful stores.
 func (b *Boot) adoptServerUUID(ctx context.Context) {
 	if b.Spec == nil || b.Spec.Role == model.RoleKeeper || b.Identity.Hostname == "" {
 		return
 	}
 	uuidFile := serverUUIDPath()
-	current, readErr := os.ReadFile(uuidFile)
-	if readErr == nil {
-		want := b.serverRootID()
+	want := b.serverRootID()
+	if current, err := os.ReadFile(uuidFile); err == nil {
 		got := strings.TrimSpace(string(current))
-		if got == want {
+		if got == want && len(current) == len(want) {
 			return
 		}
-		// CAS adoption guard (ContentAddressedSettings.cpp): a server-root
-		// anchor exists once the pool holds the node's first blob. Over
-		// /var/lib/clickhouse state, the old uuid IS the live anchor match —
-		// replacing it would Code 246 the very next start.
 		if b.statefulNode() {
 			logger.GetLogger(ctx).Warn("server uuid diverges from the deterministic root id; keeping the existing lineage (CAS claims over data would Code 246)",
 				"file", uuidFile, "existing", got, "deterministic", want)
 			return
 		}
 	}
-	identical := readErr == nil && strings.TrimSpace(string(current)) == b.serverRootID()
-	if identical {
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(uuidFile), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(uuidFile), 0o750); err != nil {
 		logger.GetLogger(ctx).Warn("server uuid seeding skipped", "err", err.Error())
 		return
 	}
-	// IMPORTANT: ClickHouse's ServerUUID::load (src/Core/ServerUUID.cpp:44-45)
-	// runs readUUIDText(uuid, in) followed immediately by assertEOF(in). A
-	// trailing '\n' trips Code 27 CANNOT_PARSE_INPUT_ASSERTION_FAILED
-	// ("expected 'eof' before: '\n'") and causes ClickHouse to overwrite the
-	// file with a random UUIDv4. Write the exact 36-byte UUID string.
-	if writeErr := os.WriteFile(uuidFile, []byte(b.serverRootID()), 0640); writeErr != nil {
-		logger.GetLogger(ctx).Warn("server uuid seeding skipped", "err", writeErr.Error())
+	// ClickHouse's ServerUUID::load runs readUUIDText followed by assertEOF, so
+	// a trailing newline triggers Code 27 and resets the file to a random UUIDv4.
+	if err := os.WriteFile(uuidFile, []byte(want), 0o640); err != nil {
+		logger.GetLogger(ctx).Warn("server uuid seeding skipped", "err", err.Error())
 		return
 	}
-	logger.GetLogger(ctx).Info("seeded the deterministic CAS server uuid",
-		"file", uuidFile, "uuid", b.serverRootID())
+	logger.GetLogger(ctx).Info("seeded the deterministic CAS server uuid", "file", uuidFile, "uuid", want)
 	_, _ = runCommand(ctx, "chown", "clickhouse:clickhouse", uuidFile)
 }
 
