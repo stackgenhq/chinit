@@ -78,30 +78,72 @@ variable "keeper_min_type" {
   description = "Keeper ladder floor (a step below is refused)."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.keeper_min_type == "" || length(var.keeper_type_ladder) == 0 || contains(var.keeper_type_ladder, var.keeper_min_type)
+    error_message = "keeper_min_type must appear in keeper_type_ladder when both are set."
+  }
 }
 
 variable "keeper_max_type" {
   description = "Keeper ladder ceiling (a step past is refused — the runaway cap)."
   type        = string
   default     = ""
+
+  validation {
+    condition = (
+      var.keeper_max_type == "" ||
+      length(var.keeper_type_ladder) == 0 ||
+      (
+        contains(var.keeper_type_ladder, var.keeper_max_type) &&
+        (var.keeper_min_type == "" || try(index(var.keeper_type_ladder, var.keeper_min_type) <= index(var.keeper_type_ladder, var.keeper_max_type), false))
+      )
+    )
+    error_message = "keeper_max_type must appear in keeper_type_ladder at or after keeper_min_type."
+  }
 }
 
 variable "writer_type_ladder" {
   description = "Ascending writer instance types for the vertical ladder. Empty = writers do not vertically scale (native ASG horizontal still applies)."
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for t in var.writer_type_ladder :
+      !can(regex("(\\.(nano|micro|small|medium)$|^c[0-9]+[a-z]*\\.large$)", t))
+    ])
+    error_message = "writer_type_ladder entries must provide at least 8 GiB RAM (no *.nano/micro/small/medium or c*.large)."
+  }
 }
 
 variable "writer_min_type" {
   description = "Writer ladder floor."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.writer_min_type == "" || length(var.writer_type_ladder) == 0 || contains(var.writer_type_ladder, var.writer_min_type)
+    error_message = "writer_min_type must appear in writer_type_ladder when both are set."
+  }
 }
 
 variable "writer_max_type" {
   description = "Writer ladder ceiling."
   type        = string
   default     = ""
+
+  validation {
+    condition = (
+      var.writer_max_type == "" ||
+      length(var.writer_type_ladder) == 0 ||
+      (
+        contains(var.writer_type_ladder, var.writer_max_type) &&
+        (var.writer_min_type == "" || try(index(var.writer_type_ladder, var.writer_min_type) <= index(var.writer_type_ladder, var.writer_max_type), false))
+      )
+    )
+    error_message = "writer_max_type must appear in writer_type_ladder at or after writer_min_type."
+  }
 }
 
 variable "writers_asg_name" {

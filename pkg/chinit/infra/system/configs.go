@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -288,6 +289,119 @@ func defaultBackupOverlayXML() string {
 `
 }
 
+// HardwareSizingOverlayXML renders a server-level config.d overlay
+// (z_hardware-sizing.xml) proportional to the host's actual vCPU count
+// and physical RAM.
+//
+// Why: a single cluster CHI spec is shared across heterogeneous roles
+// (e.g. 8-16 vCPU / 64 GiB writers alongside 2-4 vCPU / 8 GiB readers,
+// or writers stepping across a vertical type ladder). Static writer-sized
+// pools (background_pool_size=16) and caches (mark_cache_size=5 GiB) on a
+// 2-vCPU / 4-8 GiB node peg CPU at 100% on background merges and trigger
+// Code 241 OOMs, while clamping chi.yaml down to the smallest node wastes
+// capacity on scaled-up writers.
+//
+// Every <merge_tree> free-entry threshold is scaled strictly below
+// background_pool_size so ClickHouse 26.x never refuses startup with
+// Code 36 when background_pool_size < 20 (the upstream default of
+// number_of_free_entries_in_pool_to_execute_mutation).
+func HardwareSizingOverlayXML(vcpus int, memBytes uint64) string {
+	if vcpus < 1 {
+		vcpus = 2
+	}
+	if memBytes == 0 {
+		memBytes = 8 << 30
+	}
+	bgPool := clampInt(vcpus*2, 4, 32)
+	concurrencyRatio := 4
+	if vcpus <= 2 {
+		concurrencyRatio = 2
+	}
+	movePool := clampInt(vcpus, 2, 8)
+	schedulePool := clampInt(vcpus*2, 8, 16)
+	freeEntries := clampInt(bgPool/2, 1, 20)
+
+	markCache := clampUint64(memBytes*15/100, 512<<20, 8<<30)
+	uncompressedCache := clampUint64(memBytes*5/100, 256<<20, 2<<30)
+
+	return fmt.Sprintf(`<?xml version="1.0"?>
+<clickhouse>
+    <!-- Rendered by chinit for host hardware (%d vCPU, %d MiB RAM) -->
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>%d</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_mutation>%d</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>%d</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+    <background_pool_size>%d</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>%d</background_merges_mutations_concurrency_ratio>
+    <background_move_pool_size>%d</background_move_pool_size>
+    <background_schedule_pool_size>%d</background_schedule_pool_size>
+    <mark_cache_size>%d</mark_cache_size>
+    <uncompressed_cache_size>%d</uncompressed_cache_size>
+</clickhouse>
+`, vcpus, memBytes>>20, freeEntries, freeEntries, freeEntries, bgPool, concurrencyRatio, movePool, schedulePool, markCache, uncompressedCache)
+}
+
+// HardwareProfilesOverlayXML renders a users.d overlay
+// (z_hardware-profiles.xml) sizing external aggregation and sort spill
+// thresholds to the host's physical RAM so queries/backfills spill to
+// disk before hitting max_server_memory_usage_to_ram_ratio (Code 241).
+func HardwareProfilesOverlayXML(memBytes uint64) string {
+	if memBytes == 0 {
+		memBytes = 8 << 30
+	}
+	extGroupBy := clampUint64(memBytes*30/100, 512<<20, 16<<30)
+	extSort := clampUint64(memBytes*20/100, 512<<20, 8<<30)
+	return fmt.Sprintf(`<?xml version="1.0"?>
+<clickhouse>
+    <profiles>
+        <default>
+            <max_bytes_before_external_group_by>%d</max_bytes_before_external_group_by>
+            <max_bytes_before_external_sort>%d</max_bytes_before_external_sort>
+        </default>
+    </profiles>
+</clickhouse>
+`, extGroupBy, extSort)
+}
+
+func readMemTotalBytes() uint64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 8 << 30
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "MemTotal:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if kb, err := strconv.ParseUint(fields[1], 10, 64); err == nil && kb > 0 {
+					return kb * 1024
+				}
+			}
+		}
+	}
+	return 8 << 30
+}
+
+func clampInt(v, minV, maxV int) int {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
+func clampUint64(v, minV, maxV uint64) uint64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
+}
+
 // fileExists reports whether the path names an existing regular file.
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
@@ -391,6 +505,44 @@ func (i *StaticConfigInstaller) Install(ctx context.Context, bundleDir string) e
 		// it here is the same converge-the-drift discipline as the
 		// retiredOverlays block above.
 		_ = os.Remove("/etc/clickhouse-server/config.d/backup-replica-settings.xml")
+	}
+
+	// Hardware-proportional sizing overlays for active serving roles
+	// (writers + readers): lexicographically after chop-generated-*.xml
+	// so each node tunes background merge pools, mark/uncompressed caches,
+	// and external group-by/sort spill thresholds to its own vCPUs and RAM.
+	const hwConfigDest = "/etc/clickhouse-server/config.d/z_hardware-sizing.xml"
+	const hwProfileDest = "/etc/clickhouse-server/users.d/z_hardware-profiles.xml"
+	if i.Role == model.RoleWriter || i.Role == model.RoleReader {
+		vcpus := runtime.NumCPU()
+		memBytes := readMemTotalBytes()
+		hwXML := []byte(HardwareSizingOverlayXML(vcpus, memBytes))
+		if err := ValidateConfigSemantics(hwConfigDest, hwXML); err != nil {
+			return err
+		}
+		if err := os.WriteFile(hwConfigDest, hwXML, 0644); err != nil {
+			return chinitsvc.Fatal(fmt.Errorf("install z_hardware-sizing.xml: %w", err))
+		}
+		if _, err := i.runner.Run(ctx, "chown", "clickhouse:clickhouse", hwConfigDest); err != nil {
+			return fmt.Errorf("chown %s: %w", hwConfigDest, err)
+		}
+
+		profXML := []byte(HardwareProfilesOverlayXML(memBytes))
+		if err := os.MkdirAll(filepath.Dir(hwProfileDest), 0755); err != nil {
+			return chinitsvc.Fatal(fmt.Errorf("create %s: %w", filepath.Dir(hwProfileDest), err))
+		}
+		if err := ValidateConfigSemantics(hwProfileDest, profXML); err != nil {
+			return err
+		}
+		if err := os.WriteFile(hwProfileDest, profXML, 0644); err != nil {
+			return chinitsvc.Fatal(fmt.Errorf("install z_hardware-profiles.xml: %w", err))
+		}
+		if _, err := i.runner.Run(ctx, "chown", "clickhouse:clickhouse", hwProfileDest); err != nil {
+			return fmt.Errorf("chown %s: %w", hwProfileDest, err)
+		}
+	} else {
+		_ = os.Remove(hwConfigDest)
+		_ = os.Remove(hwProfileDest)
 	}
 	return nil
 }

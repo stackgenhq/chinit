@@ -49,6 +49,8 @@ resource "aws_launch_template" "writer" {
       encrypted             = true
       volume_size           = var.metadata_disk_size_gb
       volume_type           = "gp3"
+      iops                  = var.metadata_disk_iops
+      throughput            = var.metadata_disk_throughput_mbps
       delete_on_termination = true
     }
   }
@@ -153,6 +155,8 @@ resource "aws_launch_template" "reader" {
       encrypted             = true
       volume_size           = var.metadata_disk_size_gb
       volume_type           = "gp3"
+      iops                  = var.metadata_disk_iops
+      throughput            = var.metadata_disk_throughput_mbps
       delete_on_termination = true
     }
   }

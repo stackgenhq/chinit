@@ -161,7 +161,7 @@ var _ = Describe("AutoscaleService", func() {
 
 	Context("the keeper coordinator", func() {
 		It("self-resizes one ladder step on a latency breach", func() {
-			signals.keeper = domain.ScaleSignals{KeeperMaxLatencyMs: 900, KeeperOutstanding: 0, KeeperCPUIdlePct: 80}
+			signals.keeper = domain.ScaleSignals{KeeperMaxLatencyMs: 6000, KeeperOutstanding: 0, KeeperCPUIdlePct: 80}
 			svc, err := NewAutoscaleService(signals, resizer, fleet, cool)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -176,7 +176,7 @@ var _ = Describe("AutoscaleService", func() {
 		})
 
 		It("skips when the cooldown is active", func() {
-			signals.keeper = domain.ScaleSignals{KeeperMaxLatencyMs: 900}
+			signals.keeper = domain.ScaleSignals{KeeperMaxLatencyMs: 6000}
 			cool.records["autoscale-keeper"] = time.Now().Add(time.Hour).Unix()
 			svc, err := NewAutoscaleService(signals, resizer, fleet, cool)
 			Expect(err).NotTo(HaveOccurred())
@@ -195,6 +195,33 @@ var _ = Describe("AutoscaleService", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res.Decision.Breach).To(BeFalse())
 			Expect(res.Decision.Action).To(BeEmpty())
+			Expect(resizer.changes).To(BeEmpty())
+		})
+
+		It("self-resizes one ladder step DOWN on sustained idle above floor", func() {
+			signals.keeper = domain.ScaleSignals{KeeperMaxLatencyMs: 10, KeeperOutstanding: 0, KeeperCPUIdlePct: 95}
+			resizer.describe.InstanceType = "t4g.large"
+			svc, _ := NewAutoscaleService(signals, resizer, fleet, cool)
+
+			res, err := svc.Autoscale(context.Background(), keeperRequest())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.Decision.Breach).To(BeFalse())
+			Expect(res.Decision.Action).To(Equal("keeper-self-down"))
+			Expect(res.Decision.From).To(Equal("t4g.large"))
+			Expect(res.Decision.To).To(Equal("t4g.medium"))
+			Expect(resizer.changes).To(HaveLen(1))
+			Expect(cool.records).To(HaveKey("autoscale-keeper"))
+		})
+
+		It("no-ops at the ladder floor on sustained idle", func() {
+			signals.keeper = domain.ScaleSignals{KeeperMaxLatencyMs: 10, KeeperOutstanding: 0, KeeperCPUIdlePct: 95}
+			resizer.describe.InstanceType = "t4g.medium"
+			svc, _ := NewAutoscaleService(signals, resizer, fleet, cool)
+
+			res, err := svc.Autoscale(context.Background(), keeperRequest())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.Decision.Action).To(BeEmpty())
+			Expect(res.Decision.Reason).To(ContainSubstring("at ladder floor"))
 			Expect(resizer.changes).To(BeEmpty())
 		})
 
@@ -244,13 +271,42 @@ var _ = Describe("AutoscaleService", func() {
 			Expect(cool.records).To(HaveKey("autoscale-writer"))
 		})
 
-		It("no-ops when the fleet idle sits above the threshold", func() {
+		It("no-ops when the fleet idle sits within the normal operating band", func() {
 			signals.writer = domain.ScaleSignals{WriterCPUIdlePct: 60}
 			svc, _ := NewAutoscaleService(signals, resizer, fleet, cool)
 
 			res, err := svc.Autoscale(context.Background(), writerRequest())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res.Decision.Action).To(BeEmpty())
+			Expect(fleet.rolls).To(BeEmpty())
+		})
+
+		It("steps the launch template DOWN and rolls the fleet on sustained idle above floor", func() {
+			signals.writer = domain.ScaleSignals{WriterCPUIdlePct: 90}
+			resizer.describe.InstanceType = "t4g.xlarge"
+			svc, _ := NewAutoscaleService(signals, resizer, fleet, cool)
+
+			res, err := svc.Autoscale(context.Background(), writerRequest())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.Skipped).To(BeEmpty())
+			Expect(res.Decision.Action).To(Equal("writer-roll-down"))
+			Expect(res.Decision.From).To(Equal("t4g.xlarge"))
+			Expect(res.Decision.To).To(Equal("t4g.large"))
+			Expect(fleet.created).To(Equal([]string{"t4g.large"}))
+			Expect(fleet.rolls).To(HaveLen(1))
+			Expect(fleet.rolls[0].MinHealthyPercentage).To(Equal(int32(100)))
+			Expect(cool.records).To(HaveKey("autoscale-writer"))
+		})
+
+		It("no-ops when sustained idle hits the ladder floor", func() {
+			signals.writer = domain.ScaleSignals{WriterCPUIdlePct: 92}
+			resizer.describe.InstanceType = "t4g.medium"
+			svc, _ := NewAutoscaleService(signals, resizer, fleet, cool)
+
+			res, err := svc.Autoscale(context.Background(), writerRequest())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.Decision.Action).To(BeEmpty())
+			Expect(res.Decision.Reason).To(ContainSubstring("at ladder floor"))
 			Expect(fleet.rolls).To(BeEmpty())
 		})
 
@@ -298,10 +354,26 @@ var _ = Describe("TypeLadder", func() {
 		Entry("an unknown type never steps (no guessing)", "m8g.2xlarge", "", false),
 	)
 
-	It("answers the ceiling check", func() {
+	It("answers the ceiling and floor checks", func() {
 		Expect(ladder.AtOrAboveMax("t4g.xlarge")).To(BeTrue())
 		Expect(ladder.AtOrAboveMax("t4g.large")).To(BeFalse())
+		Expect(ladder.AtOrBelowMin("t4g.medium")).To(BeTrue())
+		Expect(ladder.AtOrBelowMin("t4g.small")).To(BeTrue())
+		Expect(ladder.AtOrBelowMin("t4g.large")).To(BeFalse())
 	})
+
+	DescribeTable("the bounded step down (Prev)",
+		func(current, wantPrev string, wantOK bool) {
+			prev, ok := ladder.Prev(current)
+			Expect(prev).To(Equal(wantPrev))
+			Expect(ok).To(Equal(wantOK))
+		},
+		Entry("steps xlarge → large", "t4g.xlarge", "t4g.large", true),
+		Entry("steps large → medium", "t4g.large", "t4g.medium", true),
+		Entry("floor: medium refuses to step below Min", "t4g.medium", "", false),
+		Entry("below floor refuses to step further down", "t4g.small", "", false),
+		Entry("an unknown type never steps", "r8g.2xlarge", "", false),
+	)
 
 	It("treats an unset bound as no ceiling", func() {
 		open := domain.TypeLadder{Types: []string{"a", "b", "c"}}
@@ -309,6 +381,11 @@ var _ = Describe("TypeLadder", func() {
 		Expect(ok).To(BeFalse(), "the ladder's end is always the ceiling")
 		_, ok = open.Next("a")
 		Expect(ok).To(BeTrue())
+		_, ok = open.Prev("a")
+		Expect(ok).To(BeFalse(), "the ladder's start is always the floor")
+		prev, ok := open.Prev("c")
+		Expect(ok).To(BeTrue())
+		Expect(prev).To(Equal("b"))
 	})
 })
 
@@ -319,8 +396,8 @@ var _ = Describe("ScaleThresholds", func() {
 		func(s domain.ScaleSignals, want bool) {
 			Expect(t.KeeperBreach(s)).To(Equal(want))
 		},
-		Entry("latency breach", domain.ScaleSignals{KeeperMaxLatencyMs: 500}, true),
-		Entry("latency below (all healthy)", domain.ScaleSignals{KeeperMaxLatencyMs: 499, KeeperOutstanding: 1, KeeperCPUIdlePct: 90}, false),
+		Entry("latency breach (5000ms cumulative max)", domain.ScaleSignals{KeeperMaxLatencyMs: 5000}, true),
+		Entry("latency below (all healthy, including snapshot churn <5s)", domain.ScaleSignals{KeeperMaxLatencyMs: 4999, KeeperOutstanding: 1, KeeperCPUIdlePct: 90}, false),
 		Entry("outstanding breach", domain.ScaleSignals{KeeperOutstanding: 10}, true),
 		Entry("outstanding below (all healthy)", domain.ScaleSignals{KeeperMaxLatencyMs: 12, KeeperOutstanding: 9, KeeperCPUIdlePct: 90}, false),
 		Entry("cpu idle breach (low idle = busy)", domain.ScaleSignals{KeeperCPUIdlePct: 20}, true),
@@ -335,6 +412,15 @@ var _ = Describe("ScaleThresholds", func() {
 		Entry("idle at threshold", 35.0, true),
 		Entry("idle above", 36.0, false),
 		Entry("idle below (saturated)", 5.0, true),
+	)
+
+	DescribeTable("writer idle (scale-down)",
+		func(idle float64, want bool) {
+			Expect(t.WriterIdle(domain.ScaleSignals{WriterCPUIdlePct: idle})).To(Equal(want))
+		},
+		Entry("idle at scale-down threshold (85%)", 85.0, true),
+		Entry("idle above (92%)", 92.0, true),
+		Entry("idle in normal band (60%)", 60.0, false),
 	)
 })
 

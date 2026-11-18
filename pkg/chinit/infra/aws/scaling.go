@@ -634,10 +634,13 @@ func (r *SignalsReader) ReadKeeperSignals(ctx context.Context, clusterName strin
 }
 
 // ReadWriterSignals implements port.ScaleSignalsReader: the busiest
-// writer's average CPU idle over the window (the host-prefix fan-out
-// the CloudWatch SEARCH shape answers; the min-aggregate keeps the
-// BUSIEST node's line — the fleet average hides one saturated node,
-// the load test's writer-2 at 94% while the fleet averaged 52%).
+// writer's average CPU idle over the window. In CloudWatch
+// GetMetricStatistics, synthetic "HostPattern" dimensions return zero
+// datapoints against real AWS APIs, so when the pattern query yields no
+// datapoints we fall back to the coordinator's own ClickHouse/Node
+// series (host=writer-0, Period=60) and then the aggregate AWS/EC2
+// ASG CPUUtilization series (<clusterName>-writers, converted to
+// 100 - busy).
 func (r *SignalsReader) ReadWriterSignals(ctx context.Context, clusterName string) (domain.ScaleSignals, error) {
 	if r.store == nil {
 		return domain.ScaleSignals{}, fmt.Errorf("signals reader: no metric store")
@@ -649,10 +652,34 @@ func (r *SignalsReader) ReadWriterSignals(ctx context.Context, clusterName strin
 		Stat:       "Average",
 		Period:     300,
 	})
-	if err != nil {
-		return domain.ScaleSignals{}, fmt.Errorf("writer fleet idle: %w", err)
+	if err == nil {
+		return domain.ScaleSignals{WriterCPUIdlePct: idle}, nil
 	}
-	return domain.ScaleSignals{WriterCPUIdlePct: idle}, nil
+	if idleHost0, err0 := r.breachMin(ctx, port.MetricQuery{
+		Namespace:  "ClickHouse/Node",
+		MetricName: "cpu_usage_idle",
+		Dimensions: map[string]string{"cpu": "cpu-total", "host": "writer-0"},
+		Stat:       "Average",
+		Period:     60,
+	}); err0 == nil {
+		return domain.ScaleSignals{WriterCPUIdlePct: idleHost0}, nil
+	}
+	if clusterName != "" {
+		if busyASG, errASG := r.breachMin(ctx, port.MetricQuery{
+			Namespace:  "AWS/EC2",
+			MetricName: "CPUUtilization",
+			Dimensions: map[string]string{"AutoScalingGroupName": clusterName + "-writers"},
+			Stat:       "Maximum",
+			Period:     60,
+		}); errASG == nil {
+			idlePct := 100.0 - busyASG
+			if idlePct < 0 {
+				idlePct = 0
+			}
+			return domain.ScaleSignals{WriterCPUIdlePct: idlePct}, nil
+		}
+	}
+	return domain.ScaleSignals{}, fmt.Errorf("writer fleet idle: %w", err)
 }
 
 // ============================================================================

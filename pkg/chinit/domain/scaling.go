@@ -58,6 +58,28 @@ func (l TypeLadder) Next(current string) (next string, ok bool) {
 	return l.Types[candidate], true
 }
 
+// Prev answers the step strictly below current, within bounds
+// (vertical scale-down when pressure subsides). ok is false at or
+// below the floor, above the ceiling, or when current is not on the
+// ladder.
+func (l TypeLadder) Prev(current string) (prev string, ok bool) {
+	idx := -1
+	for i, t := range l.Types {
+		if t == current {
+			idx = i
+			break
+		}
+	}
+	if idx <= 0 {
+		return "", false
+	}
+	candidate := idx - 1
+	if !l.bounded(candidate) {
+		return "", false
+	}
+	return l.Types[candidate], true
+}
+
 // pos answers the type's ladder index; an ABSENT type (or the unset
 // "" bound) answers the NO-CONSTRAINT sentinel — the bound checks
 // then constrain nothing (the explicit open-ladder shape).
@@ -105,6 +127,19 @@ func (l TypeLadder) AtOrAboveMax(current string) bool {
 	return pos == len(l.Types)-1
 }
 
+// AtOrBelowMin answers whether current sits at (or below) the ladder
+// floor — the "already at min" decision input for vertical scale-down.
+func (l TypeLadder) AtOrBelowMin(current string) bool {
+	pos := l.pos(current)
+	if pos < 0 {
+		return false
+	}
+	if minI := l.pos(l.Min); minI >= 0 {
+		return pos <= minI
+	}
+	return pos == 0
+}
+
 // ScaleSignals is the autoscale decision input: the metric readings
 // one tick observed, with the thresholds a breach is judged against.
 // The values are the BREACH-SIDE aggregates (the least pressure seen
@@ -123,7 +158,9 @@ type ScaleSignals struct {
 }
 
 // ScaleThresholds is the breach line: a signal at-or-beyond (idle:
-// at-or-below) its threshold is pressure.
+// at-or-below) its threshold is pressure; idle at-or-above the
+// scale-down line is sustained under-utilization eligible to step
+// down one rung toward Min.
 type ScaleThresholds struct {
 	// KeeperLatencyMs: at-or-beyond = breach.
 	KeeperLatencyMs float64
@@ -131,20 +168,26 @@ type ScaleThresholds struct {
 	KeeperOutstanding float64
 	// KeeperCPUIdlePct: at-or-below = breach (idle LOW = busy).
 	KeeperCPUIdlePct float64
+	// KeeperScaleDownIdlePct: at-or-above (with low latency/outstanding) = step down.
+	KeeperScaleDownIdlePct float64
 	// WriterCPUIdlePct: at-or-below = breach (the fleet signal).
 	WriterCPUIdlePct float64
+	// WriterScaleDownIdlePct: at-or-above = step down toward writer_min_type.
+	WriterScaleDownIdlePct float64
 }
 
 // DefaultScaleThresholds mirrors the CloudWatch alarms' defaults the
-// autoscale path inherits (keeper-max-latency 500ms;
-// keeper-outstanding-requests 10; the CPU idle lines at the fleet's
-// own scale-out triggers).
+// autoscale path inherits (keeper-max-latency 5000ms — cumulative-window
+// MAX in KeeperConnectionStats::getMaxLatency(); keeper-outstanding-requests
+// 10; the CPU idle lines at the fleet's scale-out/scale-in triggers).
 func DefaultScaleThresholds() ScaleThresholds {
 	return ScaleThresholds{
-		KeeperLatencyMs:   500,
-		KeeperOutstanding: 10,
-		KeeperCPUIdlePct:  20,
-		WriterCPUIdlePct:  35,
+		KeeperLatencyMs:        5000,
+		KeeperOutstanding:      10,
+		KeeperCPUIdlePct:       20,
+		KeeperScaleDownIdlePct: 90,
+		WriterCPUIdlePct:       35,
+		WriterScaleDownIdlePct: 85,
 	}
 }
 
@@ -155,9 +198,25 @@ func (t ScaleThresholds) KeeperBreach(s ScaleSignals) bool {
 		s.KeeperCPUIdlePct <= t.KeeperCPUIdlePct
 }
 
+// KeeperIdle answers whether keeper signals indicate sustained idle
+// eligible for a one-rung vertical step down toward keeper_min_type.
+func (t ScaleThresholds) KeeperIdle(s ScaleSignals) bool {
+	return t.KeeperScaleDownIdlePct > 0 &&
+		s.KeeperCPUIdlePct >= t.KeeperScaleDownIdlePct &&
+		s.KeeperOutstanding <= 1 &&
+		s.KeeperMaxLatencyMs < t.KeeperLatencyMs/5
+}
+
 // WriterBreach answers whether the fleet CPU signal breached.
 func (t ScaleThresholds) WriterBreach(s ScaleSignals) bool {
 	return s.WriterCPUIdlePct <= t.WriterCPUIdlePct
+}
+
+// WriterIdle answers whether the writer fleet CPU idle sits at or
+// above the vertical scale-down threshold (e.g. >= 85% idle = <= 15%
+// busy across the entire evaluation window).
+func (t ScaleThresholds) WriterIdle(s ScaleSignals) bool {
+	return t.WriterScaleDownIdlePct > 0 && s.WriterCPUIdlePct >= t.WriterScaleDownIdlePct
 }
 
 // ScaleDecision is the coordinator's verdict for one tick: what it

@@ -104,6 +104,11 @@ variable "instance_type" {
   description = "Instance type for writers, readers and the backup replica (arm64 recommended: Graviton). Keepers use keeper_instance_type."
   type        = string
   default     = "r8g.large"
+
+  validation {
+    condition     = !can(regex("(\\.(nano|micro|small|medium)$|^c[0-9]+[a-z]*\\.large$)", var.instance_type))
+    error_message = "instance_type must provide at least 8 GiB RAM (e.g. t4g.large, m8g.large, r8g.large, c8g.xlarge or larger); <= 4 GiB instances saturate CPU and OOM during ReplicatedMergeTree merges."
+  }
 }
 
 variable "keeper_instance_type" {
@@ -122,6 +127,28 @@ variable "metadata_disk_size_gb" {
   description = "Metadata (hot-tier) EBS volume size (GB) for writers/readers/backup. Mounted at /var/lib/clickhouse, label ch-metadata. This is where ReplicatedMergeTree hot parts live; the disk-autoscale job can grow it online up to 256 GB."
   type        = number
   default     = 64
+}
+
+variable "metadata_disk_iops" {
+  description = "Provisioned gp3 IOPS for the metadata (hot-tier) volume (/dev/sdb) on writers and readers."
+  type        = number
+  default     = 4000
+
+  validation {
+    condition     = var.metadata_disk_iops >= 3000
+    error_message = "metadata_disk_iops must be >= 3000."
+  }
+}
+
+variable "metadata_disk_throughput_mbps" {
+  description = "Provisioned gp3 throughput (MB/s) for the metadata (hot-tier) volume (/dev/sdb). Default 500 MB/s avoids the 125 MB/s gp3 baseline sequential merge iowait stall."
+  type        = number
+  default     = 500
+
+  validation {
+    condition     = var.metadata_disk_throughput_mbps >= 250
+    error_message = "metadata_disk_throughput_mbps must be >= 250 MB/s to prevent sequential MergeTree merge iowait stalls."
+  }
 }
 
 variable "cache_disk_size_gb" {

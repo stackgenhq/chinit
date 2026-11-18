@@ -134,18 +134,38 @@ func (s *AutoscaleService) keeperStep(ctx context.Context, req AutoscaleRequest,
 	}
 	decision := domain.ScaleDecision{Signals: signals}
 	decision.Breach = thresholds.KeeperBreach(signals)
-	if !decision.Breach {
+	scaleDown := !decision.Breach && thresholds.KeeperIdle(signals)
+	if !decision.Breach && !scaleDown {
 		decision.Reason = "keeper signals within thresholds"
 		return &AutoscaleResult{Decision: decision}, nil
 	}
 	if req.KeeperInstanceID == "" {
-		return &AutoscaleResult{Skipped: "keeper breach but no coordinator identity (state file lacks instance id)"}, nil
+		return &AutoscaleResult{Skipped: "keeper resize needed but no coordinator identity (state file lacks instance id)"}, nil
 	}
 	self, err := s.keeper.DescribeInstance(ctx, req.KeeperInstanceID)
 	if err != nil {
 		return nil, fmt.Errorf("autoscale: describe keeper %s: %w", req.KeeperInstanceID, err)
 	}
 	decision.From = self.InstanceType
+	if scaleDown {
+		prev, ok := req.Ladder.Prev(self.InstanceType)
+		if !ok {
+			decision.Reason = fmt.Sprintf("keeper idle (%.0f%%) at ladder floor %s", signals.KeeperCPUIdlePct, self.InstanceType)
+			return &AutoscaleResult{Decision: decision}, nil
+		}
+		decision.To = prev
+		decision.Action = "keeper-self-down"
+		decision.Reason = fmt.Sprintf("keeper idle (idle %.0f%% >= %.0f%%) — self-resize down %s → %s",
+			signals.KeeperCPUIdlePct, thresholds.KeeperScaleDownIdlePct, decision.From, decision.To)
+		if err := s.keeper.ChangeInstanceType(ctx, port.InstanceTypeChange{
+			InstanceID: req.KeeperInstanceID,
+			TargetType: prev,
+		}); err != nil {
+			return nil, fmt.Errorf("autoscale: keeper scale-down resize: %w", err)
+		}
+		s.markCooldown(ctx, port.CooldownRequest{Table: req.Cooldown.Table, Key: "autoscale-" + string(req.Coordinator)})
+		return &AutoscaleResult{Decision: decision}, nil
+	}
 	next, ok := req.Ladder.Next(self.InstanceType)
 	if !ok {
 		decision.Reason = fmt.Sprintf("keeper pressure breach but no ladder step from %s (floor/ceiling/unknown type)", self.InstanceType)
@@ -166,9 +186,11 @@ func (s *AutoscaleService) keeperStep(ctx context.Context, req AutoscaleRequest,
 }
 
 // writerStep decides the writers' fleet roll: the busiest writer's
-// idle at-or-below the threshold → one bounded launch-template step
-// with MinHealthyPercentage 100 and AutoRollback armed (the ingest
-// quorum never dips below healthy through the roll).
+// idle at-or-below the threshold → one bounded launch-template step UP
+// with MinHealthyPercentage 100 and AutoRollback armed; sustained idle
+// at-or-above WriterScaleDownIdlePct → one bounded launch-template step
+// DOWN toward writer_min_type so the fleet never stays stranded on peak
+// load-test instance types after load subsides.
 func (s *AutoscaleService) writerStep(ctx context.Context, req AutoscaleRequest, thresholds domain.ScaleThresholds) (*AutoscaleResult, error) {
 	if s.fleet == nil {
 		return &AutoscaleResult{Skipped: "provider has no fleet-resize capability"}, nil
@@ -179,8 +201,9 @@ func (s *AutoscaleService) writerStep(ctx context.Context, req AutoscaleRequest,
 	}
 	decision := domain.ScaleDecision{Signals: signals}
 	decision.Breach = thresholds.WriterBreach(signals)
-	if !decision.Breach {
-		decision.Reason = "writer fleet idle above threshold"
+	scaleDown := !decision.Breach && thresholds.WriterIdle(signals)
+	if !decision.Breach && !scaleDown {
+		decision.Reason = "writer fleet idle within operating band"
 		return &AutoscaleResult{Decision: decision}, nil
 	}
 	if req.Fleet.AutoScalingGroupName == "" {
@@ -203,6 +226,32 @@ func (s *AutoscaleService) writerStep(ctx context.Context, req AutoscaleRequest,
 		return &AutoscaleResult{Skipped: "cannot read the coordinator's own type (the fleet's type source)"}, nil
 	}
 	decision.From = self.InstanceType
+	if scaleDown {
+		prev, ok := req.Ladder.Prev(self.InstanceType)
+		if !ok {
+			decision.Reason = fmt.Sprintf("writer fleet idle (%.0f%%) at ladder floor %s", signals.WriterCPUIdlePct, self.InstanceType)
+			return &AutoscaleResult{Decision: decision}, nil
+		}
+		ver, err := s.fleet.CreateLaunchTemplateVersion(ctx, binding.LaunchTemplateID, prev)
+		if err != nil {
+			return nil, fmt.Errorf("autoscale: launch template scale-down step: %w", err)
+		}
+		decision.To = prev
+		decision.Action = "writer-roll-down"
+		decision.Reason = fmt.Sprintf("writer fleet idle (busiest idle %.0f%% >= %.0f%%) — rolling %s down to LT v%d (%s)",
+			signals.WriterCPUIdlePct, thresholds.WriterScaleDownIdlePct, req.Fleet.AutoScalingGroupName, ver, prev)
+		roll := req.Fleet
+		roll.Version = strconv.FormatInt(ver, 10)
+		roll.MinHealthyPercentage = 100
+		if roll.InstanceWarmup == 0 {
+			roll.InstanceWarmup = 300
+		}
+		if err := s.fleet.StartFleetRefresh(ctx, roll); err != nil {
+			return nil, fmt.Errorf("autoscale: fleet scale-down roll: %w", err)
+		}
+		s.markCooldown(ctx, port.CooldownRequest{Table: req.Cooldown.Table, Key: "autoscale-" + string(req.Coordinator)})
+		return &AutoscaleResult{Decision: decision}, nil
+	}
 	next, ok := req.Ladder.Next(self.InstanceType)
 	if !ok {
 		decision.Reason = fmt.Sprintf("writer fleet breach but no ladder step from %s (floor/ceiling/unknown type)", self.InstanceType)

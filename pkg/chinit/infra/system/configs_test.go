@@ -222,3 +222,33 @@ var _ = Describe("defaultBackupOverlayXML (the built-in fallback)", func() {
 		Expect(overlay).NotTo(ContainSubstring("<background_fetches_pool_size>4</background_fetches_pool_size>"))
 	})
 })
+
+var _ = Describe("HardwareSizingOverlayXML & HardwareProfilesOverlayXML", func() {
+	DescribeTable("renders valid, pool-consistent XML across instance shapes",
+		func(vcpus int, memGiB uint64, wantPool string, wantFree string) {
+			dir, err := os.MkdirTemp("", "chinit-hw-overlay-*")
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = os.RemoveAll(dir) })
+
+			hwXML := HardwareSizingOverlayXML(vcpus, memGiB<<30)
+			hwPath := filepath.Join(dir, "z_hardware-sizing.xml")
+			Expect(os.WriteFile(hwPath, []byte(hwXML), 0644)).To(Succeed())
+			Expect(ValidateXML(hwPath)).To(Succeed())
+			Expect(hwXML).To(ContainSubstring("<background_pool_size>" + wantPool + "</background_pool_size>"))
+			Expect(hwXML).To(ContainSubstring("<number_of_free_entries_in_pool_to_execute_mutation>" + wantFree + "</number_of_free_entries_in_pool_to_execute_mutation>"))
+
+			profXML := HardwareProfilesOverlayXML(memGiB << 30)
+			profPath := filepath.Join(dir, "z_hardware-profiles.xml")
+			Expect(os.WriteFile(profPath, []byte(profXML), 0644)).To(Succeed())
+			Expect(ValidateXML(profPath)).To(Succeed())
+			Expect(profXML).To(ContainSubstring("<max_bytes_before_external_group_by>"))
+			Expect(profXML).To(ContainSubstring("<max_bytes_before_external_sort>"))
+		},
+		Entry("2 vCPU / 4 GiB (tiny burstable safety net)", 2, uint64(4), "4", "2"),
+		Entry("2 vCPU / 8 GiB (t4g.large / m8g.large floor)", 2, uint64(8), "4", "2"),
+		Entry("4 vCPU / 8 GiB (c8g.xlarge reader)", 4, uint64(8), "8", "4"),
+		Entry("8 vCPU / 32 GiB (m8g.2xlarge writer)", 8, uint64(32), "16", "8"),
+		Entry("8 vCPU / 64 GiB (r8g.2xlarge writer)", 8, uint64(64), "16", "8"),
+		Entry("16 vCPU / 128 GiB (r8g.4xlarge scaled writer)", 16, uint64(128), "32", "16"),
+	)
+})
