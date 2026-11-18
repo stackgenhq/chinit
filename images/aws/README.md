@@ -25,18 +25,16 @@ Pre-baked AMIs reduce EC2 node bootstrap time from 8–12 minutes to 2–3 minut
 
 Remote log-shipping agents remain inactive unless `log_shipping.endpoint` is configured in `chinit.yaml`. The `chinit_version` variable pins the release tag downloaded and SHA-256 verified during the Packer build; version history is tracked in [CHANGELOG.md](./CHANGELOG.md).
 
-## Prebuilt Public AMI
+## Prebuilt Public AMIs
 
-A public golden AMI is published in `us-west-2`:
+Public golden AMIs for both `upstream` and `antalya` (CAS-capable) flavors are published in `us-west-2` with public launch permissions (`launchPermission = all`) and public backing-snapshot copy permissions (`createVolumePermission = all`), so any AWS account can launch instances from them directly or `aws ec2 copy-image` them into another account/region:
 
-| Attribute | Value |
-|---|---|
-| **AMI ID** | `ami-0eaa398497899f070` (`us-west-2`) |
-| **Name** | `clickhouse-golden-26.8.36.3-1794878271` |
-| **Included Software** | Ubuntu 24.04 `arm64`, ClickHouse 26.8.36.3, `chinit`, `clickhouse-backup` 2.5.0, AWS CLI, CloudWatch agent |
-| **Author Tag** | `stackgen.com` |
+| Flavor | AMI ID (`us-west-2`) | Name | Included Software |
+|---|---|---|---|
+| **Upstream LTS** (`build_flavor = "upstream"`) | `ami-0075eb79e447956ca` | `clickhouse-golden-26.8.36.3-1795040566` | Ubuntu 24.04 `arm64`, ClickHouse `26.8.36.3`, `chinit` `0.2.6`, `clickhouse-backup` `2.5.0`, AWS CLI v2, CloudWatch & OTel Collector agents |
+| **Altinity Antalya LTS / CAS** (`build_flavor = "antalya"`) | `ami-04292dd0d9281579e` | `clickhouse-golden-26.8.34.20001.altinityantalya-1795040566` | Ubuntu 24.04 `arm64`, Altinity Antalya ClickHouse `26.8.34.20001.altinityantalya`, `chinit` `0.2.6`, `clickhouse-backup` `2.5.0`, AWS CLI v2, CloudWatch & OTel Collector agents |
 
-Because AWS does not allow public AMIs to have encrypted root snapshots, the public AMI uses an unencrypted root snapshot; private builds created with this template enable EBS encryption by default.
+Because AWS does not allow public AMIs to have encrypted root snapshots, golden AMIs built by this template default to `public_ami = true` (unencrypted root snapshot + `ami_groups = ["all"]` + `snapshot_groups = ["all"]`), while the `terraform/aws` launch templates and instance definitions encrypt every launched node's root EBS volume at boot (`encrypted = true`). Set `-var public_ami=false` if you want a private, snapshot-encrypted build.
 
 ## Building Your Own AMI
 

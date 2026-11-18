@@ -13,7 +13,7 @@ module "clickhouse" {
 
   cluster_name  = "demo"
   region        = "us-west-2"
-  golden_ami_id = "ami-0f8511dd30c68ca21" # Altinity Antalya golden AMI (or build from images/aws)
+  golden_ami_id = "ami-04292dd0d9281579e" # Public Altinity Antalya 26.8 golden AMI (or omit in us-west-2 to auto-resolve)
 
   dns_zone_name = "clickhouse.internal"
   subnet_cidr   = "10.42.0.0/24"
@@ -65,7 +65,7 @@ External load balancers, custom scaling policies, secret rotation Lambdas, and b
 
 ## Shared S3 CAS Cold Tier (Altinity Antalya)
 
-Set `cas_enabled = true` (with an Altinity Antalya golden AMI such as `ami-0f8511dd30c68ca21`) to render the `cas` (`metadata_type = cas`) shared S3 pool, `cas_cache` local cache wrapper, and `tiered_cas` storage policy so cold parts are stored once across all replicas rather than duplicated per `{replica}`.
+Set `cas_enabled = true` (with an Altinity Antalya golden AMI such as `ami-04292dd0d9281579e`, or leave `golden_ami_id = null` in `us-west-2` to auto-resolve the latest public Antalya golden AMI) to render the `cas` (`metadata_type = cas`) shared S3 pool, `cas_cache` local cache wrapper, and `tiered_cas` storage policy so cold parts are stored once across all replicas rather than duplicated per `{replica}`.
 
 ## Sizing Notes
 

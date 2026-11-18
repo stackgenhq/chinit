@@ -16,9 +16,9 @@ Each update that bumps a component pin (`chinit_version`, `clickhouse_version`, 
 
 ## chinit (`chinit_version`)
 
-### chinit 0.2.6 — Altinity Antalya 26.8 LTS support & clickhouse-operator 0.28.0 adoption
-What: Bumps `chinit_version` default to `0.2.6` and upgrades the `antalya` Golden AMI flavor to `26.8.34.20001.altinityantalya` (from `Altinity/ClickHouse` branch `antalya-26.8@52d93c0c359961d2a540fda0bcb5bd3d56f69266`), adding automatic `altinity-build-artifacts` S3 `.deb` fallback with SHA-512 signature verification (`sign_release_arm_release/*.deb.sha512.gpg`) when an `antalya-26.8` version has not yet been promoted to `builds.altinity.cloud/antalya-apt-repo`.
-Why: Aligns the Altinity Antalya CAS build with the ClickHouse 26.8 LTS line (`26.8.34.20001.altinityantalya`, Golden AMI `ami-0ff5168e24c9fbcbf`) while preserving direct `apt` installation for versions published in `builds.altinity.cloud/antalya-apt-repo`.
+### chinit 0.2.6 — Altinity Antalya 26.8 LTS support, public cross-account Golden AMIs & clickhouse-operator 0.28.0 adoption
+What: Bumps `chinit_version` default to `0.2.6`, defaults `public_ami = true` (`ami_groups = ["all"]`, `snapshot_groups = ["all"]`, unencrypted root snapshot + cross-account flavor metadata in `ami_description`), and upgrades the `antalya` Golden AMI flavor to `26.8.34.20001.altinityantalya` (from `Altinity/ClickHouse` branch `antalya-26.8@52d93c0c359961d2a540fda0bcb5bd3d56f69266`), adding automatic `altinity-build-artifacts` S3 `.deb` fallback with SHA-512 signature verification (`sign_release_arm_release/*.deb.sha512.gpg`) when an `antalya-26.8` version has not yet been promoted to `builds.altinity.cloud/antalya-apt-repo`.
+Why: Aligns the Altinity Antalya CAS build with the ClickHouse 26.8 LTS line (`26.8.34.20001.altinityantalya`, public Golden AMI `ami-04292dd0d9281579e`) alongside the public upstream 26.8 LTS Golden AMI (`26.8.36.3`, `ami-0075eb79e447956ca`) so every Golden AMI produced by Packer and CI is public and directly launchable or copyable by any AWS account.
 
 ### chinit 0.2.3 — exact 36-byte deterministic UUID file, HTTP row drain & CAS merge-fetch tuning
 What: Writes `/var/lib/clickhouse/uuid` as an exact 36-byte UUID without trailing newline, drains single-row HTTP probe responses to EOF, guards `statefulNode()` on `first_boot_done`, re-derives keeper static identity on resumed boots, and configures `prefer_fetch_merged_part_time_threshold=1` / `prefer_fetch_merged_part_size_threshold=1` + `<errorlog_level>error</errorlog_level>` in `chi.yaml`.

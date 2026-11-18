@@ -139,13 +139,13 @@ variable "ami_tags" {
 
 variable "public_ami" {
   type        = bool
-  description = "Build the public shareable flavor: unencrypted root snapshot + public launch permission (AWS refuses public encrypted AMIs). The default build stays encrypted."
-  default     = false
+  description = "Build a public, cross-account consumable AMI: unencrypted root snapshot + public launch permission (ami_groups=[\"all\"]) + public snapshot copy permission (snapshot_groups=[\"all\"]) so any AWS account can launch or copy-image it directly. Set to false for private encrypted builds."
+  default     = true
 }
 
 variable "ami_author" {
   type        = string
-  description = "Author stamped as a tag on the AMI (visible to anyone who can see the image)."
+  description = "Author stamped as a tag on the AMI."
   default     = "stackgen.com"
 }
 
@@ -158,8 +158,8 @@ variable "chinit_download_token" {
 
 variable "ami_description" {
   type        = string
-  description = "Description shown in DescribeImages and the console launch dialog for the public AMI."
-  default     = "ClickHouse golden image (Ubuntu 24.04 arm64) with chinit - https://github.com/stackgenhq/chinit"
+  description = "Optional custom Description shown in DescribeImages and the console launch dialog (empty = auto-generated with ClickHouse version, build_flavor, and chinit_version so external AWS accounts can inspect metadata without owner-only tags)."
+  default     = ""
 }
 
 # ============================================================================
@@ -197,36 +197,48 @@ source "amazon-ebs" "clickhouse" {
     delete_on_termination = true
   }
 
-  # ami_name carries the ClickHouse version + git sha so Terraform can pin
-  # `golden_ami_id` exactly, and the cleanup step can recognize generations.
+  # ami_name carries the ClickHouse version + timestamp so Terraform and
+  # external AWS accounts can pin or filter `golden_ami_id` by name/flavor.
   ami_name    = "clickhouse-golden-${var.clickhouse_version}-{{timestamp}}"
   ami_regions = [var.region]
-  # Author/usage metadata for the public listing: every consumer can see
-  # these in DescribeImages / the console launch dialog.
-  ami_description = var.ami_description
+  # Cross-account metadata: AWS hides resource tags from other AWS accounts
+  # on public AMIs, so Description carries the flavor, ClickHouse version,
+  # and chinit version visible in DescribeImages across all accounts.
+  ami_description = var.ami_description != "" ? var.ami_description : "ClickHouse ${var.clickhouse_version} (${var.build_flavor}) golden image (Ubuntu 24.04 arm64, chinit v${var.chinit_version}) - https://github.com/stackgenhq/chinit"
 
-  # The public flavor carries its own Purpose tag so the private
-  # generation-prune step never sweeps published images (one published
-  # generation, retired by its own workflow job). Flavor stamps upstream
-  # vs antalya so parallel matrix builds prune only their own flavor track.
+  # Keep Purpose=clickhouse-golden-ami across all builds so owner-account
+  # Terraform data sources, CI IAM tag conditions, and per-flavor generation
+  # pruning work uniformly.
   snapshot_tags = merge(
-    var.public_ami ? merge(var.ami_tags, { Purpose = "clickhouse-golden-ami-public" }) : var.ami_tags,
-    { Flavor = var.build_flavor }
+    var.ami_tags,
+    {
+      Author            = var.ami_author
+      Flavor            = var.build_flavor
+      ClickHouseVersion = var.clickhouse_version
+      ChinitVersion     = var.chinit_version
+      Public            = var.public_ami ? "true" : "false"
+    }
   )
   tags = merge(
-    var.public_ami ? merge(var.ami_tags, { Purpose = "clickhouse-golden-ami-public" }) : var.ami_tags,
+    var.ami_tags,
     {
-      Author = var.ami_author
-      Flavor = var.build_flavor
+      Author            = var.ami_author
+      Flavor            = var.build_flavor
+      ClickHouseVersion = var.clickhouse_version
+      ChinitVersion     = var.chinit_version
+      Public            = var.public_ami ? "true" : "false"
     }
   )
 
-  # Public launch permission when building the share flavor:
-  # ami_groups=["all"] makes the image launchable by any AWS account.
-  # An encrypted AMI cannot be public — the public_ami variable gates
-  # both the encryption flag and this group.
-  ami_users  = []
-  ami_groups = var.public_ami ? ["all"] : []
+  # Public launch + snapshot copy permissions by default (var.public_ami = true):
+  # - ami_groups=["all"] grants launchPermission to all AWS accounts (RunInstances).
+  # - snapshot_groups=["all"] grants createVolumePermission on the backing root
+  #   snapshot so other AWS accounts can also `aws ec2 copy-image` into their own
+  #   account or region with their own KMS encryption key.
+  ami_users       = []
+  ami_groups      = var.public_ami ? ["all"] : []
+  snapshot_users  = []
+  snapshot_groups = var.public_ami ? ["all"] : []
 
   # run_tags / run_volume_tags: applied via TagSpecification AT LAUNCH so
   # the CI role's IAM conditions (aws:RequestTag/aws:ResourceTag
