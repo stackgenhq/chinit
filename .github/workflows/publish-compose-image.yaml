@@ -15,16 +15,8 @@ name: Publish Compose Node Image (GHCR)
 on:
   push:
     branches: [main, master]
-    paths:
-      - "cmd/**"
-      - "pkg/**"
-      - "deploy/compose/**"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/publish-compose-image.yaml"
-  workflow_run:
-    workflows: ["Release chinit"]
-    types: [completed]
+    tags:
+      - "v0.*"
   workflow_dispatch:
     inputs:
       clickhouse_version:
@@ -37,29 +29,26 @@ permissions:
   packages: write
 
 concurrency:
-  group: publish-compose-image-${{ github.event.workflow_run.head_branch || github.ref }}
+  group: publish-compose-image-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-and-push:
     name: Build & push ghcr.io/${{ github.repository_owner }}/chinit-node
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
           fetch-depth: 0
 
       - name: Resolve chinit version and image tags
         id: version
         env:
           IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/chinit-node
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
-          HEAD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           IMAGE_REPO_LC="$(echo "${IMAGE_REPO}" | tr '[:upper:]' '[:lower:]')"
           SHORT_SHA="${HEAD_SHA::7}"
@@ -100,7 +89,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0
           build-args: |
             CHINIT_VERSION=${{ steps.version.outputs.version }}
