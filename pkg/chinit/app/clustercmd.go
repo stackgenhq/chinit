@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/service"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/clusterops"
 	"github.com/stackgenhq/chinit/pkg/chinit/logger"
@@ -40,6 +41,11 @@ func runSchemaSync(args []string) error {
 	}); err != nil {
 		logger.GetLogger(ctx).Error("schema sync failed (retry on timer)", "err", err)
 		return fmt.Errorf("schema sync failed (retry on timer): %w", err)
+	}
+	if st.Identity.Role != model.RoleWriter && st.Identity.Role != model.RoleKeeper {
+		if _, ddlErr := service.ApplyBootstrapDDL(ctx, st.Identity.Hostname, string(st.Identity.Role)); ddlErr != nil {
+			logger.GetLogger(ctx).Warn("post-schema-sync DDL convergence warning", "err", ddlErr)
+		}
 	}
 	return nil
 }
