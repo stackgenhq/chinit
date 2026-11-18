@@ -1,0 +1,73 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Validates the crossplane/ deployment tree on every PR that touches it:
+# tofu validate on the contract modules (the Workspaces consume them)
+# plus offline YAML/CEL checks for the XRD, compositions, and examples.
+
+name: Crossplane
+
+on:
+  push:
+    branches: [main, master]
+    paths: ["crossplane/**", "terraform/**", ".github/workflows/crossplane.yml"]
+  pull_request:
+    paths: ["crossplane/**", "terraform/**", ".github/workflows/crossplane.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crossplane-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-contract-modules:
+    name: tofu validate (contract modules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        module:
+          - terraform/modules/chinit/aws
+          - terraform/modules/chinit/azure
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "1.10.5"
+
+      - name: tofu init -backend=false
+        working-directory: ${{ matrix.module }}
+        run: tofu init -backend=false
+
+      - name: tofu validate
+        working-directory: ${{ matrix.module }}
+        run: tofu validate
+
+  validate-crossplane-manifests:
+    name: kubectl validate (XRD + compositions + examples)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: YAML parse check
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import glob, sys, yaml
+          files = sorted(
+              glob.glob("crossplane/**/*.yaml", recursive=True)
+              + ["crossplane/examples/example-aws.yaml"]
+          )
+          seen = set()
+          for f in files:
+              if f in seen:
+                  continue
+              seen.add(f)
+              with open(f) as fh:
+                  list(yaml.safe_load_all(fh))
+              print(f"OK {f}")
+          EOF

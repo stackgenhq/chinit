@@ -1,0 +1,315 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ============================================================================
+# XRD — the chinit cluster claim API (cloud-neutral)
+# ============================================================================
+# Users author these, not managed resources: one YAML per cluster per cloud.
+# Every field maps 1:1 onto the terraform/<cloud> module's variables (same
+# names, defaults, and validation semantics as the module's variables.tf).
+# ============================================================================
+
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xclickhouseclusters.chinit.stackgenhq.io
+spec:
+  defaultCompositionRef:
+    name: xclickhouseclusters.aws.chinit.stackgenhq.io
+  connectionSecretKeys:
+    - cluster_name
+    - dns_zone_name
+    - node_claims_table
+    - bundle_bucket
+    - data_bucket
+    - backup_bucket
+    - config_files_hash
+    - writers_asg_name
+    - readers_asg_name
+    - node_endpoints
+    - secrets
+  claimNames:
+    kind: ClickHouseCluster
+    plural: clickhouseclusters
+    shortNames:
+      - chcluster
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                # ---- cloud selector -------------------------------------------------
+                cloud:
+                  description: >-
+                    The cloud the cluster deploys to (selects the composition).
+                    AWS and Azure are shipped.
+                  type: string
+                  enum: [aws, azure]
+                # ---- identity (the chinit BootSpec fields, cloud-neutral) ----------
+                clusterName:
+                  description: >-
+                    Cluster name. Renders into every chinit spec, the CHI spec,
+                    DNS names, and resource names. Azure limits: 3-20 chars
+                    [a-z0-9-] (it becomes the storage account name).
+                  type: string
+                  pattern: "^[a-z0-9][a-z0-9-]{1,18}[a-z0-9]$"
+                region:
+                  description: >-
+                    AWS region or Azure location (e.g. us-west-2 / westus2).
+                    Pins every SDK client chinit builds and the tiered-storage
+                    endpoint.
+                  type: string
+                dnsZoneName:
+                  description: >-
+                    Private DNS zone name for node discovery (writer-N /
+                    reader-N / keeper-N / backup-0 A records under it). Nodes
+                    self-register; peers resolve each other through it.
+                  type: string
+                  pattern: "^[a-z0-9][a-z0-9.-]*[a-z0-9]$"
+                # ---- identity ceilings (ASG/VMSS maxima, never live counts) --------
+                writerMax:
+                  description: >-
+                    Writers ASG max_size = the writer ordinal claim ceiling
+                    (writers claim writer-N in [0, writerMax) from the claims
+                    table). Pass the MAXIMUM the fleet can reach, never the
+                    live count.
+                  type: integer
+                  default: 2
+                  minimum: 1
+                writerDesired:
+                  description: Writers ASG desired capacity at apply time.
+                  type: integer
+                  default: 2
+                  minimum: 1
+                readerMax:
+                  description: >-
+                    Readers ASG max_size = the reader ordinal claim ceiling
+                    (the same contract as writerMax).
+                  type: integer
+                  default: 6
+                  minimum: 1
+                readerDesired:
+                  description: Readers ASG desired capacity at apply time.
+                  type: integer
+                  default: 2
+                  minimum: 0
+                readerSpot:
+                  description: >-
+                    Launch readers on Spot (mixed instances on AWS, Spot VMSS
+                    on Azure). chinit's spot-watch drains on the interruption
+                    notice; the lease TTL releases the ordinal when the drain
+                    cannot run.
+                  type: boolean
+                  default: true
+                keeperCount:
+                  description: >-
+                    Keeper (Raft) fleet size. Must be ODD for quorum
+                    arithmetic; 3 tolerates one loss, 5 tolerates two. Fixed
+                    instances at the +20 octet offsets (static identities).
+                  type: integer
+                  default: 3
+                  minimum: 1
+                  maximum: 10
+                backupEnabled:
+                  description: >-
+                    Provision the dedicated backup replica at the +30 octet
+                    offset running the clickhouse-backup timer (a CR member:
+                    its slot sits after the readers' ceiling).
+                  type: boolean
+                  default: true
+                # ---- sizing ----------------------------------------------------------
+                instanceType:
+                  description: >-
+                    AWS: instance type for writers/readers/backup (arm64
+                    recommended). Must provide >= 8 GiB RAM. Ignored on Azure
+                    (use vmSize).
+                  type: string
+                  default: r8g.large
+                keeperInstanceType:
+                  description: >-
+                    AWS: keeper instance type (raft fsync favors steady-CPU
+                    families). Ignored on Azure.
+                  type: string
+                  default: m8g.large
+                vmSize:
+                  description: 'Azure: VM size for writers/readers/backup. Ignored on AWS.'
+                  type: string
+                  default: Standard_D4s_v5
+                keeperVmSize:
+                  description: 'Azure: keeper VM size. Ignored on AWS.'
+                  type: string
+                  default: Standard_D2s_v5
+                rootDiskSizeGb:
+                  description: 'Root volume size (GB) for every node.'
+                  type: integer
+                  default: 32
+                metadataDiskSizeGb:
+                  description: >-
+                    Hot-tier (metadata) data-disk size (GB) — label
+                    ch-metadata, LUN 0. ReplicatedMergeTree hot parts live
+                    here; the chinit disk-autoscale job can grow it online.
+                  type: integer
+                  default: 64
+                cacheDiskSizeGb:
+                  description: >-
+                    S3 read-cache data-disk size (GB) — label ch-cache, LUN 1.
+                    storage.xml derives <max_size> at 0.9x.
+                  type: integer
+                  default: 128
+                keeperDiskSizeGb:
+                  description: >-
+                    Keeper raft-log/snapshot disk size (GB) — label ch-keeper
+                    (LUN 2 / /dev/sdf). Survives node replacement.
+                  type: integer
+                  default: 16
+                metadataDiskIops:
+                  description: >-
+                    AWS gp3 provisioned IOPS for the metadata volume (min
+                    3000). Ignored on Azure.
+                  type: integer
+                  default: 4000
+                metadataDiskThroughputMbps:
+                  description: >-
+                    AWS gp3 throughput (MB/s) for the metadata volume (min
+                    250). Avoids sequential merge iowait stalls. Ignored on
+                    Azure.
+                  type: integer
+                  default: 500
+                # ---- image -----------------------------------------------------------
+                goldenAmiId:
+                  description: >-
+                    AWS: the chinit golden AMI id (build it from images/aws, or
+                    the public Altinity Antalya build e.g.
+                    ami-0f8511dd30c68ca21).
+                  type: string
+                goldenImageId:
+                  description: >-
+                    Azure: the golden Compute Gallery image version resource id
+                    (build it from images/azure).
+                  type: string
+                # ---- network ----------------------------------------------------------
+                subnetCidr:
+                  description: >-
+                    The subnet's IPv4 CIDR — renders into every chinit spec's
+                    network section AND allocates the static keeper/backup IPs
+                    at the +20/+30 octet offsets inside it.
+                  type: string
+                clientCidrs:
+                  description: >-
+                    CIDRs allowed to reach client ports 8123/8443/9000/9440 on
+                    writers and readers. Empty = no client ingress (interserver
+                    + keeper traffic still flows).
+                  type: array
+                  items:
+                    type: string
+                  default: []
+                # ---- cold tier + backups ---------------------------------------------
+                casEnabled:
+                  description: >-
+                    AWS: enable the Altinity Antalya CAS shared S3 cold tier
+                    (metadata_type=cas, ONE copy across replicas instead of one
+                    per-replica copy). Requires an Antalya golden AMI. Azure:
+                    always false.
+                  type: boolean
+                  default: false
+                casPrefix:
+                  description: 'AWS: the CAS shared key prefix (no {replica} segment).'
+                  type: string
+                  default: cas
+                dataPrefix:
+                  description: 'Key/container root for ClickHouse table data (s3_data_prefix on AWS, data_prefix on Azure).'
+                  type: string
+                  default: data
+                backupRetentionDays:
+                  description: 'clickhouse-backup remote retention (days).'
+                  type: integer
+                  default: 7
+                # ---- Azure-only -------------------------------------------------------
+                resourceGroupName:
+                  description: >-
+                    Azure: the target resource group (EVERY resource, including
+                    the chinit contract Workspace run, lands inside it). Must
+                    already exist — provision it outside Crossplane. Ignored on
+                    AWS.
+                  type: string
+                subscriptionId:
+                  description: >-
+                    Azure: subscription id — chinit's ARM scope env
+                    (CHINIT_AZURE_SUBSCRIPTION_ID). Ignored on AWS.
+                  type: string
+                adminUsername:
+                  description: 'Azure: the VM admin username (SSH key auth). Ignored on AWS.'
+                  type: string
+                  default: azureuser
+                sshPublicKey:
+                  description: >-
+                    Azure: an SSH public key for the admin user. Unset = the
+                    contract module generates one (the private key is NOT
+                    retrievable — set this for real access).
+                  type: string
+                # ---- telemetry ----------------------------------------------------------
+                logShippingAgent:
+                  description: 'Remote log shipping agent (otel | fluentbit). Inert when logShippingEndpoint is empty.'
+                  type: string
+                  default: otel
+                logShippingEndpoint:
+                  description: 'OTLP/HTTP endpoint for remote log shipping (empty = disabled).'
+                  type: string
+                  default: ""
+                logShippingHeaders:
+                  description: 'Comma-separated k=v headers for the OTLP/HTTP exporter.'
+                  type: string
+                  default: ""
+                # ---- crossplane refs -------------------------------------------------------
+                providerConfigRef:
+                  description: >-
+                    The opentofu ProviderConfig running the chinit contract
+                    module (credentials + remote state). Defaults to
+                    "opentofu-<cloud>". Only the contract Workspace consumes
+                    it; native managed resources use the Crossplane providers'
+                    own ProviderConfigs.
+                  type: string
+                compositionRef:
+                  description: >-
+                    Optional composition override; defaults per cloud to
+                    xclickhouseclusters.<cloud>.chinit.stackgenhq.io.
+                  type: string
+              required: [cloud, clusterName, region, dnsZoneName, subnetCidr]
+              x-kubernetes-validations:
+                - rule: "self.cloud == 'azure' || has(self.goldenAmiId)"
+                  message: "goldenAmiId is required when cloud=aws (the golden AMI carries the baked chinit binary)."
+                - rule: "self.cloud == 'aws' || has(self.goldenImageId)"
+                  message: "goldenImageId is required when cloud=azure (the gallery image version carries the baked chinit binary)."
+                - rule: "self.cloud == 'azure' || has(self.subscriptionId)"
+                  message: "subscriptionId is required when cloud=azure."
+                - rule: "self.cloud == 'aws' || has(self.resourceGroupName)"
+                  message: "resourceGroupName is required when cloud=azure (chinit's ARM scope and every resource live inside it)."
+                - rule: "!(has(self.casEnabled) && self.casEnabled) || self.cloud == 'aws'"
+                  message: "casEnabled is the Antalya CAS shared S3 cold tier, AWS-only (Azure has no CAS build)."
+                - rule: "self.keeperCount % 2 == 1"
+                  message: "keeperCount must be ODD (Raft quorum arithmetic)."
+                - rule: "self.writerDesired <= self.writerMax"
+                  message: "writerDesired must be within [0, writerMax] (the claim ceiling)."
+                - rule: "self.readerDesired <= self.readerMax"
+                  message: "readerDesired must be within [0, readerMax] (the claim ceiling)."
+            status:
+              type: object
+              properties:
+                configFilesHash:
+                  description: 'The SHA-256 bundle digest chinit verifies at boot.'
+                  type: string
+                bundleBucket:
+                  description: 'The bundle bucket/container.'
+                  type: string
+                writerAsgName:
+                  description: 'The writers ASG/VMSS name.'
+                  type: string
+                readerAsgName:
+                  description: 'The readers ASG/VMSS name.'
+                  type: string

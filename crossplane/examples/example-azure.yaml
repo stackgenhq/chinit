@@ -1,0 +1,54 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example — a minimal chinit ClickHouse cluster on Azure via Crossplane.
+#
+# Prerequisites:
+#   1. crossplane/ + definitions/ + configuration/ + azure/ applied
+#      (see crossplane/README.md)
+#   2. A golden Compute Gallery image version id (images/azure) —
+#      replace goldenImageId below
+#   3. An existing resource group (Crossplane does NOT create it —
+#      set resourceGroupName below)
+#   4. The opentofu-azure-creds secret (service principal for the
+#      contract Workspace + the native azurerm provider's ProviderConfig)
+
+apiVersion: chinit.stackgenhq.io/v1alpha1
+kind: ClickHouseCluster
+metadata:
+  name: demo-azure
+spec:
+  cloud: azure
+  clusterName: demo          # 3-20 chars: becomes the storage account name
+  region: westus2
+  dnsZoneName: clickhouse.internal
+
+  # Identity ceilings — the VMSS maxima, never the live counts.
+  writerMax: 2
+  writerDesired: 2
+  readerMax: 6
+  readerDesired: 2
+  readerSpot: true
+  keeperCount: 3
+  backupEnabled: true
+
+  # Golden image (chinit binary baked in — build from images/azure).
+  goldenImageId: /subscriptions/REPLACE_ME/galleries/REPLACE_ME/images/clickhouse-node/versions/1.0.0
+
+  # Azure-specific pins.
+  resourceGroupName: rg-clickhouse-demo
+  subscriptionId: 00000000-0000-0000-0000-000000000000
+  adminUsername: azureuser
+  # sshPublicKey: ssh-ed25519 AAAA...   # set for real VM access
+
+  # Network — a fresh VNet in 10.42.0.0/24 (keepers at .20-.22, backup at .30).
+  subnetCidr: 10.42.0.0/24
+  clientCidrs:
+    - 10.42.0.0/24
+
+  # Sizing.
+  vmSize: Standard_D4s_v5
+  keeperVmSize: Standard_D2s_v5
+  metadataDiskSizeGb: 64
+  cacheDiskSizeGb: 128
+  keeperDiskSizeGb: 16

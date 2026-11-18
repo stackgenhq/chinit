@@ -1,0 +1,48 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example — a minimal chinit ClickHouse cluster on AWS via Crossplane.
+#
+# Prerequisites:
+#   1. crossplane/ + definitions/ + configuration/ + aws/ applied
+#      (see crossplane/README.md)
+#   2. A golden AMI (images/aws): replace goldenAmiId below
+#   3. The opentofu-aws-creds secret (AWS credentials for the contract
+#      Workspace + the native AWS provider's ProviderConfig)
+
+apiVersion: chinit.stackgenhq.io/v1alpha1
+kind: ClickHouseCluster
+metadata:
+  name: demo-aws
+spec:
+  cloud: aws
+  clusterName: demo
+  region: us-west-2
+  dnsZoneName: clickhouse.internal
+
+  # Identity ceilings — the ASG maxima, never the live counts.
+  writerMax: 2
+  writerDesired: 2
+  readerMax: 6
+  readerDesired: 2
+  readerSpot: true
+  keeperCount: 3
+  backupEnabled: true
+
+  # Golden image (chinit binary baked in — build from images/aws).
+  goldenAmiId: ami-0f8511dd30c68ca21  # Altinity Antalya golden AMI
+
+  # Network — a fresh VPC in 10.42.0.0/24 (keepers at .20-.22, backup at .30).
+  subnetCidr: 10.42.0.0/24
+  clientCidrs:
+    - 10.42.0.0/24
+
+  # Sizing (arm64/Graviton across the board).
+  instanceType: r8g.large
+  keeperInstanceType: m8g.large
+  metadataDiskSizeGb: 64
+  cacheDiskSizeGb: 128
+  keeperDiskSizeGb: 16
+
+  # Set casEnabled: true with an Antalya AMI for the shared S3 cold tier.
+  casEnabled: false

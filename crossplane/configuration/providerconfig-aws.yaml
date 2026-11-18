@@ -1,0 +1,46 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ============================================================================
+# ProviderConfig — the opentofu runner that executes the chinit contract
+# module (terraform/modules/chinit/aws) inside the cluster
+# ============================================================================
+# The Workspace runs ONE tofu module (the contract renderer); its AWS
+# credentials come from this ProviderConfig. Remote state is mandatory —
+# the provider does not persist state between reconciliations.
+# ============================================================================
+
+apiVersion: opentofu.upbound.io/v1beta1
+kind: ProviderConfig
+metadata:
+  name: opentofu-aws
+spec:
+  credentials:
+    - filename: aws-credentials.env
+      source: Secret
+      secretRef:
+        namespace: upbound-system
+        name: opentofu-aws-creds
+        key: credentials
+  # Injected into every Workspace this config governs: the AWS provider
+  # block and the mandatory remote state backend. The secret's file holds
+  # the standard AWS_PROFILE-style env keys — see the secret layout in
+  # docs/crossplane.md.
+  configuration: |
+    provider "aws" {
+      region                      = var.chinit_aws_region
+      access_key                  = var.chinit_aws_access_key
+      secret_key                  = var.chinit_aws_secret_key
+      skip_credentials_validation = true
+      skip_region_validation      = true
+      skip_requesting_account_id  = true
+    }
+
+    # The provider does not persist state: always remote.
+    terraform {
+      backend "kubernetes" {
+        secret_suffix     = "providerconfig-opentofu-aws"
+        namespace         = "upbound-system"
+        in_cluster_config = true
+      }
+    }

@@ -1,0 +1,44 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ============================================================================
+# ProviderConfig — the opentofu runner that executes the chinit contract
+# module (terraform/modules/chinit/azure) inside the cluster
+# ============================================================================
+# Same shape as providerconfig-aws.yaml, with the azurerm provider block
+# and the service-principal credentials chinit's ARM scope also needs at
+# boot (CHINIT_AZURE_SUBSCRIPTION_ID / CHINIT_AZURE_RESOURCE_GROUP /
+# CHINIT_AZURE_KEY_VAULT_NAME / CHINIT_AZURE_MANAGED_IDENTITY_CLIENT_ID
+# render from the claim into the user-data wrapper).
+# ============================================================================
+
+apiVersion: opentofu.upbound.io/v1beta1
+kind: ProviderConfig
+metadata:
+  name: opentofu-azure
+spec:
+  credentials:
+    - filename: azure-credentials.env
+      source: Secret
+      secretRef:
+        namespace: upbound-system
+        name: opentofu-azure-creds
+        key: credentials
+  configuration: |
+    provider "azurerm" {
+      features {}
+      subscription_id                 = var.chinit_azure_subscription_id
+      client_id                       = var.chinit_azure_client_id
+      client_secret                   = var.chinit_azure_client_secret
+      tenant_id                       = var.chinit_azure_tenant_id
+      skip_provider_registration      = true
+    }
+
+    # The provider does not persist state: always remote.
+    terraform {
+      backend "kubernetes" {
+        secret_suffix     = "providerconfig-opentofu-azure"
+        namespace         = "upbound-system"
+        in_cluster_config = true
+      }
+    }

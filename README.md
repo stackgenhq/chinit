@@ -54,6 +54,8 @@ The companion **Packer templates** in [`images/`](./images) pre-bake ClickHouse,
 
 ## Getting Started
 
+### Deploy with Terraform
+
 The quickest way to deploy a full cluster is with the **Terraform modules**, which provision the lease table, private DNS zone, secrets, instance IAM/RBAC roles, SHA-verified configuration bundle, and the four node roles (`writer`, `reader`, `keeper`, and optional `backup`):
 
 ```hcl
@@ -68,6 +70,26 @@ module "clickhouse" {
 ```
 
 See [`terraform/`](./terraform) for full module documentation and examples.
+
+### Deploy with Crossplane
+
+The same cluster can be deployed **from the Kubernetes API** with [Crossplane](https://docs.crossplane.io): native managed resources for the cloud infra, and the `chinit` contract module rendered in-cluster via `provider-opentofu` — byte-identical bundle and SHA-256 gate to the Terraform path:
+
+```yaml
+apiVersion: chinit.stackgenhq.io/v1alpha1
+kind: ClickHouseCluster
+metadata:
+  name: demo
+spec:
+  cloud: aws
+  clusterName: demo
+  region: us-west-2
+  dnsZoneName: clickhouse.internal
+  subnetCidr: 10.42.0.0/24
+  goldenAmiId: ami-0f8511dd30c68ca21
+```
+
+See [`crossplane/`](./crossplane) for the XRD, compositions, and examples, and [`docs/crossplane.md`](./docs/crossplane.md) for the rendered guide.
 
 To install the `chinit` binary directly on a Linux host:
 
@@ -92,6 +114,7 @@ Then run `chinit boot -spec /var/lib/clickhouse-bootstrap/chinit.yaml`. See the 
 - [Spec Reference (`chinit.yaml`)](./docs/spec.md) — Complete configuration reference
 - [Node Boot Procedure](./images/BOOT.md) — Step-by-step lifecycle from instance launch to `boot-finished`
 - [Terraform Modules](./terraform/README.md) — Deploy a complete cluster on AWS or Azure
+- [Crossplane](./docs/crossplane.md) — Deploy the same cluster from the Kubernetes API
 
 **Building Images & Contributing**
 

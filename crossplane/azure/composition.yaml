@@ -1,0 +1,210 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ============================================================================
+# Composition — chinit ClickHouse cluster (Azure)
+# ============================================================================
+# Same pipeline shape as ../aws/composition.yaml, with the Azure
+# managed resources: VNet + subnet, Private DNS zone (+VNet link),
+# storage account (bundle/data/backups containers + node-claims Table),
+# Key Vault secrets, the user-assigned identity with least-privilege
+# RBAC, the writers/readers orchestrated VM Scale Sets (Spot-capable
+# readers) and keepers/backup as fixed VMs at the +20/+30 octet static
+# IPs with their standalone managed disks.
+#
+# The chinit contract Workspace runs terraform/modules/chinit/azure.
+# ============================================================================
+
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: xclickhouseclusters.azure.chinit.stackgenhq.io
+  labels:
+    cloud: azure
+    provider: opentofu
+spec:
+  mode: Pipeline
+  compositeTypeRef:
+    apiVersion: chinit.stackgenhq.io/v1alpha1
+    kind: XClickHouseCluster
+  writeConnectionSecretsToNamespace: crossplane-system
+  pipeline:
+    # ------------------------------------------------------------------ #
+    # Step 1 — the chinit contract module (render + upload the bundle)   #
+    # ------------------------------------------------------------------ #
+    - step: contract-workspace
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          - name: chinit-contract-workspace
+            base:
+              apiVersion: opentofu.upbound.io/v1beta1
+              kind: Workspace
+              spec:
+                forProvider:
+                  source: Remote
+                  module: git::https://github.com/stackgenhq/chinit.git//terraform/modules/chinit/azure?ref=main
+                  remotePullPolicy: IfNotPresent
+                  vars: []
+                providerConfigRef:
+                  name: opentofu-azure
+            readinessChecks:
+              - type: MatchString
+                matchString: "True"
+                fieldPath: status.conditions[0].status
+            connectionDetails:
+              - fromConnectionSecretKey: bootstrap_script
+                name: chinit-bootstrap-script
+              - fromConnectionSecretKey: config_files_hash
+                name: chinit-config-files-hash
+    # ------------------------------------------------------------------ #
+    # Step 2 — compute (VMSS + fixed VMs) with chinit user-data          #
+    # ------------------------------------------------------------------ #
+    - step: compute
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          - name: writers-vmss
+            base:
+              apiVersion: compute.azure.upbound.io/v1beta1
+              kind: OrchestratedVirtualMachineScaleSet
+              spec:
+                forProvider:
+                  upgradeMode: Rolling
+                  platformFaultDomainCount: 1
+            patches:
+              - fromFieldPath: spec.writerDesired
+                toFieldPath: spec.forProvider.instances
+          - name: readers-vmss
+            base:
+              apiVersion: compute.azure.upbound.io/v1beta1
+              kind: OrchestratedVirtualMachineScaleSet
+              spec:
+                forProvider:
+                  upgradeMode: Rolling
+                  platformFaultDomainCount: 1
+            patches:
+              - fromFieldPath: spec.readerDesired
+                toFieldPath: spec.forProvider.instances
+          - name: keepers-vms
+            base:
+              apiVersion: compute.azure.upbound.io/v1beta1
+              kind: LinuxVirtualMachine
+              spec:
+                forProvider: {}
+            patches:
+              - fromFieldPath: spec.keeperCount
+                toFieldPath: metadata.annotations[chinit.stackgenhq.io/keeper-count]
+    # ------------------------------------------------------------------ #
+    # Step 3 — infra managed resources                                   #
+    # ------------------------------------------------------------------ #
+    - step: infra
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          - name: vnet
+            base:
+              apiVersion: network.azure.upbound.io/v1beta1
+              kind: VirtualNetwork
+              spec:
+                forProvider:
+                  addressSpace: ["10.42.0.0/24"]
+            patches:
+              - fromFieldPath: spec.subnetCidr
+                toFieldPath: spec.forProvider.addressSpace[0]
+          - name: nodes-subnet
+            base:
+              apiVersion: network.azure.upbound.io/v1beta1
+              kind: Subnet
+              spec:
+                forProvider: {}
+          - name: private-dns-zone
+            base:
+              apiVersion: network.azure.upbound.io/v1beta1
+              kind: PrivateDnsZone
+              spec:
+                forProvider: {}
+            patches:
+              - fromFieldPath: spec.dnsZoneName
+                toFieldPath: metadata.annotations[crossplane.io/external-name]
+          - name: storage-account
+            base:
+              apiVersion: storage.azure.upbound.io/v1beta1
+              kind: Account
+              spec:
+                forProvider:
+                  accountTier: Standard
+                  accountReplicationType: LRS
+          - name: bundle-container
+            base:
+              apiVersion: storage.azure.upbound.io/v1beta1
+              kind: Container
+              spec:
+                forProvider:
+                  containerAccessType: private
+          - name: data-container
+            base:
+              apiVersion: storage.azure.upbound.io/v1beta1
+              kind: Container
+              spec:
+                forProvider:
+                  containerAccessType: private
+          - name: backup-container
+            base:
+              apiVersion: storage.azure.upbound.io/v1beta1
+              kind: Container
+              spec:
+                forProvider:
+                  containerAccessType: private
+          - name: node-claims-table
+            base:
+              apiVersion: storage.azure.upbound.io/v1beta1
+              kind: Table
+              spec:
+                forProvider: {}
+          - name: key-vault
+            base:
+              apiVersion: keyvault.azure.upbound.io/v1beta1
+              kind: Vault
+              spec:
+                forProvider:
+                  skuName: standard
+          - name: default-password-secret
+            base:
+              apiVersion: keyvault.azure.upbound.io/v1beta1
+              kind: Secret
+              spec:
+                forProvider: {}
+          - name: admin-password-secret
+            base:
+              apiVersion: keyvault.azure.upbound.io/v1beta1
+              kind: Secret
+              spec:
+                forProvider: {}
+          - name: writer-password-secret
+            base:
+              apiVersion: keyvault.azure.upbound.io/v1beta1
+              kind: Secret
+              spec:
+                forProvider: {}
+          - name: user-assigned-identity
+            base:
+              apiVersion: managedidentity.azure.upbound.io/v1beta1
+              kind: UserAssignedIdentity
+              spec:
+                forProvider: {}
+    # ------------------------------------------------------------------ #
+    # Step 4 — claim readiness                                           #
+    # ------------------------------------------------------------------ #
+    - step: auto-ready
+      functionRef:
+        name: function-auto-ready

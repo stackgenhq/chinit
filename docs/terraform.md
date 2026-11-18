@@ -116,3 +116,12 @@ az vm run-command invoke --command-id RunShellScript \
 - **[The Spec]({{ '/spec/' | relative_url }})** — every `chinit.yaml` field the modules can render.
 
 The modules also validate offline (`tofu init -backend=false && tofu validate`), so you can check changes in CI without cloud credentials.
+
+## Deploying with Crossplane instead
+
+If you manage infrastructure from the Kubernetes API (GitOps, Argo CD), the [`crossplane/`](https://github.com/stackgenhq/chinit/tree/main/crossplane) tree deploys the same cluster with [Crossplane](https://docs.crossplane.io):
+
+- **Cloud infrastructure as native managed resources** — VPC/VNet, buckets/storage accounts, lease tables, private DNS zones, secrets, IAM/RBAC, ASGs/VMSS, fixed keepers/backup — synchronized by one `ClickHouseCluster` claim.
+- **The chinit contract module rendered in-cluster** via [provider-opentofu](https://github.com/upbound/provider-opentofu) `Workspace` resources, so the spec rendering and the SHA-256 bundle digest stay byte-identical to the Terraform deliverables (one renderer, no drift).
+
+A `ClickHouseCluster` claim maps 1:1 onto each module's variables (`writerMax`/`readerMax` are the ASG/VMSS maxima = the claim ceilings, never live counts). See [the Crossplane guide](https://stackgenhq.github.io/chinit/crossplane/) for install, credentials, claims, and scaling.

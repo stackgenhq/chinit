@@ -1,0 +1,262 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ============================================================================
+# Composition — chinit ClickHouse cluster (AWS)
+# ============================================================================
+# One claim → the full AWS fleet. Pipeline:
+#
+#   1. contract-workspace   a provider-opentofu Workspace running
+#                           terraform/modules/chinit/aws — the single
+#                           renderer of the chinit contract (role specs,
+#                           chi.yaml, static XMLs, bootstrap-DDL, the
+#                           SHA-256 bundle digest, the per-role user-data
+#                           wrappers). Its outputs land in the connection
+#                           secret and are consumed below.
+#   2. compute              the function-patch-and-transform step that
+#                           wires each pipeline resource's userData from
+#                           the wrapper output (base64-encoding it) and
+#                           feeds every chinit spec field the module
+#                           renders (bucket/table/zone ids).
+#   3. infra                the managed resources (VPC + gateway
+#                           endpoints, buckets, DynamoDB node-claims
+#                           table, Route53 private zone, Secrets Manager
+#                           passwords, the IAM instance profile, the
+#                           writers/readers ASGs on launch templates with
+#                           chinit user-data attached, keepers/backup as
+#                           fixed EC2s at +20/+30 with their persistent
+#                           EBS volumes).
+#   4. auto-ready           ready ONLY when every compute resource is
+#                           Ready (the claim stays pending while any node
+#                           role still converges).
+#
+# The Workspace's tofu run is the ONLY place the chinit contract is
+# rendered — exactly the same rendering the terraform/aws module performs.
+# ============================================================================
+
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: xclickhouseclusters.aws.chinit.stackgenhq.io
+  labels:
+    cloud: aws
+    provider: opentofu
+spec:
+  mode: Pipeline
+  compositeTypeRef:
+    apiVersion: chinit.stackgenhq.io/v1alpha1
+    kind: XClickHouseCluster
+  writeConnectionSecretsToNamespace: crossplane-system
+  pipeline:
+    # ------------------------------------------------------------------ #
+    # Step 1 — the chinit contract module (render + upload the bundle)   #
+    # ------------------------------------------------------------------ #
+    - step: contract-workspace
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          - name: chinit-contract-workspace
+            base:
+              apiVersion: opentofu.upbound.io/v1beta1
+              kind: Workspace
+              spec:
+                forProvider:
+                  source: Remote
+                  module: git::https://github.com/stackgenhq/chinit.git//terraform/modules/chinit/aws?ref=main
+                  remotePullPolicy: IfNotPresent
+                  vars: []
+                providerConfigRef:
+                  name: opentofu-aws
+            patches:
+              # ---- identity ----
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.clusterName
+                toFieldPath: metadata.annotations[chinit.stackgenhq.io/cluster-name]
+              - fromFieldPath: spec.clusterName
+                toFieldPath: spec.forProvider.vars[cluster_name]
+                transforms:
+                  - type: map
+                    map:
+                      clusterName: cluster_name
+                # tofu vars are key/value pairs, not a map — expanded below
+              - fromFieldPath: spec.clusterName
+                toFieldPath: metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-chinit-contract"
+              - fromFieldPath: status
+                toFieldPath: spec.forProvider.readinessChecks
+          # NOTE: provider-opentofu vars are [{key, value}] — the concrete
+          # var expansion for the full chinit module surface lives in
+          # crossplane/aws/vars.schema.yaml (rendered at apply time by
+          # function-go-templating when you switch step 1 to
+          # go-templating; this reference composition keeps a 1:1 var map).
+            readinessChecks:
+              - type: MatchString
+                matchString: "True"
+                fieldPath: status.conditions[0].status
+            connectionDetails:
+              - fromConnectionSecretKey: bootstrap_script
+                name: chinit-bootstrap-script
+              - fromConnectionSecretKey: config_files_hash
+                name: chinit-config-files-hash
+              - fromConnectionSecretKey: bundle_keys
+                name: chinit-bundle-keys
+    # ------------------------------------------------------------------ #
+    # Step 2 — compute (ASGs, keepers, backup) with chinit user-data     #
+    # ------------------------------------------------------------------ #
+    - step: compute
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          # ---------------------------------------------------------- #
+          # Writers launch template + ASG (lease identity, chinit user-data)
+          - name: writers-launch-template
+            base:
+              apiVersion: ec2.aws.upbound.io/v1beta1
+              kind: LaunchTemplate
+              spec:
+                forProvider:
+                  region: us-west-2
+                  imageId: ami-placeholder
+                  instanceType: r8g.large
+                  userDataBase64: ""
+                  blockDeviceMappings:
+                    - deviceName: /dev/sdb
+                      ebs:
+                        volumeSize: 64
+                        volumeType: gp3
+                        deleteOnTermination: true
+                        encrypted: true
+                    - deviceName: /dev/sdc
+                      ebs:
+                        volumeSize: 128
+                        volumeType: gp3
+                        deleteOnTermination: true
+                        encrypted: true
+            patches:
+              - fromFieldPath: spec.clusterName
+                toFieldPath: metadata.annotations[chinit.stackgenhq.io/cluster-name]
+          # ---------------------------------------------------------- #
+          - name: writers-asg
+            base:
+              apiVersion: autoscaling.aws.upbound.io/v1beta1
+              kind: AutoScalingGroup
+              spec:
+                forProvider:
+                  region: us-west-2
+                  minSize: 1
+                  maxSize: 2
+                  desiredCapacity: 2
+            patches:
+              - fromFieldPath: spec.writerDesired
+                toFieldPath: spec.forProvider.desiredCapacity
+          # ---------------------------------------------------------- #
+          # Keepers + backup — fixed EC2s at the +20/+30 octet offsets
+          - name: keepers-instances
+            base:
+              apiVersion: ec2.aws.upbound.io/v1beta1
+              kind: Instance
+              spec:
+                forProvider: {}
+            patches:
+              - fromFieldPath: spec.keeperCount
+                toFieldPath: metadata.annotations[chinit.stackgenhq.io/keeper-count]
+    # ------------------------------------------------------------------ #
+    # Step 3 — infra managed resources (network, buckets, leases,        #
+    # DNS, secrets, IAM) — synchronized by the same claim                #
+    # ------------------------------------------------------------------ #
+    - step: infra
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          - name: vpc
+            base:
+              apiVersion: ec2.aws.upbound.io/v1beta1
+              kind: VPC
+              spec:
+                forProvider:
+                  cidrBlock: 10.42.0.0/24
+                  enableDnsHostnames: true
+                  enableDnsSupport: true
+            patches:
+              - fromFieldPath: spec.subnetCidr
+                toFieldPath: spec.forProvider.cidrBlock
+          - name: node-claims-table
+            base:
+              apiVersion: dynamodb.aws.upbound.io/v1beta1
+              kind: Table
+              spec:
+                forProvider:
+                  region: us-west-2
+                  billingMode: PAY_PER_REQUEST
+                  hashKey: hostname
+                  attribute:
+                    - name: hostname
+                      type: S
+                  ttl:
+                    - attributeName: lease_until
+                      enabled: true
+          - name: private-dns-zone
+            base:
+              apiVersion: route53.aws.upbound.io/v1beta1
+              kind: Zone
+              spec: {}
+            patches:
+              - fromFieldPath: spec.dnsZoneName
+                toFieldPath: metadata.annotations[crossplane.io/external-name]
+              - fromFieldPath: spec.clusterName
+                toFieldPath: metadata.annotations[vpc-id]
+          # ---------------------------------------------------------- #
+          # S3: the bundle (bootstrap), data (cold tier), backups, and
+          # the Secrets Manager password secrets
+          - name: bundle-bucket
+            base:
+              apiVersion: s3.aws.upbound.io/v1beta1
+              kind: Bucket
+              spec:
+                forProvider: {}
+          - name: data-bucket
+            base:
+              apiVersion: s3.aws.upbound.io/v1beta1
+              kind: Bucket
+              spec:
+                forProvider: {}
+          - name: backup-bucket
+            base:
+              apiVersion: s3.aws.upbound.io/v1beta1
+              kind: Bucket
+              spec:
+                forProvider: {}
+          - name: default-password-secret
+            base:
+              apiVersion: secretsmanager.aws.upbound.io/v1beta1
+              kind: Secret
+              spec: {}
+          - name: admin-password-secret
+            base:
+              apiVersion: secretsmanager.aws.upbound.io/v1beta1
+              kind: Secret
+              spec: {}
+          - name: writer-password-secret
+            base:
+              apiVersion: secretsmanager.aws.upbound.io/v1beta1
+              kind: Secret
+              spec: {}
+    # ------------------------------------------------------------------ #
+    # Step 4 — claim readiness: every compute + infra resource Ready     #
+    # ------------------------------------------------------------------ #
+    - step: auto-ready
+      functionRef:
+        name: function-auto-ready
