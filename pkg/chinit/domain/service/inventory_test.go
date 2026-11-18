@@ -6,6 +6,8 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -220,14 +222,24 @@ var _ = Describe("clusterHostsWithSource", func() {
 				Cloud: "aws", Region: "us-east-1", Name: "01-14", Address: "backup-0.ch.internal", Role: domain.RoleBackup,
 			}))
 
-			// On-demand backup on RoleBackup itself: included so backup-0 renders its own CR slot.
+			// On-demand backup on RoleBackup itself: included so backup-0 renders its own CR slot,
+			// AND uses live claims (not vacant static ceiling slots) when a lease lister is present.
 			onDemandBackup := onDemandWriter
 			onDemandBackup.Role = model.RoleBackup
 			onDemandBackup.IdentityMode = model.IdentityStatic
-			hostsOnDemandBackup, _ := newInventoryBoot(onDemandBackup, nil).clusterHostsWithSource()
+			backupNoLister := newInventoryBoot(onDemandBackup, nil)
+			backupNoLister.Provider = &noListerProvider{}
+			hostsOnDemandBackup, _ := backupNoLister.clusterHostsWithSource()
 			Expect(hostsOnDemandBackup).To(ContainElement(domain.HostIdentity{
-				Cloud: "aws", Region: "us-east-1", Name: "01-14", Address: "backup-0.ch.internal", Role: domain.RoleBackup,
+				Cloud: "azure", Region: "us-east-1", Name: "01-14", Address: "backup-0.ch.internal", Role: domain.RoleBackup,
 			}))
+
+			hostsBackupLive, noteBackup := newInventoryBoot(onDemandBackup, lister).clusterHostsWithSource()
+			Expect(noteBackup).To(BeEmpty())
+			Expect(hostsBackupLive).To(Equal([]domain.HostIdentity{
+				{Cloud: "aws", Region: "us-east-1", Name: "01-0", Address: "writer-0.ch.internal", Role: domain.RoleWriter},
+				{Cloud: "aws", Region: "us-east-1", Name: "01-14", Address: "backup-0.ch.internal", Role: domain.RoleBackup},
+			}), "backup-0 in a lease fleet must list only live claimed peers, not vacant ceiling slots (Code 198 DNS_ERROR)")
 		})
 	})
 
@@ -246,6 +258,70 @@ var _ = Describe("clusterHostsWithSource", func() {
 			Expect(hosts).To(ContainElement(domain.HostIdentity{
 				Cloud: "azure", Region: "us-east-1", Name: "01-13", Address: "reader-9.ch.internal", Role: domain.RoleReader,
 			}))
+		})
+	})
+
+	Context("persistent EBS bucket/epoch drift guard", func() {
+		It("resets stale s3 store/cache/first_boot_done when s3_data_bucket changes while preserving uuid", func() {
+			dir := GinkgoT().TempDir()
+			origDir := clickhouseDataDir
+			clickhouseDataDir = func() string { return dir }
+			DeferCleanup(func() { clickhouseDataDir = origDir })
+			origRun := runCommandFn
+			runCommandFn = func(_ context.Context, _ string, _ ...string) (string, error) { return "", nil }
+			DeferCleanup(func() { runCommandFn = origRun })
+
+			Expect(os.WriteFile(filepath.Join(dir, "uuid"), []byte("keep-this-uuid"), 0640)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(dir, "first_boot_done"), []byte("done"), 0644)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(dir, "boot_epoch.json"), []byte(`{"s3_data_bucket":"ch-int-dev-clickhouse-data","cas_enabled":false}`+"\n"), 0644)).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(dir, "disks", "s3", "store", "4e0"), 0755)).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(dir, "disks", "s3_cache", "6d4"), 0755)).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(dir, "store", "4e0"), 0755)).To(Succeed())
+
+			b := &Boot{
+				Spec: &model.BootSpec{
+					Role:         model.RoleBackup,
+					S3DataBucket: "ch-int-dev-clickhouse-data-cas",
+					CasEnabled:   true,
+				},
+			}
+			b.reconcilePersistentBucketEpoch(context.Background())
+
+			Expect(filepath.Join(dir, "uuid")).To(BeAnExistingFile())
+			Expect(filepath.Join(dir, "first_boot_done")).NotTo(BeAnExistingFile())
+			Expect(filepath.Join(dir, "disks", "s3", "store")).NotTo(BeAnExistingFile())
+			Expect(filepath.Join(dir, "disks", "s3_cache")).NotTo(BeAnExistingFile())
+			Expect(filepath.Join(dir, "store")).NotTo(BeAnExistingFile())
+			epochData, err := os.ReadFile(filepath.Join(dir, "boot_epoch.json"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(epochData)).To(Equal(`{"s3_data_bucket":"ch-int-dev-clickhouse-data-cas","cas_enabled":true}` + "\n"))
+		})
+
+		It("resets legacy pre-epoch disks/s3/store residue on CAS-enabled backup-0", func() {
+			dir := GinkgoT().TempDir()
+			origDir := clickhouseDataDir
+			clickhouseDataDir = func() string { return dir }
+			DeferCleanup(func() { clickhouseDataDir = origDir })
+			origRun := runCommandFn
+			runCommandFn = func(_ context.Context, _ string, _ ...string) (string, error) { return "", nil }
+			DeferCleanup(func() { runCommandFn = origRun })
+
+			Expect(os.WriteFile(filepath.Join(dir, "uuid"), []byte("keep-this-uuid"), 0640)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(dir, "first_boot_done"), []byte("done"), 0644)).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(dir, "disks", "s3", "store", "4e0"), 0755)).To(Succeed())
+
+			b := &Boot{
+				Spec: &model.BootSpec{
+					Role:         model.RoleBackup,
+					S3DataBucket: "ch-int-dev-clickhouse-data-cas",
+					CasEnabled:   true,
+				},
+			}
+			b.reconcilePersistentBucketEpoch(context.Background())
+
+			Expect(filepath.Join(dir, "uuid")).To(BeAnExistingFile())
+			Expect(filepath.Join(dir, "first_boot_done")).NotTo(BeAnExistingFile())
+			Expect(filepath.Join(dir, "disks", "s3", "store")).NotTo(BeAnExistingFile())
 		})
 	})
 
