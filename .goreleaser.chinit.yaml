@@ -56,6 +56,15 @@ release:
     owner: stackgenhq
     name: chinit
   name_template: "chinit {{ .Version }}"
+  # A tag force-move (e.g. re-pointing v0.2.2 onto an HCL-fix commit)
+  # re-runs the release on a tag whose assets ALREADY exist: without
+  # this, every upload 422s (`already_exists`) and the failed run
+  # never completes, which blocks the release-chained AMI build
+  # (build-golden-ami.yml fires only on workflow_run.conclusion ==
+  # success). Re-uploading replaces the same-name asset — checksums of
+  # a re-cut tag SHOULD change and the SUMS asset publishes with them.
+  replace_existing_draft: true
+  replace_existing_artifacts: true
 
 changelog:
   use: git
