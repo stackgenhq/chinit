@@ -23,14 +23,11 @@ import (
 // the same fields off its own parsed spec — this projection is the
 // subcommand path, where the full spec was never parsed.
 type telemetrySpec struct {
-	LogShipping struct {
-		Endpoint string `yaml:"endpoint"`
-		Headers  string `yaml:"headers"`
-	} `yaml:"log_shipping"`
+	LogShipping model.LogShipping `yaml:"log_shipping"`
 }
 
 // loadTelemetryConfig reads the bundle spec's log_shipping section
-// (empty endpoint = telemetry disabled — the node's own convergence
+// (empty endpoints = telemetry disabled — the node's own convergence
 // contract: the optional pipeline never gates a job).
 func loadTelemetryConfig() telemetry.Config {
 	cfg := telemetry.Config{ServiceVersion: Version}
@@ -43,7 +40,11 @@ func loadTelemetryConfig() telemetry.Config {
 		return cfg
 	}
 	cfg.Endpoint = spec.LogShipping.Endpoint
+	cfg.MetricsEndpoint = spec.LogShipping.MetricsEndpoint
+	cfg.TracesEndpoint = spec.LogShipping.TracesEndpoint
 	cfg.Headers = spec.LogShipping.Headers
+	cfg.MetricsHeaders = spec.LogShipping.MetricsHeaders
+	cfg.TracesHeaders = spec.LogShipping.TracesHeaders
 	return cfg
 }
 
@@ -82,30 +83,35 @@ func shutdownTelemetry(ctx context.Context) {
 // Same loud-once WARNING when the endpoint is empty.
 func initBootTelemetry(ctx context.Context, spec *model.BootSpec, meta port.InstanceMetadata, cloud string) {
 	cfg := telemetry.Config{
-		ServiceVersion: Version,
-		Endpoint:       spec.LogShipping.Endpoint,
-		Headers:        spec.LogShipping.Headers,
-		InstanceID:     meta.InstanceID,
-		Cluster:        spec.ClusterName,
-		Role:           string(spec.Role),
-		Cloud:          cloud,
-		Region:         spec.Region,
+		ServiceVersion:  Version,
+		Endpoint:        spec.LogShipping.Endpoint,
+		MetricsEndpoint: spec.LogShipping.MetricsEndpoint,
+		TracesEndpoint:  spec.LogShipping.TracesEndpoint,
+		Headers:         spec.LogShipping.Headers,
+		MetricsHeaders:  spec.LogShipping.MetricsHeaders,
+		TracesHeaders:   spec.LogShipping.TracesHeaders,
+		InstanceID:      meta.InstanceID,
+		Cluster:         spec.ClusterName,
+		Role:            string(spec.Role),
+		Cloud:           cloud,
+		Region:          spec.Region,
 	}
 	if err := telemetry.Init(ctx, cfg); err != nil {
-		logger.GetLogger(ctx).Warn("telemetry init failed; metrics disabled for this run", "err", err.Error())
+		logger.GetLogger(ctx).Warn("telemetry init failed; metrics/traces disabled for this run", "err", err.Error())
 	}
 	if !telemetry.Enabled() {
-		logger.GetLogger(ctx).Warn("telemetry disabled: log_shipping.endpoint is empty in the spec (set it to the OTLP collector to capture chinit metrics)")
+		logger.GetLogger(ctx).Warn("telemetry disabled: log_shipping endpoints are empty in the spec (set endpoint/metrics_endpoint/traces_endpoint to capture chinit metrics and spans)")
 	}
 }
 
-// emitBootTelemetry records the pipeline's per-step durations and the
-// overall verdict (the engine's own StepOutcome rows — no re-timing,
-// the engine stays SDK-free; the telemetry reads the result only).
+// emitBootTelemetry records the pipeline's per-step durations, the
+// overall verdict, and the correlated "chinit.boot" trace waterfall
+// (root span + child span per step).
 func emitBootTelemetry(ctx context.Context, res service.RunResult, refresh bool) {
 	if !telemetry.Enabled() {
 		return
 	}
+	traceSteps := make([]telemetry.BootTraceStep, 0, len(res.Steps))
 	for _, st := range res.Steps {
 		telemetry.BootStep(ctx, telemetry.BootStepRequest{
 			Step:            st.Name,
@@ -113,10 +119,25 @@ func emitBootTelemetry(ctx context.Context, res service.RunResult, refresh bool)
 			Failed:          st.Err != nil,
 			Skipped:         st.Skipped,
 		})
+		traceSteps = append(traceSteps, telemetry.BootTraceStep{
+			Name:        st.Name,
+			Criticality: st.Crit.String(),
+			StartedAt:   st.StartedAt,
+			Duration:    st.Duration,
+			Err:         st.Err,
+			Skipped:     st.Skipped,
+		})
 	}
 	telemetry.BootOutcome(ctx, telemetry.BootOutcomeRequest{
 		Failed:  res.Fatality != nil,
 		Refresh: refresh,
+	})
+	telemetry.BootTrace(ctx, telemetry.BootTraceRequest{
+		StartedAt:  res.StartedAt,
+		FinishedAt: res.FinishedAt,
+		Refresh:    refresh,
+		Fatality:   res.Fatality,
+		Steps:      traceSteps,
 	})
 }
 
@@ -145,10 +166,17 @@ func runWithTelemetry(c command, args []string) error {
 		}
 	}
 	start := time.Now()
+	var endSpan func(string, error)
+	if !c.Boot {
+		_, endSpan = telemetry.StartJobSpan(ctx, c.Name)
+	}
 	err := c.Run(args)
 	outcome := telemetry.OutcomeCompleted
 	if err != nil {
 		outcome = telemetry.OutcomeFailed
+	}
+	if endSpan != nil {
+		endSpan(outcome, err)
 	}
 	telemetry.JobRun(ctx, telemetry.JobRunRequest{
 		Job:             c.Name,

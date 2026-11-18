@@ -379,6 +379,19 @@ var _ = Describe("DiskManager.MountAll", func() {
 		Expect(fail.IsFatal(err)).To(BeFalse(),
 			"a transient attach race must stay retryable: Fatal would defeat the boot step's bootWait policy")
 	})
+
+	It("prepares container directories without blkid/mount when platform is compose", func() {
+		r := newFakeRunner()
+		d := NewDiskManager(r).WithPlatform("compose")
+
+		mounted, err := d.MountAll(context.Background(), specFor(model.RoleKeeper), nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(mounted).To(HaveLen(2))
+		Expect(r.invoked("mkdir -p /var/lib/clickhouse")).To(BeTrue())
+		Expect(r.invoked("mkdir -p /var/lib/clickhouse-keeper/log")).To(BeTrue())
+		Expect(r.invoked("chown -R clickhouse:clickhouse /var/lib/clickhouse")).To(BeTrue())
+		Expect(r.invoked("blkid -l -o device -t LABEL=ch-metadata")).To(BeFalse())
+	})
 })
 
 var _ = Describe("ValidateXML", func() {

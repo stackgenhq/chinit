@@ -18,6 +18,7 @@ import (
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/service"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/aws"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/azure"
+	"github.com/stackgenhq/chinit/pkg/chinit/infra/compose"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/detect"
 	"github.com/stackgenhq/chinit/pkg/chinit/logger"
 )
@@ -28,6 +29,7 @@ func registry() port.Registry {
 	r := port.Registry{}
 	r.Register(detect.AWSName, func(cfg port.Config) port.Provider { return aws.New(cfg) })
 	r.Register(detect.AzureName, func(cfg port.Config) port.Provider { return azure.New(cfg) })
+	r.Register(detect.ComposeName, func(cfg port.Config) port.Provider { return compose.New(cfg) })
 	return r
 }
 

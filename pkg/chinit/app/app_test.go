@@ -4,11 +4,19 @@
 package app
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/port"
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/service"
 )
 
 // This file pins the CLI surface: subcommand dispatch and the boot
@@ -123,7 +131,8 @@ var _ = Describe("the command registry", func() {
 		unitCommands := []string{
 			"schema-sync", "schema-bootstrap", "replica-sync", "queue-heal",
 			"lease-renew", "keeper-health", "dead-replica-gc", "orphaned-gc",
-			"backup-daily", "backup-wake", "spot-watch", "drain", "drain-shutdown", "disk-autoscale",
+			"backup-daily", "backup-wake", "spot-watch", "drain", "drain-shutdown",
+			"disk-autoscale", "span-ship",
 		}
 		byName := map[string]bool{}
 		for _, c := range commands {
@@ -132,5 +141,61 @@ var _ = Describe("the command registry", func() {
 		for _, name := range unitCommands {
 			Expect(byName[name]).To(BeTrue(), "unit ExecStart command %q must be in the registry", name)
 		}
+	})
+})
+
+type stubSpanLogReader struct {
+	spans []model.RecordedSpan
+}
+
+func (r *stubSpanLogReader) ReadSpans(_ context.Context, _ port.SpanLogQuery) ([]model.RecordedSpan, error) {
+	return r.spans, nil
+}
+
+var _ = Describe("span-ship coordinator", func() {
+	It("wires SpanLogReader, JSONSpanCursorStore, and OTLPSpanSink through service.SpanShipper", func() {
+		var exportedBatches atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/insert/opentelemetry/v1/traces" {
+				exportedBatches.Add(1)
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		dir := GinkgoT().TempDir()
+		specFile := filepath.Join(dir, "chinit.yaml")
+		Expect(os.WriteFile(specFile, []byte("log_shipping:\n  traces_endpoint: "+srv.URL+"/insert/opentelemetry/v1/traces\n"), 0644)).To(Succeed())
+		stateFile := filepath.Join(dir, "state.json")
+		Expect(os.WriteFile(stateFile, []byte(`{"identity":{"role":"writer","hostname":"writer-0","cluster_name":"ch-int-dev","region":"us-west-2","cloud":"aws"}}`), 0644)).To(Succeed())
+		cursorFile := filepath.Join(dir, "span-ship.json")
+
+		origSpec := inventorySpecPath
+		inventorySpecPath = func() string { return specFile }
+		DeferCleanup(func() { inventorySpecPath = origSpec })
+
+		coord, err := newSpanShipCoordinator([]string{"-state", stateFile, "-cursor", cursorFile})
+		Expect(err).NotTo(HaveOccurred())
+		coord.reader = &stubSpanLogReader{
+			spans: []model.RecordedSpan{{
+				Hostname:          "writer-0",
+				ClickHouseVersion: "26.6.8.20004",
+				TraceID:           "11111111-2222-3333-4444-555555555555",
+				SpanID:            42,
+				OperationName:     "query",
+				Kind:              "SERVER",
+				StartTimeMicros:   1800000000000000,
+				FinishTimeMicros:  1800000000500000,
+				StatusCode:        "OK",
+			}},
+		}
+
+		Expect(coord.run(context.Background())).To(Succeed())
+		Expect(exportedBatches.Load()).To(Equal(int32(1)))
+
+		stored, ok, err := service.NewJSONSpanCursorStore(cursorFile).LoadCursor()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeTrue())
+		Expect(stored.FinishTimeMicros).To(Equal(uint64(1800000000500000)))
 	})
 })

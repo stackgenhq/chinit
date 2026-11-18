@@ -1,0 +1,29 @@
+cloud: compose
+role: keeper
+identity_mode: static
+cluster_name: compose-demo
+dns_zone_name: ch.local
+region: local
+
+keeper_nodes:
+  - keeper-0
+
+config_bundle:
+  bucket: compose-local
+  prefix: bootstrap
+
+disks:
+  metadata_label: ch-metadata
+  keeper_label: ch-keeper
+
+secrets:
+  default_password: default-password
+  admin_password: admin-password
+  writer_password: writer-password
+
+network:
+  subnet_cidr: 10.142.0.0/24
+
+log_shipping:
+  agent: otel
+  endpoint: http://otel-collector:4318

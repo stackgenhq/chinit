@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
@@ -283,6 +284,14 @@ WantedBy=multi-user.target
 				)
 			}
 		}
+		if b.Spec.LogShipping.EffectiveTracesEndpoint() != "" {
+			// Forward ClickHouse's in-table system.opentelemetry_span_log
+			// spans to the remote OTLP/VictoriaTraces endpoint every 30s.
+			units = append(units,
+				b.chinitUnit("span-ship.service", "Ship ClickHouse system.opentelemetry_span_log spans over OTLP", "span-ship"),
+				chinitTimer("span-ship.timer", "Forward ClickHouse OpenTelemetry spans every 30 seconds", "*-*-* *:*:00/30"),
+			)
+		}
 	case model.RoleBackup:
 		// The backup replica still carries the DDL convergence pass
 		// it materializes the same replicated tables to serve backups.
@@ -332,7 +341,7 @@ func (b *Boot) installUnits(ctx context.Context) error {
 	// exhaust unreserved space, so the probe's grow (if any) lands
 	// within the window the 5-minute timer would otherwise miss.
 	for _, u := range units {
-		if strings.HasSuffix(u.Name, ".timer") {
+		if strings.HasSuffix(u.Name, ".timer") || u.Name == "chinit-exporter.service" {
 			if out, err := runCommand(ctx, "systemctl", "enable", "--now", u.Name); err != nil {
 				// BestEffort step: enable failures are loud but the
 				// boot continues (the bash || echo WARNING shape).
@@ -516,47 +525,211 @@ WantedBy=multi-user.target
 // as attributes — so the Log Explorer rules can alert on them with
 // zero new emission code (the metrics pipeline carries the
 // aggregates; the log pipeline carries the per-tick detail).
-func (b *Boot) configureMonitoring(ctx context.Context) error {
-	if b.Spec.LogShipping.Endpoint == "" {
-		return nil // remote shipping disabled
-	}
-	switch b.Spec.LogShipping.Agent {
-	case "otel":
-		if err := os.MkdirAll("/etc/otelcol", 0755); err != nil {
-			return err
-		}
-		cfg := fmt.Sprintf(`receivers:
-  filelog:
-    include: [/var/log/clickhouse-server/*.log, /var/log/clickhouse-server/*-*.log]
-  journald/chinit:
-    units: [%s]
-    priority: info
+// otelcolConfigPath, otelcolBin, and otelcolUnitDir are seams for
+// configureMonitoring tests; production binds standard system paths.
+var (
+	otelcolConfigPath = func() string { return "/etc/otelcol/config.yaml" }
+	otelcolBin        = func() string { return "/usr/local/bin/otelcol" }
+	otelcolUnitDir    = func() string { return "/etc/systemd/system" }
+)
 
+// OTelCollectorRenderer renders /etc/otelcol/config.yaml for logs,
+// metrics (Prometheus scrape + local OTLP -> OTLP HTTP or Prometheus
+// Remote Write), and traces (local OTLP -> OTLP HTTP / VictoriaTraces).
+type OTelCollectorRenderer struct {
+	spec     *model.BootSpec
+	hostname string
+	units    []system.UnitFile
+}
+
+// NewOTelCollectorRenderer constructs a collector config renderer over
+// the node's BootSpec, settled hostname, and role unit inventory.
+func NewOTelCollectorRenderer(spec *model.BootSpec, hostname string, units []system.UnitFile) *OTelCollectorRenderer {
+	return &OTelCollectorRenderer{spec: spec, hostname: hostname, units: units}
+}
+
+// Render produces the complete OpenTelemetry Collector YAML document.
+func (r *OTelCollectorRenderer) Render() string {
+	var b strings.Builder
+	r.writeReceivers(&b)
+	r.writeProcessors(&b)
+	r.writeExporters(&b)
+	r.writePipelines(&b)
+	return b.String()
+}
+
+func (r *OTelCollectorRenderer) hasPrometheusScrape() bool {
+	return r.spec.LogShipping.EffectiveMetricsEndpoint() != "" && r.spec.Role != model.RoleKeeper
+}
+
+func (r *OTelCollectorRenderer) writeReceivers(b *strings.Builder) {
+	ls := r.spec.LogShipping
+	logsURL := ls.EffectiveLogsEndpoint()
+	metricsURL := ls.EffectiveMetricsEndpoint()
+	tracesURL := ls.EffectiveTracesEndpoint()
+
+	b.WriteString("receivers:\n")
+	if metricsURL != "" || tracesURL != "" {
+		b.WriteString("  otlp:\n    protocols:\n      http:\n        endpoint: 127.0.0.1:4318\n")
+	}
+	if logsURL != "" {
+		if r.spec.Role == model.RoleKeeper {
+			b.WriteString("  filelog:\n    include: [/var/log/clickhouse-keeper/*.log, /var/log/clickhouse-server/*.log]\n")
+		} else {
+			b.WriteString("  filelog:\n    include: [/var/log/clickhouse-server/*.log, /var/log/clickhouse-server/*-*.log]\n")
+		}
+		fmt.Fprintf(b, "  journald/chinit:\n    units: [%s]\n    priority: info\n", journaldUnitList(r.units))
+	}
+	if r.hasPrometheusScrape() {
+		fmt.Fprintf(b, `  prometheus:
+    config:
+      scrape_configs:
+        - job_name: clickhouse
+          scrape_interval: %s
+          static_configs:
+            - targets: ["127.0.0.1:9363"]
+`, ls.EffectiveScrapeInterval())
+		if r.spec.Role == model.RoleWriter || r.spec.Role == model.RoleReader {
+			fmt.Fprintf(b, `        - job_name: chinit
+          scrape_interval: %s
+          static_configs:
+            - targets: ["127.0.0.1:9150"]
+`, ls.EffectiveScrapeInterval())
+		}
+	}
+}
+
+func (r *OTelCollectorRenderer) writeProcessors(b *strings.Builder) {
+	fmt.Fprintf(b, `
 processors:
+  batch: {}
   resource:
     attributes:
       - key: host.name
         value: %s
         action: upsert
+      - key: chinit.cluster
+        value: %s
+        action: upsert
+      - key: chinit.role
+        value: %s
+        action: upsert
       - key: service.name
         from_attribute: journald.journal.systemd.unit
         action: insert
+`, r.hostname, r.spec.ClusterName, string(r.spec.Role))
+}
 
-exporters:
-  otlphttp:
-    endpoint: %s
-%s
-service:
-  pipelines:
-    logs:
-      receivers: [filelog, journald/chinit]
-      processors: [resource]
-      exporters: [otlphttp]
-`, journaldUnitList(b.chinitUnits()), b.Identity.Hostname, b.Spec.LogShipping.Endpoint, otlpHeadersBlock(b.Spec.LogShipping.Headers))
-		if err := os.WriteFile("/etc/otelcol/config.yaml", []byte(cfg), 0644); err != nil {
+func (r *OTelCollectorRenderer) writeExporters(b *strings.Builder) {
+	ls := r.spec.LogShipping
+	logsURL := ls.EffectiveLogsEndpoint()
+	metricsURL := ls.EffectiveMetricsEndpoint()
+	tracesURL := ls.EffectiveTracesEndpoint()
+
+	b.WriteString("\nexporters:\n")
+	if logsURL != "" {
+		fmt.Fprintf(b, "  otlphttp:\n    logs_endpoint: %s\n", logsURL)
+		if h := otlpHeadersBlock(ls.Headers); h != "" {
+			b.WriteString(h + "\n")
+		}
+	}
+	if metricsURL != "" {
+		if ls.IsPrometheusRemoteWrite() {
+			fmt.Fprintf(b, "  prometheusremotewrite:\n    endpoint: %s\n    resource_to_telemetry_conversion:\n      enabled: true\n", metricsURL)
+		} else {
+			fmt.Fprintf(b, "  otlphttp/metrics:\n    metrics_endpoint: %s\n", metricsURL)
+		}
+		if h := otlpHeadersBlock(ls.EffectiveMetricsHeaders()); h != "" {
+			b.WriteString(h + "\n")
+		}
+	}
+	if tracesURL != "" {
+		fmt.Fprintf(b, "  otlphttp/traces:\n    traces_endpoint: %s\n", tracesURL)
+		if h := otlpHeadersBlock(ls.EffectiveTracesHeaders()); h != "" {
+			b.WriteString(h + "\n")
+		}
+	}
+}
+
+func (r *OTelCollectorRenderer) writePipelines(b *strings.Builder) {
+	ls := r.spec.LogShipping
+	b.WriteString("\nservice:\n  pipelines:\n")
+	if ls.EffectiveLogsEndpoint() != "" {
+		b.WriteString("    logs:\n      receivers: [filelog, journald/chinit]\n      processors: [resource, batch]\n      exporters: [otlphttp]\n")
+	}
+	if ls.EffectiveMetricsEndpoint() != "" {
+		metricsReceivers := "[otlp]"
+		if r.hasPrometheusScrape() {
+			metricsReceivers = "[otlp, prometheus]"
+		}
+		metricsExporter := "[otlphttp/metrics]"
+		if ls.IsPrometheusRemoteWrite() {
+			metricsExporter = "[prometheusremotewrite]"
+		}
+		fmt.Fprintf(b, "    metrics:\n      receivers: %s\n      processors: [resource, batch]\n      exporters: %s\n", metricsReceivers, metricsExporter)
+	}
+	if ls.EffectiveTracesEndpoint() != "" {
+		b.WriteString("    traces:\n      receivers: [otlp]\n      processors: [resource, batch]\n      exporters: [otlphttp/traces]\n")
+	}
+}
+
+func (b *Boot) configureMonitoring(ctx context.Context) error {
+	if !b.Spec.LogShipping.HasAnyEndpoint() {
+		return nil // remote shipping disabled
+	}
+	agent := b.Spec.LogShipping.Agent
+	if agent == "" {
+		agent = "otel"
+	}
+	switch agent {
+	case "otel":
+		cfgPath := otelcolConfigPath()
+		if err := os.MkdirAll(filepath.Dir(cfgPath), 0755); err != nil {
 			return err
 		}
+		cfg := NewOTelCollectorRenderer(b.Spec, b.Identity.Hostname, b.chinitUnits()).Render()
+		if err := os.WriteFile(cfgPath, []byte(cfg), 0644); err != nil {
+			return err
+		}
+		if _, err := os.Stat(otelcolBin()); err != nil {
+			logger.GetLogger(ctx).Warn("WARNING: otelcol binary absent; config written without starting service", "bin", otelcolBin())
+			return nil
+		}
+		installer := system.NewUnitInstaller(otelcolUnitDir())
+		unit := system.UnitFile{
+			Name: "otelcol.service",
+			Content: fmt.Sprintf(`[Unit]
+Description=OpenTelemetry Collector (logs, metrics, traces remote push)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%s --config=%s
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, otelcolBin(), cfgPath),
+		}
+		if _, err := installer.InstallUnits([]system.UnitFile{unit}); err != nil {
+			return err
+		}
+		if out, err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+			return fmt.Errorf("otelcol daemon-reload: %w: %s", err, out)
+		}
+		if out, err := runCommand(ctx, "systemctl", "enable", "otelcol.service"); err != nil {
+			logger.GetLogger(ctx).Warn("WARNING: otelcol enable failed", "out", out, "err", err)
+		}
+		if out, err := runCommand(ctx, "systemctl", "restart", "otelcol.service"); err != nil {
+			logger.GetLogger(ctx).Warn("WARNING: otelcol restart failed", "out", out, "err", err)
+		}
 	case "fluentbit":
+		logsEndpoint := b.Spec.LogShipping.EffectiveLogsEndpoint()
+		if logsEndpoint == "" {
+			return nil
+		}
 		if err := os.MkdirAll("/etc/fluent-bit", 0755); err != nil {
 			return err
 		}
@@ -576,12 +749,12 @@ service:
     Name         %s
     Match        *
     Endpoint     %s
-`, output, b.Spec.LogShipping.Endpoint)
+`, output, logsEndpoint)
 		if err := os.WriteFile("/etc/fluent-bit/fluent-bit.conf", []byte(cfg), 0644); err != nil {
 			return err
 		}
 	default:
-		return fmt.Errorf("unknown log shipping agent %q (want otel or fluentbit)", b.Spec.LogShipping.Agent)
+		return fmt.Errorf("unknown log shipping agent %q (want otel or fluentbit)", agent)
 	}
 	return nil
 }

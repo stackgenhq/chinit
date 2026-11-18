@@ -12,8 +12,9 @@ import (
 
 // Names of the supported providers (the registry keys).
 const (
-	AWSName   = "aws"
-	AzureName = "azure"
+	AWSName     = "aws"
+	AzureName   = "azure"
+	ComposeName = "compose"
 )
 
 // Result is what detection produced, for the boot log.

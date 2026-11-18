@@ -5,13 +5,24 @@ package telemetry_test
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/port"
 	"github.com/stackgenhq/chinit/pkg/chinit/telemetry"
 )
 
@@ -217,6 +228,108 @@ var _ = Describe("Telemetry", func() {
 			// Collect while the second reader is live, then flush.
 			metrics := collect(r2)
 			Expect(metrics).To(HaveKey("chinit_job_runs"))
+		})
+	})
+
+	Context("OTLP trace spans", func() {
+		It("emits chinit boot waterfall and job spans via TracerProvider", func() {
+			Expect(telemetry.Shutdown(context.Background())).To(Succeed())
+			spanRecorder := tracetest.NewInMemoryExporter()
+			Expect(telemetry.InitWithProviders(telemetry.Config{
+				ServiceVersion: "test",
+				Cluster:        "sg-dev",
+				Role:           "writer",
+			}, nil, spanRecorder)).To(Succeed())
+			Expect(telemetry.TracesEnabled()).To(BeTrue())
+
+			t0 := time.Unix(1700000000, 0)
+			telemetry.BootTrace(context.Background(), telemetry.BootTraceRequest{
+				StartedAt:  t0,
+				FinishedAt: t0.Add(10 * time.Second),
+				Steps: []telemetry.BootTraceStep{
+					{Name: "mount_data_disks", Criticality: "critical", StartedAt: t0, Duration: 3 * time.Second},
+					{Name: "health_gate", Criticality: "best-effort", StartedAt: t0.Add(3 * time.Second), Duration: 2 * time.Second, Err: errors.New("peer cold")},
+				},
+			})
+			_, finishJob := telemetry.StartJobSpan(context.Background(), "lease-renew")
+			finishJob(telemetry.OutcomeCompleted, nil)
+
+			Expect(telemetry.ForceFlush(context.Background())).To(Succeed())
+			stubs := spanRecorder.GetSpans()
+			Expect(stubs).To(HaveLen(4))
+			byName := map[string]tracetest.SpanStub{}
+			for _, s := range stubs {
+				byName[s.Name] = s
+			}
+			Expect(byName).To(HaveKey("chinit.boot"))
+			Expect(byName).To(HaveKey("chinit.boot.mount_data_disks"))
+			Expect(byName).To(HaveKey("chinit.boot.health_gate"))
+			Expect(byName).To(HaveKey("chinit.job.lease-renew"))
+			Expect(byName["chinit.boot.mount_data_disks"].Parent.SpanID()).To(Equal(byName["chinit.boot"].SpanContext.SpanID()))
+			Expect(byName["chinit.boot.health_gate"].Status.Code).To(Equal(codes.Error))
+		})
+
+		It("converts domain SpanBatch records and POSTs OTLP via OTLPSpanSink to a custom VictoriaTraces path", func() {
+			var hits atomic.Int32
+			var gotPath, gotAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				gotPath = r.URL.Path
+				gotAuth = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			batch := port.SpanBatch{
+				Cluster:  "ch-int-dev",
+				Role:     model.RoleWriter,
+				Hostname: "writer-0",
+				Spans: []model.RecordedSpan{
+					{
+						Hostname:          "writer-0",
+						ClickHouseVersion: "26.6.8.20004",
+						TraceID:           "6b221d50-1111-2222-3333-444455556666",
+						SpanID:            100,
+						ParentSpanID:      0,
+						OperationName:     "query",
+						Kind:              "SERVER",
+						StartTimeMicros:   1700000000000000,
+						FinishTimeMicros:  1700000000250000,
+						StatusCode:        "OK",
+						Attributes:        map[string]string{"clickhouse.query_id": "q-1"},
+					},
+					{
+						Hostname:          "writer-0",
+						ClickHouseVersion: "26.6.8.20004",
+						TraceID:           "6b221d50-1111-2222-3333-444455556666",
+						SpanID:            200,
+						ParentSpanID:      100,
+						OperationName:     "WriteBufferFromS3::finalizeImpl",
+						Kind:              "CLIENT",
+						StartTimeMicros:   1700000000050000,
+						FinishTimeMicros:  1700000000200000,
+						StatusCode:        "OK",
+					},
+				},
+			}
+
+			sink := telemetry.NewOTLPSpanSink(telemetry.OTLPSpanSinkConfig{
+				EndpointURL: srv.URL + "/insert/opentelemetry/v1/traces",
+				Headers:     "Authorization=Bearer vm-secret",
+			})
+			spans := sink.BuildReadOnlySpans(batch)
+			Expect(spans).To(HaveLen(2))
+			Expect(batch.MaxFinishMicros()).To(Equal(uint64(1700000000250000)))
+			var wantParent oteltrace.SpanID
+			binary.BigEndian.PutUint64(wantParent[:], 100)
+			Expect(spans[1].Parent().SpanID()).To(Equal(wantParent))
+
+			exported, err := sink.Export(context.Background(), batch)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exported).To(Equal(2))
+			Expect(hits.Load()).To(Equal(int32(1)))
+			Expect(gotPath).To(Equal("/insert/opentelemetry/v1/traces"))
+			Expect(gotAuth).To(Equal("Bearer vm-secret"))
 		})
 	})
 })

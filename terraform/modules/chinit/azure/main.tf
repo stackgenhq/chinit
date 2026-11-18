@@ -338,7 +338,25 @@ variable "log_shipping_agent" {
 }
 
 variable "log_shipping_endpoint" {
-  description = "OTLP/HTTP endpoint (empty = remote shipping disabled)."
+  description = "Base OTLP/HTTP endpoint (empty = remote shipping disabled unless a per-signal endpoint is set)."
+  type        = string
+  default     = ""
+}
+
+variable "log_shipping_logs_endpoint" {
+  description = "Optional logs remote push URL override (e.g. VictoriaLogs 'https://<vl>/insert/opentelemetry/v1/logs')."
+  type        = string
+  default     = ""
+}
+
+variable "log_shipping_metrics_endpoint" {
+  description = "Optional metrics remote push URL override (VictoriaMetrics '/api/v1/write' Prometheus Remote Write or '/opentelemetry/v1/metrics' OTLP HTTP)."
+  type        = string
+  default     = ""
+}
+
+variable "log_shipping_traces_endpoint" {
+  description = "Optional traces remote push URL override (e.g. VictoriaTraces 'https://<vt>/insert/opentelemetry/v1/traces')."
   type        = string
   default     = ""
 }
@@ -347,6 +365,71 @@ variable "log_shipping_headers" {
   description = "Comma-separated k=v header pairs sent with each remote export."
   type        = string
   default     = ""
+}
+
+variable "log_shipping_metrics_headers" {
+  description = "Optional comma-separated k=v header pairs overriding log_shipping_headers for metrics push."
+  type        = string
+  default     = ""
+}
+
+variable "log_shipping_traces_headers" {
+  description = "Optional comma-separated k=v header pairs overriding log_shipping_headers for traces push."
+  type        = string
+  default     = ""
+}
+
+variable "log_shipping_scrape_interval" {
+  description = "Prometheus scrape interval for otelcol metrics push (default '15s')."
+  type        = string
+  default     = "15s"
+}
+
+variable "ch_otel_trace_probability" {
+  description = "ClickHouse opentelemetry_start_trace_probability (0.0-1.0) applied to default and ingest profiles."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.ch_otel_trace_probability >= 0 && var.ch_otel_trace_probability <= 1
+    error_message = "ch_otel_trace_probability must be between 0 and 1."
+  }
+}
+
+variable "ch_otel_keeper_trace_probability" {
+  description = "ClickHouse opentelemetry_start_keeper_trace_probability ('auto' or '0'..'1')."
+  type        = string
+  default     = "auto"
+}
+
+variable "ch_otel_trace_processors" {
+  description = "Enable ClickHouse per-processor OpenTelemetry spans (opentelemetry_trace_processors)."
+  type        = bool
+  default     = false
+}
+
+variable "ch_otel_span_log_ttl_days" {
+  description = "TTL days for system.opentelemetry_span_log (prevents frozen rotated span tables on metadata disks)."
+  type        = number
+  default     = 3
+}
+
+variable "ch_trace_log_ttl_days" {
+  description = "TTL days for system.trace_log, processors_profile_log, s3queue_log, blob_storage_log, and background_schedule_pool_log."
+  type        = number
+  default     = 7
+}
+
+variable "ch_global_profiler_period_ns" {
+  description = "Optional server-level global_profiler_real_time_period_ns / global_profiler_cpu_time_period_ns override (0 = keep ClickHouse 10s default)."
+  type        = number
+  default     = 0
+}
+
+variable "ch_log_query_threads" {
+  description = "Enable log_query_threads on default and ingest profiles so system.query_thread_log captures per-thread timings."
+  type        = bool
+  default     = false
 }
 
 variable "fluentbit_output" {
@@ -469,6 +552,13 @@ locals {
     log_level                    = var.ch_log_level
     text_log_level               = var.ch_text_log_level
     text_log_ttl_line            = var.ch_text_log_ttl_days > 0 ? "event_date + INTERVAL ${var.ch_text_log_ttl_days} DAY DELETE" : ""
+    otel_trace_probability       = var.ch_otel_trace_probability
+    otel_keeper_trace_prob       = var.ch_otel_keeper_trace_probability
+    otel_trace_processors        = var.ch_otel_trace_processors ? "1" : "0"
+    otel_span_log_ttl_days       = var.ch_otel_span_log_ttl_days
+    trace_log_ttl_days           = var.ch_trace_log_ttl_days
+    global_profiler_period_ns    = var.ch_global_profiler_period_ns
+    log_query_threads            = var.ch_log_query_threads ? "1" : "0"
   })
 
   chi_spec = var.chi_spec != null ? var.chi_spec : local.default_chi_spec
@@ -538,20 +628,26 @@ locals {
     subnet_cidr                    = var.subnet_cidr
     # Azure has no NLB-subnet equivalent in front of these nodes by
     # default; an empty nlb_subnet_cidr renders the spec field inert.
-    nlb_subnet_cidr           = ""
-    admin_networks_list       = join(", ", [for c in compact([for c in split(",", var.admin_allowed_networks) : trimspace(c)]) : "\"${c}\""])
-    writer_networks_list      = join(", ", [for c in compact([for c in split(",", var.writer_allowed_networks) : trimspace(c)]) : "\"${c}\""])
-    default_networks_list     = join(", ", [for c in compact([for c in split(",", var.default_user_allowed_networks) : trimspace(c)]) : "\"${c}\""])
-    backup_bucket             = var.backup_storage_account_name
-    backup_prefix             = var.backup_container_name
-    backup_retention_days     = var.backup_retention_days
-    backup_compression_format = var.backup_compression_format
-    is_backup_replica         = "false"
-    backup_replica_hostname   = var.enable_backup ? "backup-0" : ""
-    log_shipping_agent        = var.log_shipping_agent
-    log_shipping_endpoint     = var.log_shipping_endpoint
-    log_shipping_headers      = var.log_shipping_headers
-    fluentbit_output          = var.fluentbit_output
+    nlb_subnet_cidr               = ""
+    admin_networks_list           = join(", ", [for c in compact([for c in split(",", var.admin_allowed_networks) : trimspace(c)]) : "\"${c}\""])
+    writer_networks_list          = join(", ", [for c in compact([for c in split(",", var.writer_allowed_networks) : trimspace(c)]) : "\"${c}\""])
+    default_networks_list         = join(", ", [for c in compact([for c in split(",", var.default_user_allowed_networks) : trimspace(c)]) : "\"${c}\""])
+    backup_bucket                 = var.backup_storage_account_name
+    backup_prefix                 = var.backup_container_name
+    backup_retention_days         = var.backup_retention_days
+    backup_compression_format     = var.backup_compression_format
+    is_backup_replica             = "false"
+    backup_replica_hostname       = var.enable_backup ? "backup-0" : ""
+    log_shipping_agent            = var.log_shipping_agent
+    log_shipping_endpoint         = var.log_shipping_endpoint
+    log_shipping_logs_endpoint    = var.log_shipping_logs_endpoint
+    log_shipping_metrics_endpoint = var.log_shipping_metrics_endpoint
+    log_shipping_traces_endpoint  = var.log_shipping_traces_endpoint
+    log_shipping_headers          = var.log_shipping_headers
+    log_shipping_metrics_headers  = var.log_shipping_metrics_headers
+    log_shipping_traces_headers   = var.log_shipping_traces_headers
+    log_shipping_scrape_interval  = var.log_shipping_scrape_interval
+    fluentbit_output              = var.fluentbit_output
   }
 
   chinit_specs = {

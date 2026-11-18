@@ -122,5 +122,23 @@ log_shipping:
   endpoint: "${log_shipping_endpoint}"
   headers: "${log_shipping_headers}"
   fluentbit_output: "${fluentbit_output}"
+%{if log_shipping_logs_endpoint != ""~}
+  logs_endpoint: "${log_shipping_logs_endpoint}"
+%{endif~}
+%{if log_shipping_metrics_endpoint != ""~}
+  metrics_endpoint: "${log_shipping_metrics_endpoint}"
+%{endif~}
+%{if log_shipping_traces_endpoint != ""~}
+  traces_endpoint: "${log_shipping_traces_endpoint}"
+%{endif~}
+%{if log_shipping_metrics_headers != ""~}
+  metrics_headers: "${log_shipping_metrics_headers}"
+%{endif~}
+%{if log_shipping_traces_headers != ""~}
+  traces_headers: "${log_shipping_traces_headers}"
+%{endif~}
+%{if log_shipping_scrape_interval != "" && log_shipping_scrape_interval != "15s"~}
+  scrape_interval: "${log_shipping_scrape_interval}"
+%{endif~}
 
 region: "${region}"

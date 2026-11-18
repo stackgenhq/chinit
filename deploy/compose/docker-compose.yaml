@@ -1,0 +1,141 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+x-chinit-node: &chinit-node
+  build:
+    context: ../..
+    dockerfile: deploy/compose/Dockerfile
+  image: chinit-node:compose
+  privileged: true
+  cgroup: host
+  stop_signal: SIGRTMIN+3
+  stop_grace_period: 30s
+  tmpfs:
+    - /run
+    - /run/lock
+  ulimits:
+    nofile:
+      soft: 262144
+      hard: 262144
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.118.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4318:4318"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.5
+
+  keeper-0:
+    <<: *chinit-node
+    hostname: keeper-0
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.20
+      CHINIT_INSTANCE_ID: compose-keeper-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./specs/keeper.yaml:/var/lib/clickhouse-bootstrap/chinit.yaml:ro
+      - ./bundle:/etc/chinit/bundle:ro
+      - ./secrets:/etc/chinit/secrets:ro
+      - ch-leases:/var/lib/chinit-cluster
+      - keeper-0-data:/var/lib/clickhouse-keeper
+      - keeper-0-ch:/var/lib/clickhouse
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.20
+        aliases:
+          - keeper-0
+          - keeper-0.ch.local
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && systemctl is-active --quiet clickhouse-keeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  writer-0:
+    <<: *chinit-node
+    hostname: writer-node-0
+    depends_on:
+      otel-collector:
+        condition: service_started
+      keeper-0:
+        condition: service_healthy
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.10
+      CHINIT_INSTANCE_ID: compose-writer-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./specs/writer.yaml:/var/lib/clickhouse-bootstrap/chinit.yaml:ro
+      - ./bundle:/etc/chinit/bundle:ro
+      - ./secrets:/etc/chinit/secrets:ro
+      - ch-leases:/var/lib/chinit-cluster
+      - writer-0-data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "9150:9150"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && curl -sf http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  reader-0:
+    <<: *chinit-node
+    hostname: reader-node-0
+    depends_on:
+      otel-collector:
+        condition: service_started
+      keeper-0:
+        condition: service_healthy
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.30
+      CHINIT_INSTANCE_ID: compose-reader-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./specs/reader.yaml:/var/lib/clickhouse-bootstrap/chinit.yaml:ro
+      - ./bundle:/etc/chinit/bundle:ro
+      - ./secrets:/etc/chinit/secrets:ro
+      - ch-leases:/var/lib/chinit-cluster
+      - reader-0-data:/var/lib/clickhouse
+    ports:
+      - "18123:8123"
+      - "19150:9150"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.30
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && curl -sf http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+networks:
+  chnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.142.0.0/24
+
+volumes:
+  ch-leases:
+  keeper-0-data:
+  keeper-0-ch:
+  writer-0-data:
+  reader-0-data:

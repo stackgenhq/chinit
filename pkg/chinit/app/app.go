@@ -62,7 +62,7 @@ type command struct {
 // boot, then the schema/replica cluster ops, then the periodic
 // maintenance jobs, then the termination-path commands.
 var commands = []command{
-	{Name: "boot", Run: runBoot, Usage: "[-spec chinit.yaml] [-cloud aws|azure] [-dry-run] [-refresh]", Boot: true},
+	{Name: "boot", Run: runBoot, Usage: "[-spec chinit.yaml] [-cloud aws|azure|compose] [-dry-run] [-refresh]", Boot: true},
 	{Name: "schema-sync", Run: runSchemaSync, Usage: "[-retries N] [-prune-stale-self]"},
 	{Name: "schema-bootstrap", Run: runSchemaBootstrap},
 	{Name: "replica-sync", Run: runReplicaSync},
@@ -77,6 +77,7 @@ var commands = []command{
 	{Name: "fleet-converge", Run: runFleetConverge, Usage: "[-state FILE] (the ordinal-0 writer sweeps the task table)"},
 	{Name: "fleet-rollout", Run: runFleetRollout, Usage: "-target-version V [-role writer|reader] [-state FILE] (AMI rollout coordinator)"},
 	{Name: "exporter", Run: runExporter, Usage: "[-port 9150] [-state FILE] (the fleet metrics endpoint: /metrics + /clickhouse-metrics)"},
+	{Name: "span-ship", Run: runSpanShip, Usage: "[-state FILE] [-cursor FILE] [-limit N] (forward ClickHouse system.opentelemetry_span_log spans over OTLP)"},
 	{Name: "task-poll", Run: runTaskPoll, Usage: "[-state FILE] (claim and run this node's fleet task)"},
 	{Name: "fleet-status", Run: runFleetStatus, Usage: "[-json] [-state FILE] (the fleet's status table; exit 2 = degraded)"},
 	{Name: "cordon", Run: runCordon, Usage: "[-state FILE] <hostname> (flag a node for maintenance)"},
@@ -159,7 +160,7 @@ the BootSpec (chinit.yaml) and installs its own recurring jobs as
 subcommands.
 
 Usage:
-  chinit boot [-spec chinit.yaml] [-cloud aws|azure] [-dry-run] [-refresh]
+  chinit boot [-spec chinit.yaml] [-cloud aws|azure|compose] [-dry-run] [-refresh]
 `, Version)
 	// The maintenance/termination command list prints from the
 	// dispatch registry — the usage text and the dispatch table are
@@ -195,7 +196,7 @@ func parseBootFlags(args []string) (*bootFlags, error) {
 	fs := flag.NewFlagSet("chinit boot", flag.ContinueOnError)
 	f := &bootFlags{}
 	fs.StringVar(&f.specPath, "spec", "/var/lib/clickhouse-bootstrap/chinit.yaml", "path to chinit.yaml")
-	fs.StringVar(&f.cloud, "cloud", "", "cloud provider override (aws|azure); empty = detect")
+	fs.StringVar(&f.cloud, "cloud", "", "cloud provider override (aws|azure|compose); empty = detect")
 	fs.BoolVar(&f.dryRun, "dry-run", false, "validate the spec and print the plan without acting")
 	fs.BoolVar(&f.refresh, "refresh", false, "in-place refresh of a converged node: re-execute every step against the live node (never re-claims identity, never wipes keeper raft state)")
 	fs.StringVar(&f.statePath, "state", "/var/lib/chinit/state.json", "state file path")

@@ -11,11 +11,17 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/sdk/metric"
 	otelresource "go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 )
 
 // flushTimeout bounds Shutdown's ForceFlush — a wedged collector must
@@ -25,13 +31,23 @@ const flushTimeout = 5 * time.Second
 // Config is the init request (the two-parameter style: one struct,
 // no growing positional lists).
 type Config struct {
-	// Endpoint is the OTLP/HTTP metrics target — the spec's
-	// log_shipping.endpoint. Empty disables the whole package (every
-	// emit no-ops).
+	// Endpoint is the base OTLP/HTTP target — the spec's
+	// log_shipping.endpoint. Empty disables telemetry unless
+	// MetricsEndpoint or TracesEndpoint is explicitly set.
 	Endpoint string
+	// MetricsEndpoint overrides Endpoint for OTLP metrics (e.g.
+	// VictoriaMetrics "/opentelemetry/v1/metrics"). Prometheus Remote
+	// Write URLs ("/api/v1/write") are scraped/forwarded by otelcol.
+	MetricsEndpoint string
+	// TracesEndpoint overrides Endpoint for OTLP traces (e.g.
+	// VictoriaTraces "/insert/opentelemetry/v1/traces").
+	TracesEndpoint string
 	// Headers are comma-separated k=v pairs from log_shipping.headers
 	// (bearer tokens for collector front doors that need them).
 	Headers string
+	// MetricsHeaders / TracesHeaders optionally override Headers per signal.
+	MetricsHeaders string
+	TracesHeaders  string
 	// ServiceVersion is the chinit build (app.Version).
 	ServiceVersion string
 	// InstanceID is the emitting process's identity — the settled
@@ -69,39 +85,79 @@ type instruments struct {
 }
 
 var (
-	mu          sync.Mutex
-	provider    *metric.MeterProvider
-	meter       otelmetric.Meter
-	instr       *instruments
-	baseAttrs   []attribute.KeyValue
-	initialized bool
+	mu             sync.Mutex
+	provider       *metric.MeterProvider
+	meter          otelmetric.Meter
+	instr          *instruments
+	tracerProvider *sdktrace.TracerProvider
+	tracer         oteltrace.Tracer
+	baseAttrs      []attribute.KeyValue
+	initialized    bool
 )
 
-// Init installs the process-wide provider. Idempotent: a second call
-// (tests, re-entry) is a no-op while the first provider lives. When
-// cfg.Endpoint is empty the package stays in its disabled zero state —
-// Init returns nil and every emit no-ops, the same degradation rule as
-// the MetricPusher capability (a cloud without a metrics pipeline
-// logs a WARNING at the callsite and the job still exits 0).
+func (cfg Config) logShipping() model.LogShipping {
+	return model.LogShipping{
+		Endpoint:        cfg.Endpoint,
+		MetricsEndpoint: cfg.MetricsEndpoint,
+		TracesEndpoint:  cfg.TracesEndpoint,
+		Headers:         cfg.Headers,
+		MetricsHeaders:  cfg.MetricsHeaders,
+		TracesHeaders:   cfg.TracesHeaders,
+	}
+}
+
+// Init installs the process-wide metric and/or trace providers.
+// Idempotent: a second call (tests, re-entry) is a no-op while the
+// first provider lives. When neither an OTLP metrics endpoint nor a
+// traces endpoint resolves, the package stays in its disabled zero
+// state — Init returns nil and every emit no-ops.
 func Init(ctx context.Context, cfg Config) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if initialized {
 		return nil
 	}
-	if strings.TrimSpace(cfg.Endpoint) == "" {
+	ls := cfg.logShipping()
+	var reader metric.Reader
+	if metricsURL := ls.EffectiveMetricsEndpoint(); metricsURL != "" && !ls.IsPrometheusRemoteWrite() {
+		exporter, err := otlpmetrichttp.New(ctx,
+			otlpmetrichttp.WithEndpointURL(metricsURL),
+			otlpmetrichttp.WithHeaders(parseHeaders(ls.EffectiveMetricsHeaders())),
+		)
+		if err != nil {
+			return fmt.Errorf("telemetry metric exporter: %w", err)
+		}
+		// Oneshot discipline: the interval is a wedged-process backstop
+		// only — Shutdown's ForceFlush is the real delivery path.
+		reader = metric.NewPeriodicReader(exporter, metric.WithInterval(time.Hour))
+	} else if ls.IsPrometheusRemoteWrite() && ls.Agent != "fluentbit" {
+		// When metrics_endpoint is Prometheus Remote Write (e.g.
+		// VictoriaMetrics /api/v1/write), push chinit's OTLP job/boot
+		// metrics to the local otelcol OTLP receiver on 127.0.0.1:4318
+		// so otelcol forwards them through prometheusremotewrite.
+		exporter, err := otlpmetrichttp.New(ctx,
+			otlpmetrichttp.WithEndpointURL("http://127.0.0.1:4318/v1/metrics"),
+		)
+		if err == nil {
+			reader = metric.NewPeriodicReader(exporter, metric.WithInterval(time.Hour))
+		}
+	}
+
+	var spanExp sdktrace.SpanExporter
+	if tracesURL := ls.EffectiveTracesEndpoint(); tracesURL != "" {
+		exp, err := otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpointURL(tracesURL),
+			otlptracehttp.WithHeaders(parseHeaders(ls.EffectiveTracesHeaders())),
+		)
+		if err != nil {
+			return fmt.Errorf("telemetry trace exporter: %w", err)
+		}
+		spanExp = exp
+	}
+	if reader == nil && spanExp == nil {
 		return nil // telemetry disabled — emits no-op
 	}
-	exporter, err := otlpmetrichttp.New(ctx,
-		otlpmetrichttp.WithEndpointURL(strings.TrimSuffix(cfg.Endpoint, "/")+"/v1/metrics"),
-		otlpmetrichttp.WithHeaders(parseHeaders(cfg.Headers)),
-	)
-	if err != nil {
-		return fmt.Errorf("telemetry exporter: %w", err)
-	}
-	// Oneshot discipline: the interval is a wedged-process backstop
-	// only — Shutdown's ForceFlush is the real delivery path.
-	return initWithReaderLocked(metric.NewPeriodicReader(exporter, metric.WithInterval(time.Hour)), cfg)
+	return initProvidersLocked(cfg, reader, spanExp)
 }
 
 // InitWithReader installs the provider over a caller-supplied reader
@@ -110,24 +166,26 @@ func Init(ctx context.Context, cfg Config) error {
 // production path never calls it). Same config, same instruments, same
 // disabled-when-empty rule.
 func InitWithReader(cfg Config, reader metric.Reader) error {
+	return InitWithProviders(cfg, reader, nil)
+}
+
+// InitWithProviders installs caller-supplied metric reader and/or span
+// exporter (the specs' collection seam for both metrics and traces).
+func InitWithProviders(cfg Config, reader metric.Reader, spanExp sdktrace.SpanExporter) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if initialized {
 		return nil
 	}
-	if reader == nil {
+	if reader == nil && spanExp == nil {
 		return nil // telemetry disabled — emits no-op
 	}
-	return initWithReaderLocked(reader, cfg)
+	return initProvidersLocked(cfg, reader, spanExp)
 }
 
-// initWithReaderLocked assembles the provider over one reader (the
-// OTLP exporter arrives wrapped in a periodic reader; the test seam
-// passes a manual.Reader straight through). The schemaless merge rule
-// is the operator's (machinery.go): a schema URL conflict between
-// Default() and our semconv would be an SDK-upgrade crash, not a
-// runtime condition.
-func initWithReaderLocked(reader metric.Reader, cfg Config) error {
+// initProvidersLocked assembles the meter and/or tracer providers over
+// a shared OTel Resource.
+func initProvidersLocked(cfg Config, reader metric.Reader, spanExp sdktrace.SpanExporter) error {
 	res, err := otelresource.Merge(
 		otelresource.Default(),
 		otelresource.NewSchemaless(
@@ -142,17 +200,26 @@ func initWithReaderLocked(reader metric.Reader, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("telemetry resource: %w", err)
 	}
-	provider = metric.NewMeterProvider(
-		metric.WithResource(res),
-		metric.WithReader(reader),
-	)
-	meter = provider.Meter("chinit")
-	var err2 error
-	instr, err2 = buildInstruments(meter)
-	if err2 != nil {
-		provider = nil
-		meter = nil
-		return fmt.Errorf("telemetry instruments: %w", err2)
+	if reader != nil {
+		provider = metric.NewMeterProvider(
+			metric.WithResource(res),
+			metric.WithReader(reader),
+		)
+		meter = provider.Meter("chinit")
+		var err2 error
+		instr, err2 = buildInstruments(meter)
+		if err2 != nil {
+			provider = nil
+			meter = nil
+			return fmt.Errorf("telemetry instruments: %w", err2)
+		}
+	}
+	if spanExp != nil {
+		tracerProvider = sdktrace.NewTracerProvider(
+			sdktrace.WithResource(res),
+			sdktrace.WithBatcher(spanExp),
+		)
+		tracer = tracerProvider.Tracer("chinit")
 	}
 	baseAttrs = []attribute.KeyValue{
 		attribute.String("chinit.cluster", cfg.Cluster),
@@ -265,33 +332,189 @@ func buildInstruments(m otelmetric.Meter) (*instruments, error) {
 	return i, nil
 }
 
-// Shutdown flushes the provider and tears it down. Safe on the
-// disabled zero state. The flush deadline bounds the collector-
-// unreachable case so a dying job never hangs on telemetry; a flush
-// failure is returned (the CLI logs it as a WARNING — the job's own
-// outcome stands, the same rule as pushKeeperUp).
+// ForceFlush flushes pending metrics and spans without tearing down
+// the active providers.
+func ForceFlush(ctx context.Context) error {
+	mu.Lock()
+	p := provider
+	tp := tracerProvider
+	mu.Unlock()
+	flushCtx, cancel := context.WithTimeout(ctx, flushTimeout)
+	defer cancel()
+	var err error
+	if tp != nil {
+		if ferr := tp.ForceFlush(flushCtx); ferr != nil && err == nil {
+			err = ferr
+		}
+	}
+	if p != nil {
+		if ferr := p.ForceFlush(flushCtx); ferr != nil && err == nil {
+			err = ferr
+		}
+	}
+	return err
+}
+
+// Shutdown flushes the metric and trace providers and tears them down.
+// Safe on the disabled zero state. The flush deadline bounds the
+// collector-unreachable case so a dying job never hangs on telemetry.
 func Shutdown(ctx context.Context) error {
 	mu.Lock()
 	p := provider
+	tp := tracerProvider
 	provider = nil
 	meter = nil
 	instr = nil
+	tracerProvider = nil
+	tracer = nil
 	baseAttrs = nil
 	initialized = false
 	mu.Unlock()
-	if p == nil {
+	if p == nil && tp == nil {
 		return nil
 	}
-	var err error
-	defer func() {
-		if serr := p.Shutdown(ctx); serr != nil && err == nil {
-			err = serr
-		}
-	}()
 	flushCtx, cancel := context.WithTimeout(ctx, flushTimeout)
 	defer cancel()
-	err = p.ForceFlush(flushCtx)
+	var err error
+	if tp != nil {
+		if ferr := tp.ForceFlush(flushCtx); ferr != nil && err == nil {
+			err = ferr
+		}
+		if serr := tp.Shutdown(flushCtx); serr != nil && err == nil {
+			err = serr
+		}
+	}
+	if p != nil {
+		if ferr := p.ForceFlush(flushCtx); ferr != nil && err == nil {
+			err = ferr
+		}
+		if serr := p.Shutdown(flushCtx); serr != nil && err == nil {
+			err = serr
+		}
+	}
 	return err
+}
+
+// TracesEnabled reports whether Init wired a live TracerProvider.
+func TracesEnabled() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return initialized && tracer != nil
+}
+
+// StartJobSpan opens a root span for a chinit subcommand execution when
+// trace export is enabled, returning a finish closure that sets the
+// outcome status/attributes and ends the span. No-op when disabled.
+func StartJobSpan(ctx context.Context, job string) (context.Context, func(outcome string, runErr error)) {
+	mu.Lock()
+	tr := tracer
+	base := baseAttrs
+	mu.Unlock()
+	if tr == nil {
+		return ctx, func(string, error) {}
+	}
+	spanCtx, span := tr.Start(ctx, "chinit.job."+job,
+		oteltrace.WithSpanKind(oteltrace.SpanKindInternal),
+		oteltrace.WithAttributes(attrs(base, attribute.String("chinit.job", job))...),
+	)
+	return spanCtx, func(outcome string, runErr error) {
+		span.SetAttributes(attribute.String("chinit.outcome", outcome))
+		if runErr != nil {
+			span.RecordError(runErr)
+			span.SetStatus(codes.Error, runErr.Error())
+		} else {
+			span.SetStatus(codes.Ok, "")
+		}
+		span.End()
+	}
+}
+
+// BootTraceStep describes one step's timing and verdict for BootTrace.
+type BootTraceStep struct {
+	Name        string
+	Criticality string
+	StartedAt   time.Time
+	Duration    time.Duration
+	Err         error
+	Skipped     bool
+}
+
+// BootTraceRequest carries the boot pipeline run's timing and outcome
+// so BootTrace can emit one correlated trace waterfall ("chinit.boot"
+// root span + child spans per step).
+type BootTraceRequest struct {
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Refresh    bool
+	Fatality   error
+	Steps      []BootTraceStep
+}
+
+// BootTrace emits a root "chinit.boot" span with one child span per
+// executed step using the engine's recorded timestamps. No-op when
+// trace telemetry is disabled.
+func BootTrace(ctx context.Context, req BootTraceRequest) {
+	mu.Lock()
+	tr := tracer
+	base := baseAttrs
+	mu.Unlock()
+	if tr == nil {
+		return
+	}
+	bootStart := req.StartedAt
+	if bootStart.IsZero() {
+		bootStart = time.Now()
+	}
+	bootEnd := req.FinishedAt
+	if bootEnd.Before(bootStart) {
+		bootEnd = bootStart
+	}
+	rootCtx, rootSpan := tr.Start(ctx, "chinit.boot",
+		oteltrace.WithTimestamp(bootStart),
+		oteltrace.WithSpanKind(oteltrace.SpanKindInternal),
+		oteltrace.WithAttributes(attrs(base, attribute.Bool("chinit.refresh", req.Refresh))...),
+	)
+	for _, st := range req.Steps {
+		stepStart := st.StartedAt
+		if stepStart.IsZero() {
+			stepStart = bootStart
+		}
+		stepEnd := stepStart.Add(st.Duration)
+		if stepEnd.After(bootEnd) {
+			bootEnd = stepEnd
+		}
+		outcome := OutcomeCompleted
+		if st.Err != nil {
+			outcome = OutcomeFailed
+		}
+		if st.Skipped {
+			outcome = OutcomeSkipped
+		}
+		_, child := tr.Start(rootCtx, "chinit.boot."+st.Name,
+			oteltrace.WithTimestamp(stepStart),
+			oteltrace.WithSpanKind(oteltrace.SpanKindInternal),
+			oteltrace.WithAttributes(attrs(base,
+				attribute.String("chinit.step", st.Name),
+				attribute.String("chinit.criticality", st.Criticality),
+				attribute.String("chinit.outcome", outcome),
+				attribute.Bool("chinit.skipped", st.Skipped),
+			)...),
+		)
+		if st.Err != nil {
+			child.RecordError(st.Err)
+			child.SetStatus(codes.Error, st.Err.Error())
+		} else {
+			child.SetStatus(codes.Ok, "")
+		}
+		child.End(oteltrace.WithTimestamp(stepEnd))
+	}
+	if req.Fatality != nil {
+		rootSpan.RecordError(req.Fatality)
+		rootSpan.SetStatus(codes.Error, req.Fatality.Error())
+	} else {
+		rootSpan.SetStatus(codes.Ok, "")
+	}
+	rootSpan.End(oteltrace.WithTimestamp(bootEnd))
 }
 
 // Enabled reports whether Init wired a live provider (the CLI's

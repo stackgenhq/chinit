@@ -1,0 +1,35 @@
+cloud: compose
+role: reader
+identity_mode: lease
+claimer_table_name: compose-claims
+writer_hostname_prefix: writer-
+reader_hostname_prefix: reader-
+writer_max: 2
+reader_max: 2
+reader_count: 1
+cluster_name: compose-demo
+dns_zone_name: ch.local
+region: local
+
+keeper_nodes:
+  - keeper-0
+
+config_bundle:
+  bucket: compose-local
+  prefix: bootstrap
+
+disks:
+  metadata_label: ch-metadata
+
+secrets:
+  default_password: default-password
+  admin_password: admin-password
+  writer_password: writer-password
+
+network:
+  subnet_cidr: 10.142.0.0/24
+
+log_shipping:
+  agent: otel
+  endpoint: http://otel-collector:4318
+  scrape_interval: 15s
