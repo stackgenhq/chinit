@@ -195,11 +195,18 @@ source "amazon-ebs" "clickhouse" {
 
   # The public flavor carries its own Purpose tag so the private
   # generation-prune step never sweeps published images (one published
-  # generation, retired by its own workflow job).
-  snapshot_tags = var.public_ami ? merge(var.ami_tags, { Purpose = "clickhouse-golden-ami-public" }) : var.ami_tags
-  tags          = merge(
+  # generation, retired by its own workflow job). Flavor stamps upstream
+  # vs antalya so parallel matrix builds prune only their own flavor track.
+  snapshot_tags = merge(
     var.public_ami ? merge(var.ami_tags, { Purpose = "clickhouse-golden-ami-public" }) : var.ami_tags,
-    { Author = var.ami_author }
+    { Flavor = var.build_flavor }
+  )
+  tags = merge(
+    var.public_ami ? merge(var.ami_tags, { Purpose = "clickhouse-golden-ami-public" }) : var.ami_tags,
+    {
+      Author = var.ami_author
+      Flavor = var.build_flavor
+    }
   )
 
   # Public launch permission when building the share flavor:

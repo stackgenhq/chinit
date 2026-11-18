@@ -176,6 +176,21 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		// 11. Start clickhouse-server (CRITICAL; keepers skip inside).
 		StepFunc("start_clickhouse", Critical, onceFatal, b.startClickhouse),
 
+		// 11c. CloudWatch agent (AWS): BEFORE the peer-heavy steps.
+		// The 2026-11-18 finding: health_gate's 11-minute retry
+		// budget (bootWait x attempts against a fleet mid-refresh,
+		// where every peer is cold) ran out BEFORE the tail steps
+		// ran, so the CW agent never installed on fresh nodes —
+		// 30-min S3Queue lag blind spot at the 30 TB benchmark
+		// (no watermark metrics from any node), no CPU/iowait
+		// series during the whole rolling refresh window, and a
+		// `ch-s3queue-lag` alarm blind for 30+ consecutive
+		// minutes. Running configure_cloudwatch immediately after
+		// the server starts (no peer needed; it's node-local
+		// fetch-config) guarantees every boot has telemetry even
+		// when the health gate later retries the whole budget.
+		StepFunc("configure_cloudwatch", BestEffort, onceFatal, b.configureCloudWatch),
+
 		// 11a. Storage-loss detection (server nodes): a re-imaged node
 		// whose ordinal claims a name with EXISTING Keeper replica
 		// registrations and an EMPTY data directory would stall every
@@ -229,10 +244,9 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		StepFunc("configure_backup", Critical, onceFatal, b.configureBackup),
 
 		// 16. Monitoring agents (OTEL/Fluent Bit remote shipping;
-		// CloudWatch agent on AWS — chinit owns it now, the image only
-		// installs the deb).
+		// the AWS CloudWatch agent lives in step 11c so telemetry
+		// exists even when the health gate burns its retry budget).
 		StepFunc("configure_monitoring", BestEffort, onceFatal, b.configureMonitoring),
-		StepFunc("configure_cloudwatch", BestEffort, onceFatal, b.configureCloudWatch),
 
 		// 17. Spot watcher service (readers). BestEffort stays: the
 		// spot notice is an optimization over the shutdown drain +

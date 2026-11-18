@@ -21,19 +21,24 @@ on:
   workflow_dispatch:
     inputs:
       clickhouse_version:
-        description: "ClickHouse version (e.g. 26.8.36.3; empty = packer default)"
+        description: "Upstream ClickHouse version (e.g. 26.8.36.3; empty = default)"
+        required: false
+        default: ""
+      antalya_clickhouse_version:
+        description: "Altinity Antalya ClickHouse version (e.g. 26.6.8.20004.altinityantalya; empty = default)"
         required: false
         default: ""
       build_flavor:
-        description: "Package repo: upstream (packages.clickhouse.com) or antalya (Altinity builds, Apache-2.0, CAS-capable)"
+        description: "Package repo flavor(s) to build in parallel: both (default), upstream, or antalya"
         required: false
-        default: "upstream"
+        default: "both"
         type: choice
         options:
+          - both
           - upstream
           - antalya
       publish:
-        description: "ALSO build the PUBLIC share flavor (unencrypted + launchable by any AWS account; keep one published generation)"
+        description: "ALSO build the PUBLIC share flavor (unencrypted + launchable by any AWS account; keep one published generation per flavor)"
         required: false
         default: false
         type: boolean
@@ -78,17 +83,28 @@ concurrency:
 
 jobs:
   build-ami:
-    name: Build golden AMI
+    name: Build golden AMI (${{ matrix.flavor }})
     # The publish-public job builds its own flavor; when dispatching with
     # publish=true, skip the private build entirely (one build per run).
     # The workflow_run arm ALSO gates on the triggering release's
     # conclusion: a failed release bumped no pin, so building would
     # only re-bake the previous generation on a 15-45min build slot.
+    # Both upstream and antalya build in parallel by default unless a single
+    # flavor is explicitly selected on workflow_dispatch.
     if: >-
       (github.event_name != 'workflow_dispatch' || !inputs.publish) &&
-      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') &&
+      (github.event_name != 'workflow_dispatch' || inputs.build_flavor == 'both' || inputs.build_flavor == '' || inputs.build_flavor == matrix.flavor)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: upstream
+            default_clickhouse_version: "26.8.36.3"
+          - flavor: antalya
+            default_clickhouse_version: "26.6.8.20004.altinityantalya"
 
     steps:
       - name: Mask account identifiers
@@ -153,10 +169,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build
+      - name: Build (${{ matrix.flavor }})
         id: build
         env:
-          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          # Scope BUILD_ID per matrix flavor so parallel cleanup steps never
+          # sweep the sibling flavor's in-flight builder instance/keypair/SG.
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.flavor }}
           # The repo is private: release assets are not anonymously
           # fetchable, and the packer template's LAST install step
           # downloads chinit from the release. Without this token the
@@ -171,39 +189,45 @@ jobs:
           # pipefail: without it `packer build | tee` reports tee's exit code
           # (always 0) and a FAILED build looks like a green job.
           set -o pipefail
-          EXTRA=""
-          [ -n "${{ github.event.inputs.clickhouse_version }}" ] && \
-            EXTRA="-var clickhouse_version=${{ github.event.inputs.clickhouse_version }}"
-          FLAVOR="${{ github.event.inputs.build_flavor }}"
-          [ -z "$FLAVOR" ] && FLAVOR="upstream"
-          EXTRA="$EXTRA -var build_flavor=$FLAVOR"
-          # Stamp every temporary resource (instance, key pair, security group,
-          # volume) with BuildId so the cleanup step can sweep this exact run's
-          # leftovers even if packer is killed before it can clean up itself.
-          EXTRA="$EXTRA -var build_id=${BUILD_ID}"
+          FLAVOR="${{ matrix.flavor }}"
+          if [ "$FLAVOR" = "antalya" ]; then
+            CH_VER="${{ github.event.inputs.antalya_clickhouse_version }}"
+            if [ -z "$CH_VER" ] && [ "${{ github.event.inputs.build_flavor }}" = "antalya" ]; then
+              CH_VER="${{ github.event.inputs.clickhouse_version }}"
+            fi
+          else
+            CH_VER="${{ github.event.inputs.clickhouse_version }}"
+          fi
+          [ -z "$CH_VER" ] && CH_VER="${{ matrix.default_clickhouse_version }}"
+          # Pass -var-file FIRST so explicit -var clickhouse_version / build_flavor
+          # overrides defaults.pkrvars.hcl (in Packer HCL2 later vars win).
           packer build \
+            -var-file=${{ env.PACKER_DIR }}/defaults.pkrvars.hcl \
             -var "region=${{ env.AWS_REGION }}" \
             -var "chinit_download_token=${CHINIT_DOWNLOAD_TOKEN}" \
-            $EXTRA \
-            -var-file=${{ env.PACKER_DIR }}/defaults.pkrvars.hcl \
+            -var "build_flavor=${FLAVOR}" \
+            -var "clickhouse_version=${CH_VER}" \
+            -var "build_id=${BUILD_ID}" \
             ${{ env.PACKER_DIR }}/clickhouse.pkr.hcl \
             | tee build.log
           # Extract the produced AMI id from the log
           AMI_ID=$(grep -oE 'ami-[a-z0-9]+' build.log | tail -1)
           echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+          echo "clickhouse_version=$CH_VER" >> "$GITHUB_OUTPUT"
 
-      - name: Prune old generations (keep ${{ env.KEEP_GENERATIONS }})
+      - name: Prune old ${{ matrix.flavor }} generations (keep ${{ env.KEEP_GENERATIONS }})
         run: |
-          # List golden AMIs oldest-first; deregister everything past the
-          # KEEP_GENERATIONS newest, then delete their (only) snapshot.
+          # List golden AMIs for THIS flavor oldest-first; deregister everything
+          # past the KEEP_GENERATIONS newest, then delete their (only) snapshot.
           IDS=$(aws ec2 describe-images \
             --region ${{ env.AWS_REGION }} \
             --owners self \
             --filters "Name=tag:Purpose,Values=clickhouse-golden-ami" \
+                      "Name=tag:Flavor,Values=${{ matrix.flavor }}" \
             --query "sort_by(Images,&CreationDate)[].ImageId" \
             --output text | tr '[:space:]' '\n' | grep '^ami-' || true)
           TOTAL=$(echo "$IDS" | grep -c '^ami-' || true)
-          echo "golden AMIs: $TOTAL (keeping newest ${{ env.KEEP_GENERATIONS }})"
+          echo "golden AMIs (${{ matrix.flavor }}): $TOTAL (keeping newest ${{ env.KEEP_GENERATIONS }})"
           echo "$IDS" | head -n -${{ env.KEEP_GENERATIONS }} | while read -r AMI; do
             [ -z "$AMI" ] && continue
             # Never prune an AMI the repo still references (e.g. a tfvars
@@ -235,7 +259,7 @@ jobs:
       - name: Cleanup orphaned builder resources
         if: always()
         env:
-          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.flavor }}
         run: |
           set -uo pipefail
           echo "Sweeping leftover packer resources for BuildId=${BUILD_ID}"
@@ -291,9 +315,11 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## Golden AMI built 🎉" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Golden AMI built (${{ matrix.flavor }}) 🎉" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**AMI id:** \`${{ steps.build.outputs.ami_id }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Flavor:** \`${{ matrix.flavor }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **ClickHouse version:** \`${{ steps.build.outputs.clickhouse_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **AMI id:** \`${{ steps.build.outputs.ami_id }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "To use it, set in tfvars:" >> "$GITHUB_STEP_SUMMARY"
           echo '```hcl' >> "$GITHUB_STEP_SUMMARY"
@@ -303,12 +329,23 @@ jobs:
   # The PUBLIC share flavor: unencrypted root snapshot + public launch
   # permission (AWS refuses public encrypted AMIs), Author=stackgen.com
   # stamped on the image. Triggered via workflow_dispatch with
-  # publish=true. Keeps exactly one published generation.
+  # publish=true. Keeps exactly one published generation per flavor.
   publish-public:
-    name: Publish public AMI flavor
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    name: Publish public AMI flavor (${{ matrix.flavor }})
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish &&
+      (inputs.build_flavor == 'both' || inputs.build_flavor == '' || inputs.build_flavor == matrix.flavor)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: upstream
+            default_clickhouse_version: "26.8.36.3"
+          - flavor: antalya
+            default_clickhouse_version: "26.6.8.20004.altinityantalya"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -330,42 +367,51 @@ jobs:
       - name: Packer init
         run: packer init images/aws
 
-      - name: Build public flavor
+      - name: Build public flavor (${{ matrix.flavor }})
         id: build
         env:
-          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}-public-${{ matrix.flavor }}
           # The repo is private: release assets need auth to download.
           # contents:read GITHUB_TOKEN; packer passes it into the builder
           # as CHINIT_DOWNLOAD_TOKEN (sensitive var — never printed).
           CHINIT_DOWNLOAD_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
-          EXTRA=""
-          [ -n "${{ github.event.inputs.clickhouse_version }}" ] && \
-            EXTRA="-var clickhouse_version=${{ github.event.inputs.clickhouse_version }}"
+          FLAVOR="${{ matrix.flavor }}"
+          if [ "$FLAVOR" = "antalya" ]; then
+            CH_VER="${{ github.event.inputs.antalya_clickhouse_version }}"
+            if [ -z "$CH_VER" ] && [ "${{ github.event.inputs.build_flavor }}" = "antalya" ]; then
+              CH_VER="${{ github.event.inputs.clickhouse_version }}"
+            fi
+          else
+            CH_VER="${{ github.event.inputs.clickhouse_version }}"
+          fi
+          [ -z "$CH_VER" ] && CH_VER="${{ matrix.default_clickhouse_version }}"
           packer build \
+            -var-file=images/aws/defaults.pkrvars.hcl \
             -var "region=${{ env.AWS_REGION }}" \
-            -var "build_flavor=${{ github.event.inputs.build_flavor }}" \
+            -var "build_flavor=${FLAVOR}" \
+            -var "clickhouse_version=${CH_VER}" \
             -var "public_ami=true" \
             -var "ami_author=stackgen.com" \
             -var "chinit_download_token=${CHINIT_DOWNLOAD_TOKEN}" \
             -var "build_id=${BUILD_ID}" \
-            $EXTRA \
-            -var-file=images/aws/defaults.pkrvars.hcl \
             images/aws/clickhouse.pkr.hcl \
             | tee build.log
           AMI_ID=$(grep -oE 'ami-[a-z0-9]+' build.log | tail -1)
           echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+          echo "clickhouse_version=$CH_VER" >> "$GITHUB_OUTPUT"
 
-      - name: Retire the previous public generation
-        # One published generation: the newest stays, older public AMIs
-        # (same Purpose tag + IsPublic) are deregistered and their
+      - name: Retire the previous public ${{ matrix.flavor }} generation
+        # One published generation per flavor: the newest stays, older public AMIs
+        # (same Purpose + Flavor tag) are deregistered and their
         # snapshots deleted. Consumers pin the AMI id; a pinned id is
         # never retired while a reference exists in the repo.
         run: |
           KEEP=$(aws ec2 describe-images \
             --region ${{ env.AWS_REGION }} --owners self \
             --filters "Name=tag:Purpose,Values=clickhouse-golden-ami-public" \
+                      "Name=tag:Flavor,Values=${{ matrix.flavor }}" \
             --query "sort_by(Images[?ImageId!='${{ steps.build.outputs.ami_id }}'],&CreationDate)[].ImageId" \
             --output text)
           for AMI in $KEEP; do
@@ -385,7 +431,7 @@ jobs:
       - name: Cleanup orphaned builder resources
         if: always()
         env:
-          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}-public-${{ matrix.flavor }}
         run: |
           set -uo pipefail
           IDS=$(aws ec2 describe-instances --region "${{ env.AWS_REGION }}" \
@@ -406,8 +452,10 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## Public AMI published 🌍" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Public AMI published (${{ matrix.flavor }}) 🌍" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**AMI id:** \`${{ steps.build.outputs.ami_id }}\` (us-west-2, launchable by any AWS account)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Flavor:** \`${{ matrix.flavor }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **ClickHouse version:** \`${{ steps.build.outputs.clickhouse_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **AMI id:** \`${{ steps.build.outputs.ami_id }}\` (us-west-2, launchable by any AWS account)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Author tag: stackgen.com" >> "$GITHUB_STEP_SUMMARY"
