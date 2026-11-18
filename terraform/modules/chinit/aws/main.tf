@@ -354,9 +354,21 @@ variable "keeper_disk_label" {
 }
 
 variable "cache_disk_size_gb" {
-  description = "Provisioned cache-disk size (GB). storage.xml's cache <max_size> derives from it at 0.9x and must not exceed the volume (ClickHouse refuses to start otherwise — Code 36; EBS sizes are decimal GB, max_size takes raw bytes)."
+  description = "Provisioned cache-disk size (GB). storage.xml's cache <max_size> derives from it at 0.9x and must not exceed the volume (ClickHouse refuses to start otherwise — Code 36; EBS sizes are decimal GB, max_size takes raw bytes). At boot, chinit also dynamically sizes cache <max_size> to 90% of the mounted /var/lib/clickhouse/disks volume (e.g. local NVMe instance store)."
   type        = number
   default     = 128
+}
+
+variable "cas_enabled" {
+  description = "Enable the Altinity Antalya Content-Addressable Storage (CAS) shared S3 cold tier (`metadata_type = cas`, single copy across replicas). Requires an Antalya golden AMI (e.g. `ami-0f8511dd30c68ca21`)."
+  type        = bool
+  default     = false
+}
+
+variable "cas_prefix" {
+  description = "Shared S3 key prefix (no `{replica}` segment) for the CAS cold-tier pool when `cas_enabled = true`."
+  type        = string
+  default     = "cas"
 }
 
 # ----------------------------------------------------------------------------
@@ -517,7 +529,9 @@ locals {
     "configs/ssl.xml"     = file("${path.module}/templates/ssl.xml")
     "configs/storage.xml" = templatefile("${path.module}/templates/storage.xml", {
       s3_data_prefix       = var.data_prefix
-      cache_max_size_bytes = floor(var.cache_disk_size_gb * 0.9) * 1024 * 1024 * 1024
+      cas_enabled          = var.cas_enabled
+      cas_prefix           = var.cas_prefix
+      cache_max_size_bytes = floor((var.cache_disk_size_gb * 0.9) / (var.cas_enabled ? 2 : 1)) * 1024 * 1024 * 1024
     })
     "configs/bootstrap-ddl.sql" = file("${path.module}/templates/bootstrap-ddl.sql")
   }
@@ -673,6 +687,7 @@ locals {
       chinit_spec_key = "chinit-${role}.yaml"
       bundle_bucket   = var.bootstrap_bucket
       bundle_prefix   = var.bootstrap_prefix
+      region          = var.region
       wrapper_extra   = var.wrapper_extra
     })
   }

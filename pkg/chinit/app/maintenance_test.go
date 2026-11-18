@@ -444,6 +444,35 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 		Expect(runOrphanedGc([]string{"-state", statePath})).To(Succeed())
 		Expect(ops.calls).To(BeEmpty(), "orphaned-gc is a documented no-op; it reaches no cluster port")
 	})
+
+	It("sweeps retired high-water DNS records across writer_max and reader_max on the coordinator without extra lease scans", func() {
+		// maintSpec sets writer_max: 4, reader_max: 10. With only writer-0
+		// and reader-1 active, the coordinator must sweep writer-1..3 and
+		// reader-0, reader-2..9 while keeping lister.tables at a single scan.
+		lister.claims = []chinitport.Claim{
+			{Hostname: "writer-0", IP: "10.0.1.254"},
+			{Hostname: "reader-1", IP: "10.0.1.233"},
+		}
+		dns := &drainDNS{}
+		origBuild := buildProvider
+		buildProvider = func(string, string) (chinitport.Provider, error) {
+			return &drainProvider{name: "aws", lister: lister, dns: dns}, nil
+		}
+		DeferCleanup(func() { buildProvider = origBuild })
+
+		writeMaintState(model.RoleWriter, "writer-0")
+		Expect(runDeadReplicaGc([]string{"-state", statePath})).To(Succeed())
+		Expect(lister.tables).To(Equal([]string{"node-claims"}), "must reuse the single entry lease scan")
+
+		deleted := map[string]bool{}
+		for _, req := range dns.deletes {
+			deleted[req.RecordName] = true
+		}
+		Expect(deleted["writer-1"]).To(BeTrue(), "retired high-water writer-1 record must be deleted")
+		Expect(deleted["reader-0"]).To(BeTrue(), "vacant reader-0 record must be deleted")
+		Expect(deleted["writer-0"]).To(BeFalse(), "live writer-0 record must never be deleted")
+		Expect(deleted["reader-1"]).To(BeFalse(), "live reader-1 record must never be deleted")
+	})
 })
 
 var _ = Describe("runQueueHeal (the CLI entry)", func() {

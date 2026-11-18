@@ -34,6 +34,16 @@ type ConvergeDNSArgs struct {
 	// node's name even when a prior drain missed it.
 	Hostname  string
 	PrivateIP string
+	// WriterPrefix/ReaderPrefix are the hostname prefixes for ASG roles
+	// (defaults to writer-/reader- when empty).
+	WriterPrefix string
+	ReaderPrefix string
+	// WriterCeiling/ReaderCeiling bound the full reserved ordinal space
+	// (writer_max / reader_max) so scaling in the highest-ordinal node
+	// (e.g. writer-1 or reader-1 terminating, leaving only writer-0)
+	// still sweeps the retired high-water ordinal's stale A record.
+	WriterCeiling int
+	ReaderCeiling int
 }
 
 // dnsConverger is the DNS half of the lease-renew convergence: it owns
@@ -95,27 +105,15 @@ func ConvergePeerDNS(ctx context.Context, provider port.Provider, args ConvergeD
 		return nil // guard logged
 	}
 	c.selfHeal(ctx, args)
-	return c.sweep(ctx, args.LeaseTable)
+	return c.sweep(ctx, args)
 }
 
-// SweepExpiredSlotRecords releases the A record of every ordinal name
-// whose lease EXPIRED — the sweep half of the DNS convergence alone,
-// WITHOUT the self-heal upsert. The shutdown drain runs this as its
-// last act: the node's own record is already released (the drain did
-// it), so the upsert half must NOT run (it would re-create the record
-// the drain just deleted); sweeping the zone's other dead-holder
-// records is pure cleanup on the way out.
-//
-// Without it: a node terminating next to an undrained predecessor
-// (its drain could not dispatch) leaves that predecessor's stale
-// record until the next renewal tick elsewhere — up to 5 minutes of
-// schema-sync hangs the terminating node could have healed itself.
 func SweepExpiredSlotRecords(ctx context.Context, provider port.Provider, args ConvergeDNSArgs) error {
 	c, ok := newDNSConverger(ctx, provider, args)
 	if !ok {
 		return nil // guard logged
 	}
-	return c.sweep(ctx, args.LeaseTable)
+	return c.sweep(ctx, args)
 }
 
 // newDNSConverger builds the converger after the capability and zone
@@ -147,14 +145,14 @@ func newDNSConverger(ctx context.Context, provider port.Provider, args ConvergeD
 // convergence self-heals FIRST (the node's own record must stay
 // correct even when the lease table is unreachable); the shutdown
 // sweep never self-heals (see SweepExpiredSlotRecords).
-func (c *dnsConverger) sweep(ctx context.Context, table string) error {
-	claims, err := c.activeClaims(ctx, table)
+func (c *dnsConverger) sweep(ctx context.Context, args ConvergeDNSArgs) error {
+	claims, err := c.activeClaims(ctx, args.LeaseTable)
 	if err != nil {
 		// Best-effort: a listing outage must not abort the renewal.
 		logger.GetLogger(ctx).Warn("peer-dns: live-claims listing failed; expired-slot sweep skipped", "err", err)
 		return nil
 	}
-	if released := c.sweepExpiredSlots(ctx, claims); released > 0 {
+	if released := c.sweepExpiredSlots(ctx, claims, args); released > 0 {
 		logger.GetLogger(ctx).Info("peer-dns: released stale records", "count", released)
 	}
 	return nil
@@ -186,10 +184,10 @@ func (c *dnsConverger) selfHeal(ctx context.Context, args ConvergeDNSArgs) {
 }
 
 // sweepExpiredSlots deletes the A record of every ordinal name in the
-// claimed ordinal space whose lease is NOT live (a dead holder's
-// record), returning how many records it released.
-func (c *dnsConverger) sweepExpiredSlots(ctx context.Context, claims []port.Claim) int {
-	slots := claimOrdinalSpace(claims)
+// claimed/reserved ordinal space whose lease is NOT live (a dead
+// holder's record), returning how many records it released.
+func (c *dnsConverger) sweepExpiredSlots(ctx context.Context, claims []port.Claim, args ...ConvergeDNSArgs) int {
+	slots := claimOrdinalSpace(claims, args...)
 	if len(slots) == 0 {
 		return 0
 	}
@@ -222,11 +220,52 @@ func (c *dnsConverger) deleteRecord(ctx context.Context, name string) error {
 	return nil
 }
 
+// ConvergeDNSOpts is a domain collection of optional ConvergeDNSArgs.
+type ConvergeDNSOpts []ConvergeDNSArgs
+
+// writerPrefix returns the configured writer hostname prefix or the default.
+func (a ConvergeDNSArgs) writerPrefix() string {
+	if a.WriterPrefix != "" {
+		return a.WriterPrefix
+	}
+	return "writer-"
+}
+
+// readerPrefix returns the configured reader hostname prefix or the default.
+func (a ConvergeDNSArgs) readerPrefix() string {
+	if a.ReaderPrefix != "" {
+		return a.ReaderPrefix
+	}
+	return "reader-"
+}
+
+// seedCeilings populates the initial role maxima from configured
+// WriterCeiling and ReaderCeiling bounds.
+func (opts ConvergeDNSOpts) seedCeilings(maxima map[string]int, seen map[string]bool) {
+	if len(opts) == 0 {
+		return
+	}
+	a := opts[0]
+	if a.WriterCeiling > 0 {
+		wp := a.writerPrefix()
+		maxima[wp] = a.WriterCeiling - 1
+		seen[wp] = true
+	}
+	if a.ReaderCeiling > 0 {
+		rp := a.readerPrefix()
+		maxima[rp] = a.ReaderCeiling - 1
+		seen[rp] = true
+	}
+}
+
 // slotName is one ordinal-space name (writer-3): a value type that
 // carries its own liveness test against the claims list.
 type slotName struct {
 	hostname string
 }
+
+// slotNames is a domain collection of slotName entries.
+type slotNames []slotName
 
 // isLive reports whether the slot's ordinal holds a live claim.
 func (s slotName) isLive(claims []port.Claim) bool {
@@ -238,14 +277,15 @@ func (s slotName) isLive(claims []port.Claim) bool {
 	return false
 }
 
-// claimOrdinalSpace enumerates the ordinal names claims
-// cover: for every writer-/reader- prefix seen in the claims, all
-// ordinals 0..max are candidates — a vacant ordinal inside the claimed
-// range is exactly the dead-holder record the sweep exists to remove.
-// Records beyond maximum are left to the drain that created
-// them (the space only widens through a new, live claim).
-func claimOrdinalSpace(claims []port.Claim) []slotName {
+// claimOrdinalSpace enumerates the ordinal names claims and role
+// ceilings cover: for every writer-/reader- prefix seen in the claims
+// or configured via WriterCeiling/ReaderCeiling, all ordinals 0..max
+// are candidates — a vacant ordinal inside the claimed or ceiling range
+// is the dead-holder record the sweep exists to remove (including when
+// the highest-ordinal writer or reader scales in).
+func claimOrdinalSpace(claims []port.Claim, optArgs ...ConvergeDNSArgs) slotNames {
 	maxima, seen := map[string]int{}, map[string]bool{}
+	ConvergeDNSOpts(optArgs).seedCeilings(maxima, seen)
 	for _, claim := range claims {
 		prefix, ordinal, ok := splitOrdinalClaim(claim.Hostname)
 		if !ok {
@@ -256,7 +296,7 @@ func claimOrdinalSpace(claims []port.Claim) []slotName {
 			seen[prefix] = true
 		}
 	}
-	var slots []slotName
+	var slots slotNames
 	for prefix, maxOrdinal := range maxima {
 		for i := 0; i <= maxOrdinal; i++ {
 			slots = append(slots, slotName{hostname: fmt.Sprintf("%s%d", prefix, i)})

@@ -30,11 +30,7 @@ import (
 
 // unitNames renders the assembler's answer as a name list.
 func unitNames(units []system.UnitFile) []string {
-	out := make([]string, 0, len(units))
-	for _, u := range units {
-		out = append(out, u.Name)
-	}
-	return out
+	return unitFiles(units).names()
 }
 
 var _ = Describe("chinitUnits", func() {

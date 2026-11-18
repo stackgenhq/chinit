@@ -71,8 +71,31 @@ WantedBy=timers.target
 //
 // chinitUnits is the pure assembler (the matrix's test seam); this
 // method only installs what it returns.
-func (b *Boot) chinitUnits() []system.UnitFile {
-	var units []system.UnitFile
+// unitFiles is a domain collection of systemd unit definitions.
+type unitFiles []system.UnitFile
+
+// names returns the unit filenames in order.
+func (units unitFiles) names() []string {
+	out := make([]string, 0, len(units))
+	for _, u := range units {
+		out = append(out, u.Name)
+	}
+	return out
+}
+
+// isBootStartService reports whether the service unit should be started
+// once immediately at boot in addition to its recurring timer.
+func isBootStartService(name string) bool {
+	switch name {
+	case "disk-autoscale-boot.service", "dead-replica-gc.service", "queue-heal.service", "lease-renew.service":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *Boot) chinitUnits() unitFiles {
+	var units unitFiles
 	switch b.Spec.Role {
 	case model.RoleKeeper:
 		// Self-healing: keeper-health runs every minute (the bash-era
@@ -316,7 +339,7 @@ func (b *Boot) installUnits(ctx context.Context) error {
 				logger.GetLogger(ctx).Warn("WARNING: unit enable failed", "unit", u.Name, "out", out)
 			}
 		}
-		if u.Name == "disk-autoscale-boot.service" || u.Name == "dead-replica-gc.service" || u.Name == "queue-heal.service" {
+		if isBootStartService(u.Name) {
 			if out, err := runCommand(ctx, "systemctl", "start", u.Name); err != nil {
 				// Best-effort: the 5-minute timer is the backstop; a
 				// failed boot-time probe must not fail the boot.
@@ -382,6 +405,14 @@ func (b *Boot) configureBackup(ctx context.Context) error {
 		return fmt.Errorf("configureBackup: %s/admin-password missing or empty", BootstrapDir)
 	}
 
+	region := b.Identity.Region
+	if region == "" {
+		region = b.Spec.Region
+	}
+	if region == "" {
+		region = b.Meta.Region
+	}
+
 	cfg := fmt.Sprintf(`clickhouse:
   username: admin
   password: %s
@@ -412,7 +443,7 @@ s3:
   # Credentials come from the instance role (SDK chain); leave unset
   compression_level: %d
   compression_format: %s
-`, adminPw, retention, b.Spec.Backup.Bucket, prefix, b.Identity.Region, compressionLevel, b.Spec.Backup.CompressionFormat)
+`, adminPw, retention, b.Spec.Backup.Bucket, prefix, region, compressionLevel, b.Spec.Backup.CompressionFormat)
 
 	if err := os.WriteFile(backupConfigPath(), []byte(cfg), 0600); err != nil {
 		return err

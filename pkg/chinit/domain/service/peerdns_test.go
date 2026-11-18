@@ -245,4 +245,32 @@ var _ = Describe("claimOrdinalSpace", func() {
 	It("is empty with no ASG-role claims", func() {
 		Expect(claimOrdinalSpace([]port.Claim{{Hostname: "keeper-0"}})).To(BeEmpty())
 	})
+
+	It("sweeps retired high-water ordinals up to WriterCeiling and ReaderCeiling when the highest ordinal scales in", func() {
+		// Scale-in scenario: writer-1 (of writer_max=2) and reader-0 (of reader_max=2)
+		// scaled in or terminated; only writer-0 and reader-1 remain live.
+		lister := &fakeLeaseLister{claims: []port.Claim{
+			{Hostname: "writer-0", IP: "10.0.1.254"},
+			{Hostname: "reader-1", IP: "10.0.1.233"},
+		}}
+		dns := &fakeDNSRegistrar{zoneID: "Z07073102YAGFP019SAW"}
+		provider := &dnsClaimsProvider{lister, dns}
+
+		args := convergeDNSArgs()
+		args.Hostname = "writer-0"
+		args.PrivateIP = "10.0.1.254"
+		args.WriterCeiling = 2
+		args.ReaderCeiling = 2
+
+		Expect(ConvergePeerDNS(context.Background(), provider, args)).To(Succeed())
+
+		deleted := map[string]bool{}
+		for _, req := range dns.deletes {
+			deleted[req.RecordName] = true
+		}
+		Expect(deleted).To(Equal(map[string]bool{
+			"writer-1": true,
+			"reader-0": true,
+		}), "both writer-1 (above max live writer ordinal 0) and reader-0 must be swept")
+	})
 })

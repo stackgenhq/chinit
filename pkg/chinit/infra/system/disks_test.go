@@ -190,6 +190,69 @@ var _ = Describe("DiskManager.ResolveDevice cache enumeration (the 2026-11-17 wr
 		Expect(dev).To(Equal("/dev/nvme2n1"),
 			"metadata must claim the 256 GiB volume on nvme2n1 rather than the 32 GiB cache volume on nvme1n1")
 	})
+
+	It("never selects a larger ephemeral NVMe instance-store disk for ch-metadata, and prefers it for ch-cache", func() {
+		r := newFakeRunner().
+			script("blkid -l -o device -t LABEL=ch-metadata", "").
+			script("blkid -l -o device -t LABEL=ch-cache", "").
+			fail("test -b /dev/sdf").fail("test -b /dev/sdb").
+			fail("test -b /dev/sdg").fail("test -b /dev/sdc").
+			// nvme0n1: root disk (GPT)
+			script("test -b /dev/nvme0n1", "").
+			script("blkid /dev/nvme0n1", `UUID="..." TYPE="gpt"`).
+			// nvme1n1: 474 GiB ephemeral NVMe instance store (must NOT be chosen for metadata!)
+			script("test -b /dev/nvme1n1", "").
+			fail("blkid /dev/nvme1n1").
+			script("lsblk -d -n -o MODEL /dev/nvme1n1", "Amazon EC2 NVMe Instance Storage\n").
+			script("lsblk -b -d -n -o SIZE /dev/nvme1n1", "508953632768\n").
+			// nvme2n1: 64 GiB EBS gp3 metadata volume
+			script("test -b /dev/nvme2n1", "").
+			fail("blkid /dev/nvme2n1").
+			script("lsblk -d -n -o MODEL /dev/nvme2n1", "Amazon Elastic Block Store\n").
+			script("lsblk -b -d -n -o SIZE /dev/nvme2n1", "68719476736\n").
+			fail("test -b /dev/nvme3n1").
+			fail("test -b /dev/nvme4n1").
+			fail("test -b /dev/nvme5n1").
+			fail("test -b /dev/nvme6n1").
+			fail("test -b /dev/nvme7n1")
+
+		dm := NewDiskManager(r)
+		metaDev, err := dm.ResolveDevice(context.Background(), "ch-metadata", awsMetadataCandidates)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(metaDev).To(Equal("/dev/nvme2n1"),
+			"ch-metadata must land on the persistent EBS volume, never on the larger ephemeral NVMe instance store")
+
+		cacheDev, err := dm.ResolveCacheDevice(context.Background(), "ch-cache", awsCacheCandidates, metaDev)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cacheDev).To(Equal("/dev/nvme1n1"),
+			"ch-cache must prefer the local ephemeral NVMe instance-store volume")
+	})
+
+	It("stripes multiple blank ephemeral NVMe instance-store drives into a RAID-0 cache volume via mdadm", func() {
+		r := newFakeRunner().
+			script("blkid -l -o device -t LABEL=ch-cache", "").
+			script("test -b /dev/nvme0n1", "").
+			script("blkid /dev/nvme0n1", `UUID="..." TYPE="gpt"`).
+			script("test -b /dev/nvme1n1", "").
+			fail("blkid /dev/nvme1n1").
+			script("lsblk -d -n -o MODEL /dev/nvme1n1", "Amazon EC2 NVMe Instance Storage\n").
+			script("lsblk -b -d -n -o SIZE /dev/nvme1n1", "508953632768\n").
+			script("test -b /dev/nvme2n1", "").
+			fail("blkid /dev/nvme2n1").
+			script("lsblk -d -n -o MODEL /dev/nvme2n1", "Amazon EC2 NVMe Instance Storage\n").
+			script("lsblk -b -d -n -o SIZE /dev/nvme2n1", "508953632768\n").
+			fail("test -b /dev/nvme3n1").
+			fail("test -b /dev/nvme4n1").
+			fail("test -b /dev/nvme5n1").
+			fail("test -b /dev/nvme6n1").
+			fail("test -b /dev/nvme7n1")
+
+		dm := NewDiskManager(r)
+		cacheDev, err := dm.ResolveCacheDevice(context.Background(), "ch-cache", awsCacheCandidates, "/dev/nvme0n1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cacheDev).To(Equal("/dev/md/ch-cache"))
+		Expect(r.invoked("mdadm --create /dev/md/ch-cache --level=0 --raid-devices=2 --metadata=1.2 --force --run /dev/nvme1n1 /dev/nvme2n1")).To(BeTrue())
+	})
 })
 
 var _ = Describe("DiskManager.MountDisk", func() {

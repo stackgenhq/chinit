@@ -123,3 +123,68 @@ var _ = Describe("cliForceRestoreFlagger", func() {
 		Expect(newForceRestoreFlagger(context.Background(), st)).To(BeNil())
 	})
 })
+
+var _ = Describe("ddlQueueReplicas & cliDDLTaskQueueCleaner", func() {
+	It("selects chi-*, localhost, and dead writer/reader entries (both :port and %3Aport) while sparing live claims and backup-0", func() {
+		entries := ddlQueueReplicas{
+			"writer-0.example.internal:9010",
+			"writer-1.example.internal%3A9010",
+			"reader-0:9440",
+			"reader-1.example.internal:9010",
+			"localhost:9000",
+			"chi-demo-demo-01-2:9000",
+			"backup-0.example.internal:9010",
+		}
+		live := map[string]bool{
+			"writer-0": true,
+			"reader-1": true,
+		}
+		stale := entries.staleEntries(live, "writer-", "reader-")
+		Expect([]string(stale)).To(Equal([]string{
+			"writer-1.example.internal%3A9010",
+			"reader-0:9440",
+			"localhost:9000",
+			"chi-demo-demo-01-2:9000",
+		}))
+	})
+
+	It("prunes stale DDL task_queue replica znodes via clickhouse-keeper-client", func() {
+		dir := GinkgoT().TempDir()
+		specPath := filepath.Join(dir, "chinit.yaml")
+		Expect(os.WriteFile(specPath, []byte("keeper_nodes: [\"keeper-0\"]\ndns_zone_name: \"example.internal\"\n"), 0644)).To(Succeed())
+		origSpec := inventorySpecPath
+		inventorySpecPath = func() string { return specPath }
+		DeferCleanup(func() { inventorySpecPath = origSpec })
+
+		var cmds []string
+		origRun := runCommand
+		runCommand = func(_ context.Context, name string, args ...string) ([]byte, error) {
+			line := name + " " + strings.Join(args, " ")
+			cmds = append(cmds, line)
+			if strings.Contains(line, "ls '/clickhouse/demo/task_queue/replicas'") {
+				return []byte("writer-0.example.internal:9010 writer-1:9010 chi-demo-demo-01-4:9000 backup-0.example.internal:9010\n"), nil
+			}
+			if strings.Contains(line, "ls '/clickhouse/task_queue/replicas'") {
+				return []byte("localhost%3A9000\n"), nil
+			}
+			return []byte("ok"), nil
+		}
+		DeferCleanup(func() { runCommand = origRun })
+
+		st := &nodeState{Identity: model.NodeIdentity{
+			Role:        model.RoleWriter,
+			Hostname:    "writer-0",
+			ClusterName: "demo",
+			DNSZone:     "example.internal",
+		}}
+		cleaner := newDDLTaskQueueCleaner(context.Background(), st)
+		Expect(cleaner).NotTo(BeNil())
+
+		pruned := cleaner.PruneStaleDDLReplicas(activeClaims{{Hostname: "writer-0"}})
+		Expect(pruned).To(Equal([]string{
+			"/clickhouse/demo/task_queue/replicas/writer-1:9010",
+			"/clickhouse/demo/task_queue/replicas/chi-demo-demo-01-4:9000",
+			"/clickhouse/task_queue/replicas/localhost%3A9000",
+		}))
+	})
+})

@@ -96,4 +96,25 @@ var _ = Describe("configureServerEnv cloud gate", func() {
 		}
 		Expect(string(data)).To(ContainSubstring("CH_S3_ENDPOINT"))
 	})
+
+	It("exports CH_CACHE_MAX_SIZE_BYTES when a dedicated NVMe/cache volume is mounted", func() {
+		origProbe := probeCacheDiskMaxBytes
+		probeCacheDiskMaxBytes = func(context.Context) uint64 {
+			return 458058269491 // 90% of 474 GiB NVMe instance store
+		}
+		DeferCleanup(func() { probeCacheDiskMaxBytes = origProbe })
+
+		b := &Boot{
+			Spec: &model.BootSpec{
+				Role:         model.RoleWriter,
+				S3DataBucket: "data-bucket",
+				Region:       "us-east-1",
+			},
+			Provider: &stubProvider{name: "aws"},
+		}
+		content, err := b.serverEnvContent(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(content).To(ContainSubstring(`CH_S3_ENDPOINT="https://data-bucket.s3.us-east-1.amazonaws.com"`))
+		Expect(content).To(ContainSubstring(`CH_CACHE_MAX_SIZE_BYTES="458058269491"`))
+	})
 })

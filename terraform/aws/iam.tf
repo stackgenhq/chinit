@@ -190,12 +190,12 @@ data "aws_iam_policy_document" "node_chinit" {
       "s3:ListBucket",
     ]
 
-    resources = [
+    resources = concat([
       aws_s3_bucket.data.arn,
       "${aws_s3_bucket.data.arn}/${var.s3_data_prefix}/*",
       aws_s3_bucket.backup.arn,
       "${aws_s3_bucket.backup.arn}/*",
-    ]
+    ], var.cas_enabled ? ["${aws_s3_bucket.data.arn}/${var.cas_prefix}/*"] : [])
   }
 }
 

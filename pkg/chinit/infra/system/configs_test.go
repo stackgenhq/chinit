@@ -4,6 +4,7 @@
 package system
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -251,4 +252,21 @@ var _ = Describe("HardwareSizingOverlayXML & HardwareProfilesOverlayXML", func()
 		Entry("8 vCPU / 64 GiB (r8g.2xlarge writer)", 8, uint64(64), "16", "8"),
 		Entry("16 vCPU / 128 GiB (r8g.4xlarge scaled writer)", 16, uint64(128), "32", "16"),
 	)
+
+	It("dynamically sizes s3_cache and cas_cache to 90% of the mounted NVMe cache volume", func() {
+		// 474 GiB NVMe instance store (r8gd.2xlarge) with both s3_cache and cas_cache active.
+		nvmeBytes := uint64(474) << 30
+		hwXML := HardwareSizingOverlayXML(8, 64<<30, CacheDiskSizing{
+			MountBytes: nvmeBytes,
+			DiskNames:  []string{"s3_cache", "cas_cache"},
+		})
+		dir := GinkgoT().TempDir()
+		hwPath := filepath.Join(dir, "z_hardware-sizing.xml")
+		Expect(os.WriteFile(hwPath, []byte(hwXML), 0644)).To(Succeed())
+		Expect(ValidateXML(hwPath)).To(Succeed())
+
+		expectedPerCache := fmt.Sprintf("<max_size>%d</max_size>", (nvmeBytes*90/100)/2)
+		Expect(hwXML).To(ContainSubstring("<s3_cache>\n                " + expectedPerCache + "\n            </s3_cache>"))
+		Expect(hwXML).To(ContainSubstring("<cas_cache>\n                " + expectedPerCache + "\n            </cas_cache>"))
+	})
 })

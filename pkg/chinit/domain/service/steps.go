@@ -799,12 +799,37 @@ func mustRead(path string) []byte {
 // not a spec error; writing the S3 line anyway would hand the server
 // a garbage URL (https://.s3...). Credentials NEVER go here: the SDK
 // chain reads the instance role.
-func (b *Boot) configureServerEnv(ctx context.Context) error {
-	// The S3 endpoint env is an AWS-only requirement: the gate Fatals
-	// there (an empty bucket boots a server that dies at start), while
-	// Azure's blob disk needs no endpoint and skips the write.
+// probeCacheDiskMaxBytes probes the mounted /var/lib/clickhouse/disks
+// volume capacity and returns 90% of its total bytes, or 0 when no
+// dedicated cache volume is mounted. Package-level seam for tests.
+var probeCacheDiskMaxBytes = defaultProbeCacheDiskMaxBytes
+
+func defaultProbeCacheDiskMaxBytes(ctx context.Context) uint64 {
+	const cacheMount = "/var/lib/clickhouse/disks"
+	if _, err := runCommand(ctx, "mountpoint", "-q", cacheMount); err != nil {
+		return 0
+	}
+	out, err := runCommand(ctx, "df", "-B1", "--output=size", cacheMount)
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 0 {
+		return 0
+	}
+	last := strings.TrimSpace(lines[len(lines)-1])
+	n, err := strconv.ParseUint(last, 10, 64)
+	if err != nil || n == 0 {
+		return 0
+	}
+	return n * 90 / 100
+}
+
+// serverEnvContent builds the /etc/default/clickhouse-server payload
+// for the node (pure over the spec + probed cache size).
+func (b *Boot) serverEnvContent(ctx context.Context) (string, error) {
 	if b.Spec.S3DataBucket == "" && b.Provider.Name() == "aws" {
-		return Fatal(fmt.Errorf("spec s3_data_bucket is empty — storage.xml's endpoint env cannot be set (Code 36 at server start)"))
+		return "", Fatal(fmt.Errorf("spec s3_data_bucket is empty — storage.xml's endpoint env cannot be set (Code 36 at server start)"))
 	}
 	region := b.Spec.Region
 	if region == "" {
@@ -812,19 +837,31 @@ func (b *Boot) configureServerEnv(ctx context.Context) error {
 	}
 	var sb strings.Builder
 	if b.Spec.Timezone != "" {
-		sb.WriteString("CLICKHOUSE_TZ=" + b.Spec.Timezone + "\n")
+		fmt.Fprintf(&sb, "CLICKHOUSE_TZ=%s\n", b.Spec.Timezone)
 	}
 	if b.Spec.S3DataBucket != "" {
-		sb.WriteString("CH_S3_ENDPOINT=\"https://" + b.Spec.S3DataBucket + ".s3." + region + ".amazonaws.com\"\n")
+		fmt.Fprintf(&sb, "CH_S3_ENDPOINT=\"https://%s.s3.%s.amazonaws.com\"\n", b.Spec.S3DataBucket, region)
 	}
-	// Nothing to pin (Azure with no timezone): skip the file write AND
-	// the drop-in — an EnvironmentFile pointing at nothing is noise,
-	// and the step must not touch /etc on a node with no env contract.
-	if sb.Len() == 0 {
+	if cacheMax := probeCacheDiskMaxBytes(ctx); cacheMax > 0 {
+		fmt.Fprintf(&sb, "CH_CACHE_MAX_SIZE_BYTES=\"%d\"\n", cacheMax)
+	}
+	return sb.String(), nil
+}
+
+func (b *Boot) configureServerEnv(ctx context.Context) error {
+	content, err := b.serverEnvContent(ctx)
+	if err != nil {
+		return err
+	}
+	// Nothing to pin (Azure with no timezone and no mounted cache disk):
+	// skip the file write AND the drop-in — an EnvironmentFile pointing
+	// at nothing is noise, and the step must not touch /etc on a node
+	// with no env contract.
+	if len(content) == 0 {
 		return nil
 	}
 	envFile := "/etc/default/clickhouse-server"
-	if err := os.WriteFile(envFile, []byte(sb.String()), 0644); err != nil {
+	if err := os.WriteFile(envFile, []byte(content), 0644); err != nil {
 		return Fatal(fmt.Errorf("write %s: %w", envFile, err))
 	}
 	if _, err := runCommand(ctx, "chown", "clickhouse:clickhouse", envFile); err != nil {

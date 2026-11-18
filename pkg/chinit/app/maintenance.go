@@ -13,9 +13,54 @@ import (
 
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/port"
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/service"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/clusterops"
 	"github.com/stackgenhq/chinit/pkg/chinit/logger"
 )
+
+// activeClaims is a domain collection of live ordinal lease claims.
+type activeClaims []port.Claim
+
+// hostnamesWithPrefix returns sorted claim hostnames matching prefix.
+func (claims activeClaims) hostnamesWithPrefix(prefix string) []string {
+	var out []string
+	for _, claim := range claims {
+		if strings.HasPrefix(claim.Hostname, prefix) {
+			out = append(out, claim.Hostname)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// electCoordinator evaluates ordinal-0 occupancy and lowest-ordinal
+// vacancy election for the given writer prefix and self hostname.
+func (claims activeClaims) electCoordinator(prefix, selfHostname string) (ordinalZeroHeld, selfLive bool, selfOrdinal, lowestOrdinal int, lowestName string) {
+	ordinalZero := prefix + "0"
+	selfOrdinal = -1
+	lowestOrdinal = -1
+	for _, claim := range claims {
+		if !strings.HasPrefix(claim.Hostname, prefix) {
+			continue
+		}
+		ordinal, err := strconv.Atoi(strings.TrimPrefix(claim.Hostname, prefix))
+		if err != nil {
+			continue
+		}
+		if claim.Hostname == ordinalZero {
+			ordinalZeroHeld = true
+		}
+		if claim.Hostname == selfHostname {
+			selfLive = true
+			selfOrdinal = ordinal
+		}
+		if lowestOrdinal == -1 || ordinal < lowestOrdinal {
+			lowestOrdinal = ordinal
+			lowestName = claim.Hostname
+		}
+	}
+	return ordinalZeroHeld, selfLive, selfOrdinal, lowestOrdinal, lowestName
+}
 
 func runDeadReplicaGc(args []string) error {
 	statePath, err := statePathFlag(args)
@@ -44,7 +89,131 @@ func runDeadReplicaGc(args []string) error {
 	if gateMaintenanceJobWithClaims(ctx, st, claims) {
 		return nil
 	}
-	return deadReplicaGc(ctx, st, claimsLimiter(claims))
+	// Converge remote_servers.xml and sweep ceiling DNS records against
+	// the already-listed live claims (zero extra DynamoDB scans) so
+	// clusterAllReplicas(), ON CLUSTER DDL, and Route53 never retain
+	// retired high-water ordinals.
+	cached := cachedClaimsProviderFor(st, claims)
+	convergeCoordinatorRemoteServers(ctx, st, cached)
+	if err := deadReplicaGc(ctx, st, claimsLimiter(claims)); err != nil {
+		return err
+	}
+	if cleaner := newDDLTaskQueueCleaner(ctx, st); cleaner != nil && len(claims) > 0 {
+		if pruned := cleaner.PruneStaleDDLReplicas(activeClaims(claims)); len(pruned) > 0 {
+			logger.GetLogger(ctx).Info("dead-replica-gc: pruned stale DDL task_queue replicas", "count", len(pruned), "paths", pruned)
+		}
+	}
+	sweepCoordinatorCeilingDNS(ctx, st, cached)
+	convergeCoordinatorRemoteServers(ctx, st, cached)
+	return nil
+}
+
+// cachedClaimsProvider wraps a port.Provider with pre-fetched active
+// claims (plus DNSRegistrar forwarding) so coordinator sweeps perform
+// zero redundant lease-table scans.
+type cachedClaimsProvider struct {
+	port.Provider
+	lister port.LeaseLister
+	dns    port.DNSRegistrar
+}
+
+func (p *cachedClaimsProvider) ListActiveClaims(ctx context.Context, req port.ListClaimsRequest) ([]port.Claim, error) {
+	return p.lister.ListActiveClaims(ctx, req)
+}
+
+func (p *cachedClaimsProvider) ResolveZoneID(ctx context.Context, zoneName string) (string, error) {
+	if p.dns == nil {
+		return "", nil
+	}
+	return p.dns.ResolveZoneID(ctx, zoneName)
+}
+
+func (p *cachedClaimsProvider) UpsertARecord(ctx context.Context, req port.ARecordRequest) error {
+	if p.dns == nil {
+		return nil
+	}
+	return p.dns.UpsertARecord(ctx, req)
+}
+
+func (p *cachedClaimsProvider) DeleteARecord(ctx context.Context, req port.ARecordRequest) error {
+	if p.dns == nil {
+		return nil
+	}
+	return p.dns.DeleteARecord(ctx, req)
+}
+
+func cachedClaimsProviderFor(st *nodeState, claims []port.Claim) port.Provider {
+	if st == nil || claims == nil {
+		return nil
+	}
+	base, err := buildProvider(providerNameOf(st), st.Identity.Region)
+	if err != nil || base == nil {
+		return nil
+	}
+	return &cachedClaimsProvider{
+		Provider: base,
+		lister:   claimsLimiter(claims),
+		dns:      port.AsDNSRegistrar(base),
+	}
+}
+
+// sweepCoordinatorCeilingDNS deletes stale DNS A-records across the
+// full [0..writer_max) and [0..reader_max) ceilings from the elected
+// maintenance coordinator so scaling in the highest-ordinal writer or
+// reader never orphans its DNS record.
+func sweepCoordinatorCeilingDNS(ctx context.Context, st *nodeState, provider port.Provider) {
+	if st == nil || provider == nil {
+		return
+	}
+	spec, err := loadInventorySpec()
+	if err != nil || spec == nil {
+		return
+	}
+	table := st.Identity.LeaseTable
+	if table == "" {
+		table = spec.ClaimerTableName
+	}
+	zone := st.dnsZone()
+	if spec.DNSZoneName != "" {
+		zone = spec.DNSZoneName
+	}
+	if table == "" || zone == "" {
+		return
+	}
+	_ = service.SweepExpiredSlotRecords(ctx, provider, service.ConvergeDNSArgs{
+		LeaseTable:    table,
+		DNSZoneName:   zone,
+		Hostname:      st.Identity.Hostname,
+		WriterPrefix:  spec.writerPrefix(),
+		ReaderPrefix:  spec.readerPrefix(),
+		WriterCeiling: spec.writerCeiling(),
+		ReaderCeiling: spec.readerCeiling(),
+	})
+}
+
+// convergeCoordinatorRemoteServers re-renders remote_servers.xml from
+// the current live lease inventory when the node spec and provider are
+// available (best-effort).
+func convergeCoordinatorRemoteServers(ctx context.Context, st *nodeState, provider port.Provider) {
+	if st == nil || provider == nil || st.Identity.Role == model.RoleKeeper || st.Identity.Role == model.RoleBackup {
+		return
+	}
+	spec, err := loadSpec(inventorySpecPath())
+	if err != nil || spec == nil {
+		return
+	}
+	boot := &service.Boot{
+		Spec:     spec,
+		Provider: provider,
+		Meta: port.InstanceMetadata{
+			Provider:   provider.Name(),
+			Region:     st.Identity.Region,
+			InstanceID: st.Identity.InstanceID,
+			PrivateIP:  st.Identity.PrivateIP,
+		},
+		Identity: st.Identity,
+	}
+	_ = boot.ConvergeRemoteServers(ctx)
 }
 
 // claimsLimiter adapts a claims list into the writer pass's liveness
@@ -139,12 +308,7 @@ func writerGcExcludes(ctx context.Context, st *nodeState, lister port.LeaseListe
 	if spec, specErr := loadInventorySpec(); specErr == nil && spec != nil {
 		prefix = spec.writerPrefix()
 	}
-	for _, claim := range claims {
-		if strings.HasPrefix(claim.Hostname, prefix) {
-			excludes = append(excludes, claim.Hostname)
-		}
-	}
-	sort.Strings(excludes)
+	excludes = activeClaims(claims).hostnamesWithPrefix(prefix)
 	logger.GetLogger(ctx).Info("writer GC pass: live writer leases excluded from the sweep",
 		"excluded", len(excludes),
 		"name_pattern", prefix+"*")
@@ -354,31 +518,7 @@ func gateMaintenanceJobWithClaims(ctx context.Context, st *nodeState, claims []p
 	// Vacancy election: with no live ordinal-0 holder, the
 	// lowest-ordinal live writer takes the designation.
 	if st.Identity.Role == model.RoleWriter && len(claims) > 0 {
-		ordinalZeroHeld := false
-		selfLive := false
-		selfOrdinal := -1
-		lowestOrdinal := -1
-		lowestName := ""
-		for _, claim := range claims {
-			if !strings.HasPrefix(claim.Hostname, prefix) {
-				continue
-			}
-			ordinal, err := strconv.Atoi(strings.TrimPrefix(claim.Hostname, prefix))
-			if err != nil {
-				continue
-			}
-			if claim.Hostname == ordinalZero {
-				ordinalZeroHeld = true
-			}
-			if claim.Hostname == st.Identity.Hostname {
-				selfLive = true
-				selfOrdinal = ordinal
-			}
-			if lowestOrdinal == -1 || ordinal < lowestOrdinal {
-				lowestOrdinal = ordinal
-				lowestName = claim.Hostname
-			}
-		}
+		ordinalZeroHeld, selfLive, selfOrdinal, _, lowestName := activeClaims(claims).electCoordinator(prefix, st.Identity.Hostname)
 		if !ordinalZeroHeld && selfLive && lowestName == st.Identity.Hostname {
 			logger.GetLogger(ctx).Info("maintenance: ordinal-0 lease is vacant; electing the lowest-ordinal live writer",
 				"ordinal_zero", ordinalZero,

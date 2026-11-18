@@ -168,7 +168,7 @@ variable "keeper_disk_size_gb" {
 # ----------------------------------------------------------------------------
 
 variable "golden_ami_id" {
-  description = "The chinit golden AMI id (see images/aws). REQUIRED — the wrapper refuses to boot a node without the baked chinit binary. Build it with `packer build` in images/aws and pass the manifest's AMI id here."
+  description = "The chinit golden AMI id (see images/aws; e.g. `ami-0f8511dd30c68ca21` for the Altinity Antalya build). REQUIRED — the wrapper refuses to boot a node without the baked chinit binary."
   type        = string
 
   validation {
@@ -223,6 +223,18 @@ variable "s3_data_prefix" {
   description = "Key prefix (inside the data bucket) for ClickHouse table data. Every replica writes its own path under it (zero-copy replication is deprecated upstream)."
   type        = string
   default     = "data"
+}
+
+variable "cas_enabled" {
+  description = "Enable the Altinity Antalya Content-Addressable Storage (CAS) shared S3 cold tier (`metadata_type = cas`, single copy across replicas). Requires an Antalya golden AMI (e.g. `ami-0f8511dd30c68ca21`)."
+  type        = bool
+  default     = false
+}
+
+variable "cas_prefix" {
+  description = "Shared S3 key prefix (no `{replica}` segment) for the CAS cold-tier pool when `cas_enabled = true`."
+  type        = string
+  default     = "cas"
 }
 
 variable "backup_retention_days" {
