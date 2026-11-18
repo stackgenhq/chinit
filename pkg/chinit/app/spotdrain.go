@@ -409,22 +409,35 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 		}
 	}
 
-	// 2. Peer-side replica drop (the operator's HostDropReplica form):
-	// chctl replica drop on a LIVE peer removes both the table and the
-	// DATABASE replica registration the local statement misses. If no
-	// peer is reachable, the weekly GC is the safety net.
-	spec, _ := loadInventorySpec()
-	peer := selectDrainPeer(drainCtx, st, spec, port.AsLeaseLister(provider), provider.Name())
-	if peer != nil {
-		log.Info("drain: dropping replica on peer", "peer", peer.Hostname)
-		err := dropOnPeer(drainCtx, st, spec, peer)
-		if err != nil {
-			log.Warn("NOTE: peer replica drop failed; the weekly dead-replica GC will clean up",
-				"peer", peer.Hostname,
-				"err", err)
-			// Fallback: local drop.
-			_, _ = runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query",
-				"SYSTEM DROP REPLICA '"+st.Identity.Hostname+"'")
+	// 2. Shut down the local server BEFORE dropping the replica on a peer
+	// (when this drain owns the shutdown) so the ephemeral Keeper session
+	// closes first; otherwise the peer rejects SYSTEM DROP REPLICA with
+	// Code 305 ("Can't drop replica ... because it's active"). In
+	// SkipServerShutdown mode (systemd ExecStop before clickhouse-server
+	// stops), the local server is still running, so peer drop is skipped
+	// and dead-replica-gc reaps the registration right after shutdown.
+	if opts.SkipServerShutdown {
+		log.Info("drain: server shutdown skipped (the systemd teardown owns it)",
+			"hostname", st.Identity.Hostname)
+	} else {
+		if _, err := runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query", "SYSTEM SHUTDOWN"); err != nil {
+			log.Warn("WARNING: graceful shutdown failed; falling back to systemctl stop", "err", err)
+			_, _ = runCommand(drainCtx, "systemctl", "stop", "clickhouse-server")
+		} else {
+			log.Info("drain: server shut down gracefully")
+		}
+		spec, _ := loadInventorySpec()
+		peer := selectDrainPeer(drainCtx, st, spec, port.AsLeaseLister(provider), provider.Name())
+		if peer != nil {
+			log.Info("drain: dropping replica on peer", "peer", peer.Hostname)
+			err := dropOnPeer(drainCtx, st, spec, peer)
+			if err != nil {
+				log.Warn("NOTE: peer replica drop failed; the dead-replica-gc will clean up",
+					"peer", peer.Hostname,
+					"err", err)
+				_, _ = runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query",
+					"SYSTEM DROP REPLICA '"+st.Identity.Hostname+"'")
+			}
 		}
 	}
 
@@ -488,21 +501,7 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 		}
 	}
 
-	// 4. SYSTEM SHUTDOWN: stop accepting new queries gracefully.
-	// The shutdown drain skips this leg entirely (SkipServerShutdown):
-	// it runs as an ExecStop inside systemd's shutdown transaction,
-	// and the OS teardown that follows stops the server on its own.
-	if opts.SkipServerShutdown {
-		log.Info("drain: server shutdown skipped (the systemd teardown owns it)",
-			"hostname", st.Identity.Hostname)
-	} else if _, err := runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query", "SYSTEM SHUTDOWN"); err != nil {
-		log.Warn("WARNING: graceful shutdown failed; falling back to systemctl stop", "err", err)
-		_, _ = runCommand(drainCtx, "systemctl", "stop", "clickhouse-server")
-	} else {
-		log.Info("drain: server shut down gracefully")
-	}
-
-	// 5. Post-drain lifecycle hooks (the operator's HostDelete hook):
+	// 4. Post-drain lifecycle hooks (the operator's HostDelete hook):
 	// the identity is released and the server is down; the hook runs
 	// against the terminal state. Same drain rule — never blocking.
 	_ = service.RunHooks(drainCtx, service.ShellHookRunner{}, drainHookSpecs(), model.HookPostDrain, drainHookIdentity(st), true)

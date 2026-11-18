@@ -21,7 +21,7 @@ spec:
       keeper_server/snapshot_storage_path: /var/lib/clickhouse-keeper/snapshots
       keeper_server/coordination_settings/operation_timeout_ms: "10000"
       keeper_server/coordination_settings/session_timeout_ms: "30000"
-      keeper_server/coordination_settings/raft_logs_level: "information"
+      keeper_server/coordination_settings/raft_logs_level: "warning"
       keeper_server/hostname_checks_enabled: "true"
     files:
       # listen_host is a ROOT-level setting (keeper_server/listen_host
@@ -45,7 +45,8 @@ spec:
       keeper-logging.xml: |
         <clickhouse>
             <logger>
-                <level>information</level>
+                <level>warning</level>
+                <errorlog_level>error</errorlog_level>
                 <log>/var/log/clickhouse-keeper/clickhouse-keeper.log</log>
                 <errorlog>/var/log/clickhouse-keeper/clickhouse-keeper.err.log</errorlog>
                 <size>500M</size>
