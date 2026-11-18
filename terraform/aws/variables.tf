@@ -262,11 +262,32 @@ variable "dns_zone_name" {
 # ----------------------------------------------------------------------------
 
 variable "log_shipping" {
-  description = "Remote log shipping (renders into log_shipping in every chinit spec; empty endpoint = disabled). agent: otel | fluentbit; endpoint: OTLP/HTTP target; headers: comma-separated k=v pairs."
+  description = "Remote telemetry shipping (renders into log_shipping in every chinit spec; empty endpoints = disabled). Supports base OTLP endpoint or per-signal VictoriaLogs/VictoriaMetrics/VictoriaTraces URLs."
   type = object({
-    agent    = optional(string, "otel")
-    endpoint = optional(string, "")
-    headers  = optional(string, "")
+    agent            = optional(string, "otel")
+    endpoint         = optional(string, "")
+    logs_endpoint    = optional(string, "")
+    metrics_endpoint = optional(string, "")
+    traces_endpoint  = optional(string, "")
+    headers          = optional(string, "")
+    metrics_headers  = optional(string, "")
+    traces_headers   = optional(string, "")
+    scrape_interval  = optional(string, "15s")
+  })
+  default  = {}
+  nullable = false
+}
+
+variable "tracing_config" {
+  description = "ClickHouse OpenTelemetry span sampling and system profiler configuration."
+  type = object({
+    otel_trace_probability        = optional(number, 0)
+    otel_keeper_trace_probability = optional(string, "auto")
+    otel_trace_processors         = optional(bool, false)
+    otel_span_log_ttl_days        = optional(number, 3)
+    trace_log_ttl_days            = optional(number, 7)
+    global_profiler_period_ns     = optional(number, 0)
+    log_query_threads             = optional(bool, false)
   })
   default  = {}
   nullable = false

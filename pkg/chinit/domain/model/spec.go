@@ -340,12 +340,157 @@ func cronDowPart(f string) string {
 	return strings.Join(parts, ",")
 }
 
-// LogShipping is the optional remote log pipeline (OTEL or Fluent Bit).
+// LogShipping configures optional remote telemetry shipping (OTEL /
+// VictoriaMetrics / VictoriaLogs / VictoriaTraces / Fluent Bit).
 type LogShipping struct {
-	Agent           string `yaml:"agent,omitempty"       json:"agent,omitempty"`
-	Endpoint        string `yaml:"endpoint,omitempty"     json:"endpoint,omitempty"`
-	Headers         string `yaml:"headers,omitempty"      json:"headers,omitempty"`
+	Agent           string `yaml:"agent,omitempty"            json:"agent,omitempty"`
+	Endpoint        string `yaml:"endpoint,omitempty"         json:"endpoint,omitempty"`
+	Headers         string `yaml:"headers,omitempty"          json:"headers,omitempty"`
 	FluentbitOutput string `yaml:"fluentbit_output,omitempty" json:"fluentbit_output,omitempty"`
+	// Per-signal remote push overrides (e.g. VictoriaLogs, VictoriaMetrics,
+	// VictoriaTraces, which expose distinct paths/hosts). Empty fields
+	// fall back to Endpoint when Endpoint is a base OTLP URL.
+	LogsEndpoint    string `yaml:"logs_endpoint,omitempty"    json:"logs_endpoint,omitempty"`
+	MetricsEndpoint string `yaml:"metrics_endpoint,omitempty" json:"metrics_endpoint,omitempty"`
+	TracesEndpoint  string `yaml:"traces_endpoint,omitempty"  json:"traces_endpoint,omitempty"`
+	MetricsHeaders  string `yaml:"metrics_headers,omitempty"  json:"metrics_headers,omitempty"`
+	TracesHeaders   string `yaml:"traces_headers,omitempty"   json:"traces_headers,omitempty"`
+	ScrapeInterval  string `yaml:"scrape_interval,omitempty"  json:"scrape_interval,omitempty"`
+}
+
+// HasAnyEndpoint reports whether any remote push destination (logs,
+// metrics, or traces) is configured.
+func (l LogShipping) HasAnyEndpoint() bool {
+	return strings.TrimSpace(l.Endpoint) != "" ||
+		strings.TrimSpace(l.LogsEndpoint) != "" ||
+		strings.TrimSpace(l.MetricsEndpoint) != "" ||
+		strings.TrimSpace(l.TracesEndpoint) != ""
+}
+
+// isBaseOTLPEndpoint reports whether raw is a base OTLP URL (e.g.
+// "https://collector:4318" or "https://vt/insert/opentelemetry") rather
+// than a signal-specific endpoint ("/v1/logs", "/v1/metrics",
+// "/v1/traces", or Prometheus "/api/v1/write").
+func (l LogShipping) isBaseOTLPEndpoint(raw string) bool {
+	u := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if u == "" {
+		return false
+	}
+	for _, suffix := range []string{"/v1/logs", "/v1/metrics", "/v1/traces", "/api/v1/write"} {
+		if strings.HasSuffix(u, suffix) {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeSignalURL ensures an OTLP HTTP endpoint ends with
+// "/v1/<signal>" without double-appending when the caller already passed
+// a full path (e.g. VictoriaTraces "/insert/opentelemetry/v1/traces" or
+// VictoriaMetrics "/opentelemetry/v1/metrics").
+func (l LogShipping) normalizeSignalURL(raw, signal string) string {
+	u := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if u == "" {
+		return ""
+	}
+	suffix := "/v1/" + signal
+	if strings.HasSuffix(u, suffix) {
+		return u
+	}
+	return u + suffix
+}
+
+// IsPrometheusRemoteWrite reports whether the effective metrics URL
+// targets a Prometheus Remote Write endpoint (e.g. VictoriaMetrics
+// "/api/v1/write" or "/insert/0/prometheus/api/v1/write").
+func (l LogShipping) IsPrometheusRemoteWrite() bool {
+	raw := strings.TrimSpace(l.MetricsEndpoint)
+	if raw == "" {
+		raw = strings.TrimSpace(l.Endpoint)
+	}
+	u := strings.TrimSuffix(raw, "/")
+	return strings.HasSuffix(u, "/api/v1/write")
+}
+
+// EffectiveLogsEndpoint resolves the remote logs destination.
+func (l LogShipping) EffectiveLogsEndpoint() string {
+	if raw := strings.TrimSpace(l.LogsEndpoint); raw != "" {
+		if l.Agent == "fluentbit" {
+			return raw
+		}
+		return l.normalizeSignalURL(raw, "logs")
+	}
+	if raw := strings.TrimSpace(l.Endpoint); raw != "" {
+		if l.Agent == "fluentbit" {
+			return raw
+		}
+		u := strings.TrimSuffix(raw, "/")
+		if strings.HasSuffix(u, "/v1/logs") || l.isBaseOTLPEndpoint(u) {
+			return l.normalizeSignalURL(u, "logs")
+		}
+	}
+	return ""
+}
+
+// EffectiveMetricsEndpoint resolves the remote metrics destination
+// (either Prometheus Remote Write "/api/v1/write" or OTLP "/v1/metrics").
+func (l LogShipping) EffectiveMetricsEndpoint() string {
+	if raw := strings.TrimSpace(l.MetricsEndpoint); raw != "" {
+		if l.IsPrometheusRemoteWrite() {
+			return strings.TrimSuffix(raw, "/")
+		}
+		return l.normalizeSignalURL(raw, "metrics")
+	}
+	if raw := strings.TrimSpace(l.Endpoint); raw != "" {
+		u := strings.TrimSuffix(raw, "/")
+		if l.IsPrometheusRemoteWrite() {
+			return u
+		}
+		if strings.HasSuffix(u, "/v1/metrics") || l.isBaseOTLPEndpoint(u) {
+			return l.normalizeSignalURL(u, "metrics")
+		}
+	}
+	return ""
+}
+
+// EffectiveTracesEndpoint resolves the remote OTLP HTTP traces
+// destination (e.g. VictoriaTraces "/insert/opentelemetry/v1/traces").
+func (l LogShipping) EffectiveTracesEndpoint() string {
+	if raw := strings.TrimSpace(l.TracesEndpoint); raw != "" {
+		return l.normalizeSignalURL(raw, "traces")
+	}
+	if raw := strings.TrimSpace(l.Endpoint); raw != "" {
+		u := strings.TrimSuffix(raw, "/")
+		if strings.HasSuffix(u, "/v1/traces") || l.isBaseOTLPEndpoint(u) {
+			return l.normalizeSignalURL(u, "traces")
+		}
+	}
+	return ""
+}
+
+// EffectiveMetricsHeaders returns metrics_headers if set, else headers.
+func (l LogShipping) EffectiveMetricsHeaders() string {
+	if strings.TrimSpace(l.MetricsHeaders) != "" {
+		return strings.TrimSpace(l.MetricsHeaders)
+	}
+	return strings.TrimSpace(l.Headers)
+}
+
+// EffectiveTracesHeaders returns traces_headers if set, else headers.
+func (l LogShipping) EffectiveTracesHeaders() string {
+	if strings.TrimSpace(l.TracesHeaders) != "" {
+		return strings.TrimSpace(l.TracesHeaders)
+	}
+	return strings.TrimSpace(l.Headers)
+}
+
+// EffectiveScrapeInterval returns the Prometheus scrape interval for
+// otelcol metrics shipping (default "15s").
+func (l LogShipping) EffectiveScrapeInterval() string {
+	if s := strings.TrimSpace(l.ScrapeInterval); s != "" {
+		return s
+	}
+	return "15s"
 }
 
 // Validate checks the invariants every role shares. Role-specific shapes

@@ -420,6 +420,9 @@ func (d *DiskManager) candidatesFor(platform string) (meta, cache, keeper string
 // Fatal stays reserved for the cases a retry cannot cure:
 // the metadata-disk MOUNT itself failing (corrupt fs, device error).
 func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnameSet func()) ([]MountedDisk, error) {
+	if d.Platform == "compose" {
+		return d.mountComposeDirs(ctx, spec)
+	}
 	metaCands, cacheCands, keeperCands := d.candidatesFor(d.Platform)
 
 	var mounted []MountedDisk
@@ -497,4 +500,35 @@ func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnam
 func (d *DiskManager) WithPlatform(platform string) *DiskManager {
 	d.Platform = platform
 	return d
+}
+
+// mountComposeDirs prepares container-mounted directories (Docker volumes
+// or bind mounts) without touching block devices or /etc/fstab.
+func (d *DiskManager) mountComposeDirs(ctx context.Context, spec model.BootSpec) ([]MountedDisk, error) {
+	dirs := []string{"/var/lib/clickhouse", "/var/lib/clickhouse/disks"}
+	mounted := []MountedDisk{
+		{Label: spec.Disks.MetadataLabel, Device: "compose-volume", Mount: "/var/lib/clickhouse"},
+	}
+	if spec.Role == model.RoleKeeper {
+		dirs = append(dirs, "/var/lib/clickhouse-keeper/log", "/var/lib/clickhouse-keeper/snapshots")
+		mounted = append(mounted, MountedDisk{
+			Label:  spec.Disks.KeeperLabel,
+			Device: "compose-volume",
+			Mount:  "/var/lib/clickhouse-keeper",
+		})
+	}
+	for _, dir := range dirs {
+		if _, err := d.runner.Run(ctx, "mkdir", "-p", dir); err != nil {
+			return mounted, chinitsvc.Fatal(fmt.Errorf("create %s: %w", dir, err))
+		}
+	}
+	if _, err := d.runner.Run(ctx, "chown", "-R", "clickhouse:clickhouse", "/var/lib/clickhouse"); err != nil {
+		return mounted, err
+	}
+	if spec.Role == model.RoleKeeper {
+		if _, err := d.runner.Run(ctx, "chown", "-R", "clickhouse:clickhouse", "/var/lib/clickhouse-keeper"); err != nil {
+			return mounted, err
+		}
+	}
+	return mounted, nil
 }

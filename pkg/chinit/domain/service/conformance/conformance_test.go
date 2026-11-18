@@ -15,6 +15,7 @@ import (
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/service/conformance"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/aws"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/azure"
+	"github.com/stackgenhq/chinit/pkg/chinit/infra/compose"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/fakes"
 )
 
@@ -75,9 +76,21 @@ func TestProviderConformance(t *testing.T) {
 		azureProvider = p.WithBundle(bundle)
 	}
 
+	composeProvider := compose.New(port.Config{Region: "local", Spec: spec}).(*compose.Provider).
+		WithMetadata(port.InstanceMetadata{
+			Provider:   "compose",
+			Region:     "local",
+			Zone:       "compose-1",
+			InstanceID: "compose-conformance-0",
+			PrivateIP:  "172.28.0.10",
+		}).
+		WithSecrets(secrets).
+		WithBundle(bundle)
+
 	suites := []conformance.Suite{
 		{Name: "aws", Provider: awsProvider},
 		{Name: "azure", Provider: azureProvider},
+		{Name: "compose", Provider: composeProvider},
 	}
 	conformance.RunAll(t, suites)
 }

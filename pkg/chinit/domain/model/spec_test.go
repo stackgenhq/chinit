@@ -258,4 +258,38 @@ secrets:
 		Expect(spec.MultiAZ.Enabled).To(BeFalse())
 		Expect(spec.Validate()).To(Succeed())
 	})
+
+	It("resolves per-signal VictoriaMetrics / VictoriaTraces / VictoriaLogs and base OTLP URLs", func() {
+		// VictoriaMetrics stack: distinct paths/hosts per signal.
+		vm := model.LogShipping{
+			Agent:           "otel",
+			LogsEndpoint:    "https://vlinsert.example.com/insert/opentelemetry/v1/logs",
+			MetricsEndpoint: "https://vminsert.example.com/insert/0/prometheus/api/v1/write",
+			TracesEndpoint:  "https://vtinsert.example.com/insert/opentelemetry/v1/traces",
+			Headers:         "Authorization=Bearer base-tok",
+			TracesHeaders:   "Authorization=Bearer trace-tok",
+		}
+		Expect(vm.HasAnyEndpoint()).To(BeTrue())
+		Expect(vm.IsPrometheusRemoteWrite()).To(BeTrue())
+		Expect(vm.EffectiveLogsEndpoint()).To(Equal("https://vlinsert.example.com/insert/opentelemetry/v1/logs"))
+		Expect(vm.EffectiveMetricsEndpoint()).To(Equal("https://vminsert.example.com/insert/0/prometheus/api/v1/write"))
+		Expect(vm.EffectiveTracesEndpoint()).To(Equal("https://vtinsert.example.com/insert/opentelemetry/v1/traces"))
+		Expect(vm.EffectiveMetricsHeaders()).To(Equal("Authorization=Bearer base-tok"))
+		Expect(vm.EffectiveTracesHeaders()).To(Equal("Authorization=Bearer trace-tok"))
+
+		// VictoriaMetrics OTLP metrics path must not double-append /v1/metrics.
+		vmOTLP := model.LogShipping{
+			MetricsEndpoint: "https://vm.example.com/opentelemetry/v1/metrics",
+		}
+		Expect(vmOTLP.IsPrometheusRemoteWrite()).To(BeFalse())
+		Expect(vmOTLP.EffectiveMetricsEndpoint()).To(Equal("https://vm.example.com/opentelemetry/v1/metrics"))
+		Expect(vmOTLP.EffectiveLogsEndpoint()).To(BeEmpty())
+		Expect(vmOTLP.EffectiveTracesEndpoint()).To(BeEmpty())
+
+		// Base OTLP collector URL expands cleanly across all three signals.
+		base := model.LogShipping{Endpoint: "https://otel.example.com:4318/"}
+		Expect(base.EffectiveLogsEndpoint()).To(Equal("https://otel.example.com:4318/v1/logs"))
+		Expect(base.EffectiveMetricsEndpoint()).To(Equal("https://otel.example.com:4318/v1/metrics"))
+		Expect(base.EffectiveTracesEndpoint()).To(Equal("https://otel.example.com:4318/v1/traces"))
+	})
 })

@@ -397,17 +397,20 @@ func toBootIdentity(identity *model.NodeIdentity, cloud string) *bootIdentity {
 // RunResult is the pipeline outcome: every step's status and whether the
 // boot overall succeeded.
 type RunResult struct {
-	Steps    []StepOutcome
-	Fatality error // the Critical failure, if any
+	Steps      []StepOutcome
+	Fatality   error // the Critical failure, if any
+	StartedAt  time.Time
+	FinishedAt time.Time
 }
 
 // StepOutcome is one step's engine-level result.
 type StepOutcome struct {
-	Name     string
-	Crit     Criticality
-	Duration time.Duration
-	Err      error
-	Skipped  bool
+	Name      string
+	Crit      Criticality
+	StartedAt time.Time
+	Duration  time.Duration
+	Err       error
+	Skipped   bool
 }
 
 // Failed reports whether the step failed (BestEffort failures included:
@@ -421,7 +424,10 @@ func (o StepOutcome) Failed() bool { return o.Err != nil }
 // A ParallelGroup runs its children concurrently (errgroup) with the
 // same resume/criticality semantics per child.
 func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
-	res := RunResult{Steps: make([]StepOutcome, 0, len(steps))}
+	res := RunResult{
+		Steps:     make([]StepOutcome, 0, len(steps)),
+		StartedAt: e.clock.Now(),
+	}
 
 	var state *modelState
 	if e.stateStore != nil {
@@ -488,6 +494,7 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 				if e.stateStore != nil {
 					_ = e.stateStore.Save(state)
 				}
+				res.FinishedAt = e.clock.Now()
 				return res
 			}
 			if e.stateStore != nil {
@@ -516,6 +523,7 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 
 		start := e.clock.Now()
 		err := Do(ctx, st.Policy(), st.Run)
+		outcome.StartedAt = start
 		outcome.Duration = e.clock.Since(start)
 		outcome.Err = err
 
@@ -544,6 +552,7 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 				if e.stateStore != nil {
 					_ = e.stateStore.Save(state)
 				}
+				res.FinishedAt = e.clock.Now()
 				return res
 			}
 			// BestEffort: log-and-continue is the caller's job; the
@@ -554,6 +563,7 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 	if e.stateStore != nil {
 		_ = e.stateStore.Save(state)
 	}
+	res.FinishedAt = e.clock.Now()
 	return res
 }
 
@@ -586,6 +596,7 @@ func (e *Engine) runGroup(ctx context.Context, group ParallelGroup, state *model
 		g.Go(func() error {
 			start := e.clock.Now()
 			err := Do(gctx, child.Policy(), child.Run)
+			outcomes[i].StartedAt = start
 			outcomes[i].Duration = e.clock.Since(start)
 			outcomes[i].Err = err
 

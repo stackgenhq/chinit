@@ -843,7 +843,11 @@ func (b *Boot) serverEnvContent(ctx context.Context) (string, error) {
 		fmt.Fprintf(&sb, "CLICKHOUSE_TZ=%s\n", b.Spec.Timezone)
 	}
 	if b.Spec.S3DataBucket != "" {
-		fmt.Fprintf(&sb, "CH_S3_ENDPOINT=\"https://%s.s3.%s.amazonaws.com\"\n", b.Spec.S3DataBucket, region)
+		if endpoint := strings.TrimSpace(os.Getenv("CHINIT_S3_ENDPOINT")); b.Provider.Name() == "compose" && endpoint != "" {
+			fmt.Fprintf(&sb, "CH_S3_ENDPOINT=%q\n", endpoint)
+		} else {
+			fmt.Fprintf(&sb, "CH_S3_ENDPOINT=\"https://%s.s3.%s.amazonaws.com\"\n", b.Spec.S3DataBucket, region)
+		}
 	}
 	if cacheMax := probeCacheDiskMaxBytes(ctx); cacheMax > 0 {
 		fmt.Fprintf(&sb, "CH_CACHE_MAX_SIZE_BYTES=\"%d\"\n", cacheMax)

@@ -49,11 +49,27 @@ spec:
       default/max_download_threads: "32"
       default/min_bytes_to_use_direct_io: "1048576"
       default/enable_filesystem_cache_on_write_operations: "1"
+%{if otel_trace_probability > 0~}
+      default/opentelemetry_start_trace_probability: "${otel_trace_probability}"
+      default/opentelemetry_start_keeper_trace_probability: "${otel_keeper_trace_prob}"
+      default/opentelemetry_trace_processors: "${otel_trace_processors}"
+%{endif~}
+%{if log_query_threads == "1"~}
+      default/log_query_threads: "1"
+%{endif~}
       # The no-data-loss ingest profile (carried by the writer user):
       # INSERT returns after quorum replicas hold the part.
       ingest/insert_quorum: "auto"
       ingest/insert_quorum_timeout: "180000"
       ingest/select_sequential_consistency: "1"
+%{if otel_trace_probability > 0~}
+      ingest/opentelemetry_start_trace_probability: "${otel_trace_probability}"
+      ingest/opentelemetry_start_keeper_trace_probability: "${otel_keeper_trace_prob}"
+      ingest/opentelemetry_trace_processors: "${otel_trace_processors}"
+%{endif~}
+%{if log_query_threads == "1"~}
+      ingest/log_query_threads: "1"
+%{endif~}
     settings:
       # The secure INTERSERVER port (ssl.xml serves it on 9010): with
       # secure: yes this setting renders <port> into remote_servers —
@@ -83,6 +99,26 @@ spec:
       part_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
       metric_log/partition_by: "toYYYYMM(event_date)"
       metric_log/ttl: "event_date + INTERVAL 30 DAY DELETE"
+%{if global_profiler_period_ns > 0~}
+      global_profiler_real_time_period_ns: "${global_profiler_period_ns}"
+      global_profiler_cpu_time_period_ns: "${global_profiler_period_ns}"
+%{endif~}
+%{if otel_span_log_ttl_days > 0~}
+      opentelemetry_span_log/partition_by: "toYYYYMM(event_date)"
+      opentelemetry_span_log/ttl: "event_date + INTERVAL ${otel_span_log_ttl_days} DAY DELETE"
+%{endif~}
+%{if trace_log_ttl_days > 0~}
+      trace_log/partition_by: "toYYYYMM(event_date)"
+      trace_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+      processors_profile_log/partition_by: "toYYYYMM(event_date)"
+      processors_profile_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+      azure_queue_log/partition_by: "toYYYYMM(event_date)"
+      azure_queue_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+      blob_storage_log/partition_by: "toYYYYMM(event_date)"
+      blob_storage_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+      background_schedule_pool_log/partition_by: "toYYYYMM(event_date)"
+      background_schedule_pool_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+%{endif~}
     files:
       server-logger.xml: |
         <clickhouse>

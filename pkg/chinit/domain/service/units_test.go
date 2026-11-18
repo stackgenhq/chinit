@@ -113,6 +113,27 @@ var _ = Describe("chinitUnits", func() {
 				}
 			}
 		})
+
+		It("installs span-ship timer and renders VictoriaMetrics/VictoriaTraces otelcol pipelines when configured", func() {
+			spec := baseSpec()
+			spec.LogShipping = model.LogShipping{
+				Agent:           "otel",
+				LogsEndpoint:    "https://vl.example.com/insert/opentelemetry/v1/logs",
+				MetricsEndpoint: "https://vm.example.com/api/v1/write",
+				TracesEndpoint:  "https://vt.example.com/insert/opentelemetry/v1/traces",
+				Headers:         "Authorization=Bearer tok",
+			}
+			b := &Boot{Spec: &spec}
+			units := b.chinitUnits()
+			Expect(unitNames(units)).To(ContainElements("span-ship.service", "span-ship.timer"))
+
+			cfg := NewOTelCollectorRenderer(&spec, "writer-0", units).Render()
+			Expect(cfg).To(ContainSubstring("logs_endpoint: https://vl.example.com/insert/opentelemetry/v1/logs"))
+			Expect(cfg).To(ContainSubstring("prometheusremotewrite:\n    endpoint: https://vm.example.com/api/v1/write"))
+			Expect(cfg).To(ContainSubstring("traces_endpoint: https://vt.example.com/insert/opentelemetry/v1/traces"))
+			Expect(cfg).To(ContainSubstring("targets: [\"127.0.0.1:9363\"]"))
+			Expect(cfg).To(ContainSubstring("targets: [\"127.0.0.1:9150\"]"))
+		})
 	})
 
 	Context("CronToCalendar", func() {
