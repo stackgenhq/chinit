@@ -397,7 +397,7 @@ jobs:
           echo "$ALL_IDS" | head -n -${{ env.KEEP_GENERATIONS }} | while read -r AMI; do
             [ -z "$AMI" ] && continue
             if referenced "$AMI"; then echo "keeping $AMI — referenced in repository, skipping"; continue; fi
-            if in_use "$AMI"; then echo "keeping $AMI — $IN_USE instance(s) still use it, skipping"; continue; fi
+            if in_use "$AMI"; then echo "keeping $AMI — still in use by instances, skipping"; continue; fi
             retire "$AMI"
           done
 
