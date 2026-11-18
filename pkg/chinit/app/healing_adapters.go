@@ -12,6 +12,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -252,11 +253,10 @@ func (entries ddlQueueReplicas) staleEntries(liveHostnames map[string]bool, writ
 
 func ddlEntryShortHost(entry string) string {
 	host := entry
-	if idx := strings.Index(host, "%3A"); idx > 0 {
-		host = host[:idx]
-	} else if idx := strings.Index(host, "%3a"); idx > 0 {
-		host = host[:idx]
-	} else if idx := strings.IndexByte(host, ':'); idx > 0 {
+	if unescaped, err := url.PathUnescape(host); err == nil {
+		host = unescaped
+	}
+	if idx := strings.IndexByte(host, ':'); idx > 0 {
 		host = host[:idx]
 	}
 	if dot := strings.IndexByte(host, '.'); dot > 0 {
