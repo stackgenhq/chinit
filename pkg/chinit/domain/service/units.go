@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/altinity/clickhouse-operator/pkg/model/chi/backupconfig"
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 	chinitport "github.com/stackgenhq/chinit/pkg/chinit/domain/port"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/system"
@@ -388,15 +389,6 @@ func (b *Boot) configureBackup(ctx context.Context) error {
 	if err := os.MkdirAll(backupConfigDir(), 0755); err != nil {
 		return err
 	}
-	retention := b.Spec.Backup.RetentionDays
-	if retention == 0 {
-		retention = 7
-	}
-	compressionLevel := 1
-	if b.Spec.Backup.CompressionFormat == "tar" || b.Spec.Backup.CompressionFormat == "none" {
-		compressionLevel = 0
-	}
-	prefix := strings.Trim(b.Spec.Backup.Prefix, "/") + "/" + b.Spec.ClusterName
 
 	// ClickHouse credentials for the backup tool. The golden AMI ships
 	// clickhouse-backup 2.5.0, which predates the `password_file` config key
@@ -421,19 +413,32 @@ func (b *Boot) configureBackup(ctx context.Context) error {
 	if region == "" {
 		region = b.Meta.Region
 	}
+	retention := b.Spec.Backup.RetentionDays
+	if retention == 0 {
+		retention = 7
+	}
+	compressionLevel := 1
+	if b.Spec.Backup.CompressionFormat == "tar" || b.Spec.Backup.CompressionFormat == "none" {
+		compressionLevel = 0
+	}
+	prefix := strings.Trim(b.Spec.Backup.Prefix, "/") + "/" + b.Spec.ClusterName
 
-	cfg := fmt.Sprintf(`clickhouse:
-  username: admin
-  password: %s
-  host: localhost
-  port: 9000
-  data_path: /var/lib/clickhouse
-  skip_tables:
-    - system.*
-    - information_schema.*
-    - INFORMATION_SCHEMA.*
-
-general:
+	// Build the config.yml with the operator's backupconfig.Build —
+	// the same builder that generates the sidecar configuration
+	// Secrets on-cluster. The storage settings (bucket/path/region/
+	// compression) go in as the YAML storage config, and the admin
+	// credentials ride the ClickHouse credentials; Build keeps every
+	// unknown key, sets the storage paths' defaults, and turns env
+	// override back on for the settings it recognizes.
+	//
+	// NOTE on `path` vs the old hand-rolled `prefix` key: the AMI's
+	// clickhouse-backup 2.5.0 (and every later release) reads s3.path —
+	// its config struct has no `prefix` field, and go-yaml ignores
+	// unknown keys, so the previous hand-rolled template's `prefix:`
+	// line was silently DROPPED and backups landed at the bucket root
+	// instead of under <prefix>/<cluster>/. Building through
+	// backupconfig emits s3.path, restoring the intended prefix.
+	storage := fmt.Sprintf(`general:
   remote_storage: s3
   max_file_size: 107374182400
   disable_progress_bar: false
@@ -447,14 +452,41 @@ general:
 
 s3:
   bucket: %s
-  prefix: %s
+  path: %s
   region: %s
-  # Credentials come from the instance role (SDK chain); leave unset
   compression_level: %d
   compression_format: %s
-`, adminPw, retention, b.Spec.Backup.Bucket, prefix, region, compressionLevel, b.Spec.Backup.CompressionFormat)
 
-	if err := os.WriteFile(backupConfigPath(), []byte(cfg), 0600); err != nil {
+clickhouse:
+  host: localhost
+  port: 9000
+  data_path: /var/lib/clickhouse
+  skip_tables:
+    - system.*
+    - information_schema.*
+    - INFORMATION_SCHEMA.*
+`, retention, b.Spec.Backup.Bucket, prefix, region, compressionLevel, b.Spec.Backup.CompressionFormat)
+
+	built, err := backupconfig.Build(
+		[]byte(storage),
+		backupconfig.Credentials{
+			ClickHouseUsername: "admin",
+			ClickHousePassword: adminPw,
+		},
+		backupconfig.Defaults{
+			// The storage path is always set in the storage config above;
+			// object_disk_path gets the operator's macro-shaped default so
+			// object-disk data lands beside the backups under the same
+			// prefix, not at the bucket root.
+			Path:           "backup/" + prefix,
+			ObjectDiskPath: "object_disks/" + prefix,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("configureBackup: build config.yml: %w", err)
+	}
+
+	if err := os.WriteFile(backupConfigPath(), built.File, 0600); err != nil {
 		return err
 	}
 

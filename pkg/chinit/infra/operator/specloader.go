@@ -5,6 +5,7 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 
 	chk "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse-keeper.altinity.com/v1"
@@ -14,6 +15,7 @@ import (
 	chkNormalizer "github.com/altinity/clickhouse-operator/pkg/model/chk/normalizer"
 	commonNormalizer "github.com/altinity/clickhouse-operator/pkg/model/common/normalizer"
 	"github.com/altinity/clickhouse-operator/pkg/model/common/normalizer/subst"
+	core "k8s.io/api/core/v1"
 
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/port"
 )
@@ -70,6 +72,52 @@ func NewSpecLoader() *SpecLoader {
 	return &SpecLoader{}
 }
 
+// secretGetter adapts a port.SecretSource onto the operator's
+// normalizer seam (subst.SecretGetter): the operator resolves
+// TLS rootCASecretRef (and 0.28.0's backup-Secret credentials) AT
+// NORMALIZE TIME through this callback, fetching a whole Secret by
+// namespace/name and picking the field out of its Data afterward.
+//
+// Off-cluster there is no Kubernetes API server; chinit's cloud secret
+// store (AWS Secrets Manager / Azure Key Vault via the provider) is the
+// equivalent. The namespace is a Kubernetes concept the cloud stores do
+// not share (a single account/region per fleet), so it is accepted and
+// dropped. The cloud store's whole value is fetched (Field empty) and
+// mapped onto the Kubernetes Secret shape the operator's key lookup
+// expects:
+//   - a JSON object of strings becomes one Data key per field — the
+//     same field-selection semantics chinit's own GetSecretValue
+//     applies to structured secrets;
+//   - any other value is exposed under the secret's own name as the one
+//     data key (chinit's "no field = the whole value" convention).
+//
+// Without this adapter (nil secretGet): a spec that declares
+// rootCASecretRef makes FetchSecretFieldValue call the nil func and
+// PANICS the loader (not a rejection — a crash); the operator's
+// hard-fail status paths assume the callback exists.
+func secretGetter(ctx context.Context, secrets port.SecretSource) subst.SecretGetter {
+	if secrets == nil {
+		return nil
+	}
+	return func(namespace, name string) (*core.Secret, error) {
+		_ = namespace // cloud secret stores are not namespaced
+		value, err := secrets.GetSecretValue(ctx, port.SecretRequest{Name: name})
+		if err != nil {
+			return nil, err
+		}
+		data := map[string][]byte{}
+		var fields map[string]string
+		if json.Unmarshal([]byte(value), &fields) == nil && len(fields) > 0 {
+			for field, fieldValue := range fields {
+				data[field] = []byte(fieldValue)
+			}
+		} else {
+			data[name] = []byte(value)
+		}
+		return &core.Secret{Data: data}, nil
+	}
+}
+
 // LoadCHI parses, defaults and runtime-wires a CHI spec document.
 //
 // Why: rendering configs and running schemer operations require a
@@ -92,14 +140,16 @@ func (l *SpecLoader) LoadCHI(ctx context.Context, request port.LoadCHIRequest) (
 		raw.Namespace = request.Spec.Namespace
 	}
 
-	// Off-cluster there is no Kubernetes secret fetcher; specs must not
-	// rely on secretKeyRef resolution. Options must be non-nil: the
-	// normalizer dereferences Options in ensureSubject, matching the
-	// controller's NewOptions[...] wiring.
-	var secretGet subst.SecretGetter
+	// Off-cluster the secret getter is the cloud secret store when the
+	// caller wired one (the provider's Secrets Manager / Key Vault
+	// source). Options must be non-nil: the normalizer dereferences
+	// Options in ensureSubject, matching the controller's
+	// NewOptions[...] wiring. Without a source, a spec relying on
+	// secret refs is rejected by the normalizer's status path instead
+	// of resolved.
 	options := commonNormalizer.NewOptions[v1.ClickHouseInstallation]()
 
-	n := normalizer.New(secretGet)
+	n := normalizer.New(secretGetter(ctx, request.Secrets))
 	cr, err := n.CreateTemplated(raw, options)
 	if err != nil {
 		return nil, err

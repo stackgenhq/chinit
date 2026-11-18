@@ -60,14 +60,25 @@ var _ = Describe("configureBackup", func() {
 
 		cfg, err := os.ReadFile(backupConfigPath())
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(cfg)).To(ContainSubstring("  username: admin\n"))
+		// backupconfig.Build (operator 0.28.0) marshals sorted keys with
+		// 6-space indent (yaml.Marshal of nested maps), and keeps every
+		// key clickhouse-backup reads: s3.PATH is the key v2.5.0 loads —
+		// the old hand-rolled template wrote `prefix:`, which go-yaml
+		// silently drops (v2.5.0's config struct has no Prefix field),
+		// landing backups at the bucket root instead of the configured
+		// prefix. This pin guards the storage path semantics.
+		Expect(string(cfg)).To(ContainSubstring("username: admin"))
 		// 2.5.0 ignores password_file; the password must be inline.
-		Expect(string(cfg)).To(ContainSubstring("  password: sekrit\n"))
+		Expect(string(cfg)).To(ContainSubstring("password: sekrit"))
 		Expect(string(cfg)).NotTo(ContainSubstring("password_file"))
 		// The retention and bucket wiring ride along.
 		Expect(string(cfg)).To(ContainSubstring("backups_to_keep_remote: 7"))
 		Expect(string(cfg)).To(ContainSubstring("bucket: bkt"))
-		Expect(string(cfg)).To(ContainSubstring("prefix: backups/example"))
+		Expect(string(cfg)).To(ContainSubstring("path: backups/example"))
+		// The builder defaults every storage section's paths; the s3
+		// object_disk_path rides the same prefix so object-disk data
+		// lands beside the backups, not at the bucket root.
+		Expect(string(cfg)).To(ContainSubstring("object_disk_path: object_disks/backups/example"))
 	})
 
 	It("fails closed when the admin password file is missing", func() {

@@ -204,6 +204,10 @@ func (b *Boot) LoadCHI(ctx context.Context) (any, error) {
 			Name: b.Spec.ClusterName,
 			Data: data,
 		},
+		// Secret refs the spec declares (e.g. TLS rootCASecretRef)
+		// resolve through the cloud secret store at load time — the
+		// same source the users renderer resolves passwordFrom with.
+		Secrets: b.Provider,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("load chi.yaml: %w", err)
