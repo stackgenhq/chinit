@@ -73,10 +73,6 @@ func PeerHostsPath() func() string { return peerHostsPath }
 // SetPeerHostsPath redirects the hosts-file path (test seam).
 func SetPeerHostsPath(f func() string) { peerHostsPath = f }
 
-func writePeerHostsFile(ctx context.Context, claims []port.Claim, args ConvergeHostsArgs) error {
-	return peerClaims(claims).writePeerHostsFile(ctx, args)
-}
-
 func (claims peerClaims) writePeerHostsFile(ctx context.Context, args ConvergeHostsArgs) error {
 	writerPrefix := args.WriterPrefix
 	if writerPrefix == "" {

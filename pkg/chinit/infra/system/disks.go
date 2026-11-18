@@ -221,7 +221,7 @@ func (d *DiskManager) isEphemeralNVMe(ctx context.Context, device string) bool {
 // Azure L16s_v3) and mdadm is available, they are striped into a single
 // RAID-0 array (/dev/md/ch-cache) to pool full local NVMe capacity and
 // IOPS; when a single drive is present, it is used directly.
-func (d *DiskManager) resolveEphemeralCacheDevice(ctx context.Context, excludeDevice string) (string, error) {
+func (d *DiskManager) resolveEphemeralCacheDevice(ctx context.Context, excludeDevice string) string {
 	var ephemerals []string
 	var bestDev string
 	var bestSize uint64
@@ -245,10 +245,10 @@ func (d *DiskManager) resolveEphemeralCacheDevice(ctx context.Context, excludeDe
 		}
 	}
 	if len(ephemerals) == 0 {
-		return "", nil
+		return ""
 	}
 	if len(ephemerals) == 1 {
-		return ephemerals[0], nil
+		return ephemerals[0]
 	}
 	// Multiple blank ephemeral NVMe drives: stripe with mdadm RAID-0 when
 	// mdadm is installed; fall back to the largest single drive otherwise.
@@ -262,12 +262,12 @@ func (d *DiskManager) resolveEphemeralCacheDevice(ctx context.Context, excludeDe
 		"--run",
 	}, ephemerals...)
 	if _, err := d.runner.Run(ctx, "mdadm", args...); err == nil {
-		return raidDev, nil
+		return raidDev
 	}
 	if bestDev != "" {
-		return bestDev, nil
+		return bestDev
 	}
-	return ephemerals[0], nil
+	return ephemerals[0]
 }
 
 // deviceSizeBytes returns the block device's size in bytes via lsblk, or 0
@@ -313,7 +313,7 @@ func (d *DiskManager) ResolveCacheDevice(ctx context.Context, label, fallbackCan
 	if byLabel, err := d.ResolveByLabel(ctx, label); err == nil && byLabel != "" && byLabel != excludeDevice {
 		return byLabel, nil
 	}
-	if ephDev, err := d.resolveEphemeralCacheDevice(ctx, excludeDevice); err == nil && ephDev != "" {
+	if ephDev := d.resolveEphemeralCacheDevice(ctx, excludeDevice); ephDev != "" {
 		return ephDev, nil
 	}
 	return d.resolveFirstExisting(ctx, fallbackCandidates, true)

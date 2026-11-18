@@ -813,7 +813,7 @@ func defaultProbeCacheDiskMaxBytes(ctx context.Context) uint64 {
 	if err != nil {
 		return 0
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) == 0 {
 		return 0
 	}
