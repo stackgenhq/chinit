@@ -65,6 +65,8 @@ To build an image using the Altinity Antalya ClickHouse distribution (Apache-2.0
 ```bash
 packer build \
   -var build_flavor=antalya \
-  -var clickhouse_version=26.6.8.20004.altinityantalya \
+  -var clickhouse_version=26.8.34.20001.altinityantalya \
   -var-file=defaults.pkrvars.hcl clickhouse.pkr.hcl
 ```
+
+When `clickhouse_version` exists in `builds.altinity.cloud/antalya-apt-repo` (e.g. `26.6.8.20004.altinityantalya`), Packer installs it directly via `apt`. When building a `26.8` Antalya version from the `antalya-26.8` branch before apt promotion (e.g. `26.8.34.20001.altinityantalya`), Packer automatically falls back to downloading the signed `arm64` `.deb` packages from `s3://altinity-build-artifacts/REFs/${antalya_ci_ref}/${antalya_ci_sha}/build_arm_release/` and verifies each package's SHA-512 against `sign_release_arm_release/*.deb.sha512.gpg`.
