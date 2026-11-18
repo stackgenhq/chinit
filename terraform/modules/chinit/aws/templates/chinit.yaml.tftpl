@@ -65,6 +65,14 @@ autoscaling:
 s3_data_bucket: "${s3_data_bucket}"
 timezone: "${timezone}"
 
+# CAS identity contract (the 2026-11-18 Code 246 fresh-EBS roll finding):
+# when the CAS cold tier is on, the server EnvironmentFile pins
+# CH_CAS_SERVER_ROOT_ID to the node's deterministic root id
+# (cluster/hostname-derived), so every ASG replacement of an ordinal
+# claims the SAME CAS server-root anchor across fresh EBS instead of
+# Code 246 crash-looping on the terminated incarnation's anchor.
+cas_enabled: ${cas_enabled}
+
 config_bundle:
   bucket: "${bundle_bucket}"
   prefix: "${bundle_prefix}"

@@ -585,8 +585,7 @@ locals {
   chinit_spec_common = {
     cluster_name  = var.cluster_name
     dns_zone_name = var.dns_zone_name
-    region        = var.region
-    # The fleet policy: the disruption floors + the lifecycle hook
+    region        = var.region    # The fleet policy: the disruption floors + the lifecycle hook
     # list, rendered into every role's spec (the boundaries run on
     # every node).
     min_healthy_writers = var.min_healthy_writers
@@ -597,6 +596,7 @@ locals {
     config_hash         = local.config_files_hash
     s3_data_bucket      = var.data_bucket
     timezone            = var.timezone
+    cas_enabled         = var.cas_enabled
     keeper_hostnames    = var.keeper_hostnames
     # Static-writer compat fields (writer_nodes/writer_count): lease
     # binaries ignore them in slot arithmetic; pre-lease binaries on
