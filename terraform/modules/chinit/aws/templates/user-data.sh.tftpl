@@ -14,6 +14,8 @@ set +e
 CHINIT_SPEC_KEY="${chinit_spec_key}"
 CHINIT_SPEC_PATH="/var/lib/clickhouse-bootstrap/chinit.yaml"
 BOOT_UNIT=/etc/systemd/system/chinit-boot.service
+export AWS_REGION="${region}"
+export AWS_DEFAULT_REGION="${region}"
 
 ${wrapper_extra}
 
@@ -31,9 +33,12 @@ fi
 # and a single-shot user-data silently "succeeded" with no spec — the
 # ASG kept a node that never bootstrapped). Retry until the object
 # exists, then let chinit's own SHA gate handle the content.
+# Always pass --region so aws s3 cp targets s3.<region>.amazonaws.com
+# and rides the VPC's free S3 Gateway Endpoint instead of defaulting to
+# s3.amazonaws.com (us-east-1) via the NAT Gateway.
 mkdir -p "$(dirname "$CHINIT_SPEC_PATH")"
 for i in $(seq 1 30); do
-    aws s3 cp "s3://${bundle_bucket}/${bundle_prefix}/$CHINIT_SPEC_KEY" "$CHINIT_SPEC_PATH" && break
+    aws s3 cp --region "${region}" "s3://${bundle_bucket}/${bundle_prefix}/$CHINIT_SPEC_KEY" "$CHINIT_SPEC_PATH" && break
     echo "spec fetch attempt $i failed (bundle replaced mid-boot?); retrying in 10s" >&2
     sleep 10
 done

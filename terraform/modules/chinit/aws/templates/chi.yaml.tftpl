@@ -73,6 +73,7 @@ spec:
       merge_tree/parts_to_throw_insert: "3000"
       merge_tree/merge_with_ttl_timeout: "300"
       merge_tree/ttl_only_drop_parts: "1"
+      merge_tree/execute_merges_on_single_replica_time_threshold: "3600"
       # Query/system log bounds: a log table without a TTL is worse than
       # unbounded — a rotated, readonly log never runs TTL drops.
       query_log/partition_by: "toYYYYMM(event_date)"

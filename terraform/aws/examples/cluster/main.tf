@@ -15,7 +15,7 @@ module "clickhouse" {
 
   cluster_name  = "demo"
   region        = "us-west-2"
-  golden_ami_id = "ami-0123456789abcdef0" # from images/aws packer build
+  golden_ami_id = "ami-0f8511dd30c68ca21" # Altinity Antalya golden AMI (from images/aws packer build)
 
   # Identity ceilings (ASG maxima — never live counts)
   writer_max     = 2

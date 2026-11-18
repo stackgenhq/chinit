@@ -88,4 +88,26 @@ var _ = Describe("RenderFleetMetrics", func() {
 		Expect(strings.Contains(out, "chinit_fleet_status_age_seconds")).To(BeFalse(),
 			"no row = no gauge (the alarm keys on presence, not a zero)")
 	})
+
+	It("renders CAS mount and GC health gauges when CAS is enabled", func() {
+		out := service.RenderFleetMetrics(service.FleetMetricsInput{
+			Hostname: "writer-0", ClusterName: "demo", Now: now,
+			CAS: service.CASMetrics{
+				Enabled:          true,
+				LiveMounts:       2,
+				WedgedNamespaces: 0,
+				GCErrors:         1,
+			},
+		})
+		Expect(out).To(ContainSubstring(`chinit_cas_mounts_live{cluster="demo",hostname="writer-0"} 2`))
+		Expect(out).To(ContainSubstring(`chinit_cas_wedged_namespaces{cluster="demo",hostname="writer-0"} 0`))
+		Expect(out).To(ContainSubstring(`chinit_cas_gc_errors_total{cluster="demo",hostname="writer-0"} 1`))
+	})
+
+	It("omits CAS gauges when CAS is not enabled", func() {
+		out := service.RenderFleetMetrics(service.FleetMetricsInput{
+			Hostname: "writer-0", ClusterName: "demo", Now: now,
+		})
+		Expect(out).NotTo(ContainSubstring("chinit_cas_"))
+	})
 })

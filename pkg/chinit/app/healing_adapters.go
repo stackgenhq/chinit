@@ -210,3 +210,137 @@ func newForceRestoreFlagger(ctx context.Context, st *nodeState) port.ForceRestor
 	}
 	return &cliForceRestoreFlagger{execContext: ctx, keeperHost: host, keeperPort: defaultKeeperRaftPort, replicaName: st.Identity.Hostname}
 }
+
+// ddlQueueReplicas is a domain collection of Keeper child znode names
+// under a distributed DDL task_queue/replicas path.
+type ddlQueueReplicas []string
+
+// staleEntries filters the Keeper replica registrations down to entries
+// guaranteed to be dead or unresolvable off-cluster:
+//   - Kubernetes pod-pattern leftovers (chi-*),
+//   - localhost registrations,
+//   - leased ASG role entries (writer-*, reader-*) absent from liveHostnames.
+//
+// Static roles (backup-0, keeper-*) and unrecognized names are never
+// selected. Both literal "host:port" and URL-escaped "host%3Aport"
+// DDLWorker znode encodings are normalized.
+func (entries ddlQueueReplicas) staleEntries(liveHostnames map[string]bool, writerPrefix, readerPrefix string) ddlQueueReplicas {
+	if writerPrefix == "" {
+		writerPrefix = "writer-"
+	}
+	if readerPrefix == "" {
+		readerPrefix = "reader-"
+	}
+	var stale ddlQueueReplicas
+	for _, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		short := ddlEntryShortHost(entry)
+		switch {
+		case short == "localhost" || strings.HasPrefix(short, "chi-"):
+			stale = append(stale, entry)
+		case strings.HasPrefix(short, writerPrefix) || strings.HasPrefix(short, readerPrefix):
+			if !liveHostnames[short] {
+				stale = append(stale, entry)
+			}
+		}
+	}
+	return stale
+}
+
+func ddlEntryShortHost(entry string) string {
+	host := entry
+	if idx := strings.Index(host, "%3A"); idx > 0 {
+		host = host[:idx]
+	} else if idx := strings.Index(host, "%3a"); idx > 0 {
+		host = host[:idx]
+	} else if idx := strings.IndexByte(host, ':'); idx > 0 {
+		host = host[:idx]
+	}
+	if dot := strings.IndexByte(host, '.'); dot > 0 {
+		host = host[:dot]
+	}
+	return host
+}
+
+// cliDDLTaskQueueCleaner prunes dead host registrations from Keeper's
+// distributed DDL task_queue/replicas trees so ClickHouse DDLWorker
+// does not stall ON CLUSTER queries on retired or unresolvable hosts.
+type cliDDLTaskQueueCleaner struct {
+	execContext  context.Context
+	keeperHost   string
+	keeperPort   int
+	clusterName  string
+	writerPrefix string
+	readerPrefix string
+}
+
+func newDDLTaskQueueCleaner(ctx context.Context, st *nodeState) *cliDDLTaskQueueCleaner {
+	if st == nil {
+		return nil
+	}
+	spec, err := loadInventorySpec()
+	if err != nil || spec == nil || len(spec.KeeperNodes) == 0 {
+		return nil
+	}
+	host := spec.KeeperNodes[0]
+	if host == "" {
+		host = "keeper-0"
+	}
+	if spec.DNSZoneName != "" {
+		host = host + "." + spec.DNSZoneName
+	}
+	return &cliDDLTaskQueueCleaner{
+		execContext:  ctx,
+		keeperHost:   host,
+		keeperPort:   defaultKeeperRaftPort,
+		clusterName:  st.clusterName(),
+		writerPrefix: spec.writerPrefix(),
+		readerPrefix: spec.readerPrefix(),
+	}
+}
+
+// PruneStaleDDLReplicas inspects Keeper's distributed DDL replica paths
+// and removes stale znodes absent from liveClaims. Returns the removed
+// znode paths (best-effort; missing paths or transient errors skip).
+func (c *cliDDLTaskQueueCleaner) PruneStaleDDLReplicas(liveClaims activeClaims) []string {
+	if c == nil || len(liveClaims) == 0 {
+		return nil
+	}
+	live := make(map[string]bool, len(liveClaims))
+	for _, claim := range liveClaims {
+		if claim.Hostname != "" {
+			live[claim.Hostname] = true
+		}
+	}
+	paths := []string{"/clickhouse/task_queue/replicas"}
+	if c.clusterName != "" {
+		paths = append([]string{"/clickhouse/" + c.clusterName + "/task_queue/replicas"}, paths...)
+	}
+	var pruned []string
+	for _, basePath := range paths {
+		out, err := runCommand(c.execContext, "clickhouse-keeper-client",
+			"--host", c.keeperHost,
+			"--port", strconv.Itoa(c.keeperPort),
+			"-q", fmt.Sprintf("ls '%s'", basePath))
+		if err != nil {
+			continue
+		}
+		children := ddlQueueReplicas(strings.Fields(string(out)))
+		for _, dead := range children.staleEntries(live, c.writerPrefix, c.readerPrefix) {
+			if strings.ContainsAny(dead, "'/\n\r") {
+				continue
+			}
+			full := basePath + "/" + dead
+			if _, rerr := runCommand(c.execContext, "clickhouse-keeper-client",
+				"--host", c.keeperHost,
+				"--port", strconv.Itoa(c.keeperPort),
+				"-q", fmt.Sprintf("rmr '%s'", full)); rerr == nil {
+				pruned = append(pruned, full)
+			}
+		}
+	}
+	return pruned
+}

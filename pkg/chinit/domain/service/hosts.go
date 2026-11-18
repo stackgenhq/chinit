@@ -59,19 +59,12 @@ func ConvergePeerHosts(ctx context.Context, provider port.Provider, args Converg
 		logger.GetLogger(ctx).Warn("peer-hosts: live-claims listing failed; keeping current hosts file", "err", err)
 		return nil
 	}
-	return writePeerHostsFile(ctx, claims, args)
+	return peerClaims(claims).writePeerHostsFile(ctx, args)
 }
 
-// writePeerHostsFile is the sweep-and-append core shared by the boot
-// step and the periodic convergence: stale writer/reader lines are
-// swept first (a re-run must converge on the CURRENT claims, not
-// preserve whatever an older boot wrote — the old contains-check kept
-// a wrong entry forever), then one line per live claim.
-//
-// The hosts path is a seam the tests redirect (never /var/lib
-// privileges in the suite). PeerHostsPath exports the seam for the
-// app-layer specs (the lease-renew timer drives the convergence
-// its specs must redirect the same path the service writes).
+// peerClaims is a domain collection of active ordinal lease claims.
+type peerClaims []port.Claim
+
 var peerHostsPath = func() string { return "/etc/hosts" }
 
 // PeerHostsPath returns the current hosts-file path (test seam).
@@ -81,6 +74,10 @@ func PeerHostsPath() func() string { return peerHostsPath }
 func SetPeerHostsPath(f func() string) { peerHostsPath = f }
 
 func writePeerHostsFile(ctx context.Context, claims []port.Claim, args ConvergeHostsArgs) error {
+	return peerClaims(claims).writePeerHostsFile(ctx, args)
+}
+
+func (claims peerClaims) writePeerHostsFile(ctx context.Context, args ConvergeHostsArgs) error {
 	writerPrefix := args.WriterPrefix
 	if writerPrefix == "" {
 		writerPrefix = "writer-"

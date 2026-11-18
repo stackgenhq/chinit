@@ -110,7 +110,7 @@ func ValidateConfigSemantics(path string, data []byte) error {
 	}
 	// Fragment roots vary (<clickhouse>, <yandex>) — validate the
 	// element's CHILDREN whatever the root name is.
-	if err := validateNodeChildren(path, &root); err != nil {
+	if err := root.validateChildren(path); err != nil {
 		return err
 	}
 	// Cross-element semantics: a merge_tree free-entry threshold must
@@ -121,7 +121,7 @@ func ValidateConfigSemantics(path string, data []byte) error {
 	// alone can ride one (the pool then lives in another fragment or
 	// config.xml — the check only fires when BOTH are visible and
 	// conflict).
-	return validatePoolThresholds(path, &root)
+	return root.validatePoolThresholds(path)
 }
 
 // poolSettings carry the cross-checked pair: the background pool size
@@ -134,26 +134,26 @@ type poolSettings struct {
 // collectPoolSettings walks the fragment for the background pool size
 // (fragment top level) and the free-entry thresholds (<merge_tree>).
 // Absent values report -1 (unknown — the check needs both).
-func collectPoolSettings(node *xmlNode, ps *poolSettings) {
+func (node *xmlNode) collectPoolSettings(ps *poolSettings) {
 	inMergeTree := node.XMLName.Local == "merge_tree"
 	for _, child := range node.Children {
 		name := child.XMLName.Local
 		switch {
 		case name == "background_pool_size" && !inMergeTree:
-			if v, ok := childInt(&child); ok {
+			if v, ok := (&child).childInt(); ok {
 				ps.backgroundPoolSize = v
 			}
 		case strings.HasPrefix(name, "number_of_free_entries_in_pool_to_") && inMergeTree:
-			if v, ok := childInt(&child); ok {
+			if v, ok := (&child).childInt(); ok {
 				ps.thresholds[name] = v
 			}
 		}
-		collectPoolSettings(&child, ps)
+		(&child).collectPoolSettings(ps)
 	}
 }
 
 // childInt parses an element's text content as an integer.
-func childInt(node *xmlNode) (int, bool) {
+func (node *xmlNode) childInt() (int, bool) {
 	v, err := strconv.Atoi(strings.TrimSpace(node.Text))
 	if err != nil {
 		return 0, false
@@ -163,9 +163,9 @@ func childInt(node *xmlNode) (int, bool) {
 
 // validatePoolThresholds enforces floor <= pool for every visible
 // free-entry threshold against a fragment-visible pool size.
-func validatePoolThresholds(path string, root *xmlNode) error {
+func (root *xmlNode) validatePoolThresholds(path string) error {
 	ps := poolSettings{backgroundPoolSize: -1, thresholds: map[string]int{}}
-	collectPoolSettings(root, &ps)
+	root.collectPoolSettings(&ps)
 	if ps.backgroundPoolSize < 0 || len(ps.thresholds) == 0 {
 		return nil // not both visible in this fragment — nothing to cross
 	}
@@ -189,13 +189,13 @@ type xmlNode struct {
 	Children []xmlNode `xml:",any"`
 }
 
-func validateNodeChildren(path string, node *xmlNode) error {
+func (node *xmlNode) validateChildren(path string) error {
 	inMergeTree := node.XMLName.Local == "merge_tree"
 	for _, child := range node.Children {
 		name := child.XMLName.Local
 		// User-level settings belong in users.d (<profiles>), never
 		// in a server config fragment (Code 137 at startup).
-		if userLevelSettingsAtTopLevel[name] && !inProfileTree(node) {
+		if userLevelSettingsAtTopLevel[name] && !node.inProfileTree() {
 			return chinitsvc.Fatal(fmt.Errorf(
 				"%s: <%s> is a user-level setting in a server config fragment — "+
 					"ClickHouse 26.x refuses to start with Code 137 UNKNOWN_ELEMENT_IN_CONFIG "+
@@ -212,13 +212,13 @@ func validateNodeChildren(path string, node *xmlNode) error {
 		}
 		// Merge-tree-scoped settings at the fragment top level: the
 		// mirror error — Code 115 the other way.
-		if mergeTreeScopedSettings[name] && !inMergeTree && !inProfileTree(node) {
+		if mergeTreeScopedSettings[name] && !inMergeTree && !node.inProfileTree() {
 			return chinitsvc.Fatal(fmt.Errorf(
 				"%s: <%s> belongs inside <merge_tree> — at the fragment top level "+
 					"ClickHouse 26.x refuses to start with Code 115 UNKNOWN_SETTING",
 				path, name))
 		}
-		if err := validateNodeChildren(path, &child); err != nil {
+		if err := (&child).validateChildren(path); err != nil {
 			return err
 		}
 	}
@@ -227,7 +227,7 @@ func validateNodeChildren(path string, node *xmlNode) error {
 
 // inProfileTree reports whether node is a profiles subtree (users.d
 // renders carry these; a setting inside <profiles>/<default> is legal).
-func inProfileTree(node *xmlNode) bool {
+func (node *xmlNode) inProfileTree() bool {
 	return node.XMLName.Local == "profiles" || node.XMLName.Local == "default" || node.XMLName.Local == "readonly"
 }
 
@@ -291,7 +291,8 @@ func defaultBackupOverlayXML() string {
 
 // HardwareSizingOverlayXML renders a server-level config.d overlay
 // (z_hardware-sizing.xml) proportional to the host's actual vCPU count
-// and physical RAM.
+// and physical RAM, plus optional dynamic cache <max_size> sizing when
+// a dedicated cache disk is mounted at /var/lib/clickhouse/disks.
 //
 // Why: a single cluster CHI spec is shared across heterogeneous roles
 // (e.g. 8-16 vCPU / 64 GiB writers alongside 2-4 vCPU / 8 GiB readers,
@@ -305,7 +306,7 @@ func defaultBackupOverlayXML() string {
 // background_pool_size so ClickHouse 26.x never refuses startup with
 // Code 36 when background_pool_size < 20 (the upstream default of
 // number_of_free_entries_in_pool_to_execute_mutation).
-func HardwareSizingOverlayXML(vcpus int, memBytes uint64) string {
+func HardwareSizingOverlayXML(vcpus int, memBytes uint64, cacheDisks ...CacheDiskSizing) string {
 	if vcpus < 1 {
 		vcpus = 2
 	}
@@ -324,6 +325,8 @@ func HardwareSizingOverlayXML(vcpus int, memBytes uint64) string {
 	markCache := clampUint64(memBytes*15/100, 512<<20, 8<<30)
 	uncompressedCache := clampUint64(memBytes*5/100, 256<<20, 2<<30)
 
+	storageBlock := CacheDiskSizings(cacheDisks).renderCacheStorageOverlay()
+
 	return fmt.Sprintf(`<?xml version="1.0"?>
 <clickhouse>
     <!-- Rendered by chinit for host hardware (%d vCPU, %d MiB RAM) -->
@@ -337,9 +340,129 @@ func HardwareSizingOverlayXML(vcpus int, memBytes uint64) string {
     <background_move_pool_size>%d</background_move_pool_size>
     <background_schedule_pool_size>%d</background_schedule_pool_size>
     <mark_cache_size>%d</mark_cache_size>
-    <uncompressed_cache_size>%d</uncompressed_cache_size>
+    <uncompressed_cache_size>%d</uncompressed_cache_size>%s
 </clickhouse>
-`, vcpus, memBytes>>20, freeEntries, freeEntries, freeEntries, bgPool, concurrencyRatio, movePool, schedulePool, markCache, uncompressedCache)
+`, vcpus, memBytes>>20, freeEntries, freeEntries, freeEntries, bgPool, concurrencyRatio, movePool, schedulePool, markCache, uncompressedCache, storageBlock)
+}
+
+// CacheDiskSizing describes the mounted cache filesystem capacity and the
+// cache wrapper disk names (e.g. s3_cache, cas_cache) present in storage.xml
+// that share the mountpoint.
+type CacheDiskSizing struct {
+	// MountBytes is the total byte capacity of the mounted cache volume
+	// (/var/lib/clickhouse/disks). Zero skips the storage_configuration
+	// override so storage.xml's static <max_size> remains in effect.
+	MountBytes uint64
+	// DiskNames lists the cache wrapper disk names declared in
+	// storage.xml (e.g. ["s3_cache"] or ["s3_cache", "cas_cache"]).
+	// Defaults to ["s3_cache"] when empty.
+	DiskNames []string
+}
+
+// CacheDiskSizings is a domain collection of CacheDiskSizing entries.
+type CacheDiskSizings []CacheDiskSizing
+
+// CacheMaxSizeBytes computes the per-wrapper <max_size> in bytes (90% of
+// the mounted cache volume divided evenly across the active cache disk
+// wrappers sharing the mountpoint).
+func (c CacheDiskSizing) CacheMaxSizeBytes() uint64 {
+	if c.MountBytes == 0 {
+		return 0
+	}
+	count := uint64(len(c.DiskNames))
+	if count == 0 {
+		count = 1
+	}
+	return (c.MountBytes * 90 / 100) / count
+}
+
+func (sizings CacheDiskSizings) renderCacheStorageOverlay() string {
+	if len(sizings) == 0 || sizings[0].MountBytes == 0 {
+		return ""
+	}
+	s := sizings[0]
+	maxSize := s.CacheMaxSizeBytes()
+	if maxSize == 0 {
+		return ""
+	}
+	names := s.DiskNames
+	if len(names) == 0 {
+		names = []string{"s3_cache"}
+	}
+	var b strings.Builder
+	b.WriteString("\n    <storage_configuration>\n        <disks>\n")
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "            <%s>\n                <max_size>%d</max_size>\n            </%s>\n", name, maxSize, name)
+	}
+	b.WriteString("        </disks>\n    </storage_configuration>")
+	return b.String()
+}
+
+// cacheDiskNames returns the <type>cache</type> disk names declared under
+// <storage_configuration><disks> in this XML fragment.
+func (root *xmlNode) cacheDiskNames() []string {
+	var names []string
+	for _, child := range root.Children {
+		if child.XMLName.Local != "storage_configuration" {
+			continue
+		}
+		for _, sc := range child.Children {
+			if sc.XMLName.Local != "disks" {
+				continue
+			}
+			for _, disk := range sc.Children {
+				for _, prop := range disk.Children {
+					if prop.XMLName.Local == "type" && strings.TrimSpace(prop.Text) == "cache" {
+						names = append(names, disk.XMLName.Local)
+						break
+					}
+				}
+			}
+		}
+	}
+	return names
+}
+
+// detectCacheDiskNames inspects storage.xml bytes for <type>cache</type>
+// disks so z_hardware-sizing.xml overrides every cache wrapper sharing
+// /var/lib/clickhouse/disks (e.g. s3_cache and cas_cache).
+func detectCacheDiskNames(storageXML []byte) []string {
+	var root xmlNode
+	if err := xml.Unmarshal(storageXML, &root); err != nil {
+		return []string{"s3_cache"}
+	}
+	names := root.cacheDiskNames()
+	if len(names) == 0 {
+		return []string{"s3_cache"}
+	}
+	return names
+}
+
+// probeCacheMountBytes returns the size in bytes of the dedicated cache
+// filesystem mounted at /var/lib/clickhouse/disks, or 0 when unmounted
+// or unavailable.
+func (i *StaticConfigInstaller) probeCacheMountBytes(ctx context.Context) uint64 {
+	const cacheMount = "/var/lib/clickhouse/disks"
+	if _, err := i.runner.Run(ctx, "mountpoint", "-q", cacheMount); err != nil {
+		return 0
+	}
+	out, err := i.runner.Run(ctx, "df", "-B1", "--output=size", cacheMount)
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 0 {
+		return 0
+	}
+	last := strings.TrimSpace(lines[len(lines)-1])
+	n, err := strconv.ParseUint(last, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // HardwareProfilesOverlayXML renders a users.d overlay
@@ -516,7 +639,15 @@ func (i *StaticConfigInstaller) Install(ctx context.Context, bundleDir string) e
 	if i.Role == model.RoleWriter || i.Role == model.RoleReader {
 		vcpus := runtime.NumCPU()
 		memBytes := readMemTotalBytes()
-		hwXML := []byte(HardwareSizingOverlayXML(vcpus, memBytes))
+		var cacheSizing CacheDiskSizing
+		if mountBytes := i.probeCacheMountBytes(ctx); mountBytes > 0 {
+			storageBytes, _ := os.ReadFile(filepath.Join(bundleDir, "storage.xml"))
+			cacheSizing = CacheDiskSizing{
+				MountBytes: mountBytes,
+				DiskNames:  detectCacheDiskNames(storageBytes),
+			}
+		}
+		hwXML := []byte(HardwareSizingOverlayXML(vcpus, memBytes, cacheSizing))
 		if err := ValidateConfigSemantics(hwConfigDest, hwXML); err != nil {
 			return err
 		}

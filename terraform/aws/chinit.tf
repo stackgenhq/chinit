@@ -29,6 +29,8 @@ module "chinit" {
   bootstrap_prefix      = "bootstrap"
   data_bucket           = aws_s3_bucket.data.id
   data_prefix           = var.s3_data_prefix
+  cas_enabled           = var.cas_enabled
+  cas_prefix            = var.cas_prefix
   backup_bucket         = aws_s3_bucket.backup.id
   backup_prefix         = "backups"
   backup_retention_days = var.backup_retention_days

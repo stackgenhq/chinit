@@ -581,6 +581,7 @@ func runExporter(args []string) error {
 			ClusterName: st.clusterName(),
 			Tasks:       tasks,
 			Statuses:    statuses,
+			CAS:         probeCASMetrics(ctx),
 			Now:         time.Now(),
 		})); err != nil {
 			// The client went away mid-scrape; nothing to act on.
@@ -613,6 +614,41 @@ func runExporter(args []string) error {
 		"addr", addr, "cluster", st.clusterName())
 	fmt.Printf("chinit exporter listening on %s (/metrics, /clickhouse-metrics)\n", addr)
 	return http.ListenAndServe(addr, mux)
+}
+
+// probeCASMetrics queries system.cas_mounts and system.cas_gc_log on the
+// local server when the Antalya CAS tables exist, returning zeroed
+// CASMetrics (Enabled=false) on upstream builds or when CAS is unused.
+var probeCASMetrics = defaultProbeCASMetrics
+
+func defaultProbeCASMetrics(ctx context.Context) service.CASMetrics {
+	const casQuery = `
+SELECT
+    countIf(state = 'live'),
+    toInt64(sum(wedged_namespace_count)),
+    (SELECT count() FROM system.cas_gc_log WHERE event_time >= now() - INTERVAL 1 HOUR AND error != '')
+FROM system.cas_mounts
+`
+	out, err := runCommandWithEnv(ctx, clickhouseClientEnv(), "clickhouse-client", "--query", casQuery)
+	if err != nil {
+		return service.CASMetrics{}
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) != 3 {
+		return service.CASMetrics{}
+	}
+	live, err1 := strconv.Atoi(fields[0])
+	wedged, err2 := strconv.Atoi(fields[1])
+	gcErrs, err3 := strconv.Atoi(fields[2])
+	if err1 != nil || err2 != nil || err3 != nil || (live == 0 && wedged == 0 && gcErrs == 0) {
+		return service.CASMetrics{}
+	}
+	return service.CASMetrics{
+		Enabled:          true,
+		LiveMounts:       live,
+		WedgedNamespaces: wedged,
+		GCErrors:         gcErrs,
+	}
 }
 
 // runKeeperRollout is the keeper mode of fleet-rollout: the keeper

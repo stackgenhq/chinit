@@ -33,6 +33,29 @@
                 <max_size>${cache_max_size_bytes}</max_size>
                 <cache_on_write_operations>true</cache_on_write_operations>
             </s3_cache>
+%{if cas_enabled~}
+
+            <cas>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <cas_server_root_id>{replica}</cas_server_root_id>
+                <endpoint from_env="CH_S3_ENDPOINT" />
+                <endpoint_subpath>${cas_prefix}/tiered/</endpoint_subpath>
+                <use_environment_credentials>true</use_environment_credentials>
+                <skip_bucket_creation>true</skip_bucket_creation>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+            </cas>
+
+            <cas_cache>
+                <type>cache</type>
+                <disk>cas</disk>
+                <path>/var/lib/clickhouse/disks/cas_cache/</path>
+                <max_size>${cache_max_size_bytes}</max_size>
+                <cache_on_write_operations>true</cache_on_write_operations>
+            </cas_cache>
+%{endif~}
         </disks>
 
         <policies>
@@ -52,6 +75,25 @@
                 </volumes>
                 <move_factor>0.1</move_factor>
             </tiered>
+%{if cas_enabled~}
+
+            <tiered_cas>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                        <volume_priority>1</volume_priority>
+                        <prefer_not_to_merge>false</prefer_not_to_merge>
+                    </hot>
+                    <cold>
+                        <disk>cas_cache</disk>
+                        <volume_priority>2</volume_priority>
+                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+                        <prefer_not_to_merge>true</prefer_not_to_merge>
+                    </cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </tiered_cas>
+%{endif~}
         </policies>
     </storage_configuration>
 </clickhouse>

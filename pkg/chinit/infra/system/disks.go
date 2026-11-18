@@ -80,6 +80,19 @@ const (
 	azureKeeperCandidates   = "/dev/disk/azure/scsi1/lun2"
 )
 
+// nvmePoolDevices enumerates the NVMe block devices probed for size
+// comparison and ephemeral instance-store discovery.
+var nvmePoolDevices = []string{
+	"/dev/nvme0n1",
+	"/dev/nvme1n1",
+	"/dev/nvme2n1",
+	"/dev/nvme3n1",
+	"/dev/nvme4n1",
+	"/dev/nvme5n1",
+	"/dev/nvme6n1",
+	"/dev/nvme7n1",
+}
+
 // MountedDisk describes what a successful mount produced.
 type MountedDisk struct {
 	Label  string
@@ -97,14 +110,21 @@ func (d *DiskManager) ResolveByLabel(ctx context.Context, label string) (string,
 // a block device. Probing via [ -b ] shells test(1); a missing candidate
 // simply doesn't match. When the winning candidate is a blank NVMe disk
 // whose byte size is known (lsblk > 0), also check the full NVMe pool
-// (/dev/nvme0n1..nvme3n1) and pick the LARGEST blank unpartitioned NVMe
-// disk so a flipped Nitro enumeration order (e.g. /dev/sdc 32 GiB cache on
-// nvme1n1 and /dev/sdb 64/256 GiB metadata on nvme2n1, observed on reader-2
-// i-091f087bd609b1877) never mounts the smaller cache disk as ch-metadata.
-func (d *DiskManager) resolveFirstExisting(ctx context.Context, candidates string) (string, error) {
+// (/dev/nvme0n1..nvme3n1) and pick the LARGEST blank unpartitioned
+// non-ephemeral NVMe disk so a flipped Nitro enumeration order (e.g.
+// /dev/sdc 32 GiB cache on nvme1n1 and /dev/sdb 64/256 GiB metadata on
+// nvme2n1, observed on reader-2 i-091f087bd609b1877) never mounts the
+// smaller cache disk as ch-metadata — while NEVER adopting an ephemeral
+// local NVMe instance-store disk (Amazon EC2 NVMe Instance Storage /
+// Microsoft NVMe Direct Disk) for persistent metadata or keeper roles.
+func (d *DiskManager) resolveFirstExisting(ctx context.Context, candidates string, allowEphemeral bool) (string, error) {
+	sawNVMe := false
 	for _, dev := range strings.Fields(candidates) {
 		if _, err := d.runner.Run(ctx, "test", "-b", dev); err != nil {
 			continue
+		}
+		if strings.HasPrefix(dev, "/dev/nvme") {
+			sawNVMe = true
 		}
 		// Never adopt a disk that carries a PARTITION TABLE: on
 		// Graviton the NVMe enumeration order is not stable (the
@@ -119,30 +139,135 @@ func (d *DiskManager) resolveFirstExisting(ctx context.Context, candidates strin
 		if d.carriesPartitionTable(ctx, dev) {
 			continue
 		}
+		// Ephemeral NVMe instance store (e.g. r8gd/c8gd/i4g 474 GiB+
+		// local NVMe) must NEVER be adopted for metadata or keeper
+		// volumes even when larger than the EBS metadata disk.
+		if !allowEphemeral && d.isEphemeralNVMe(ctx, dev) {
+			if dev == "/dev/nvme1n1" && sawNVMe {
+				if poolDev := d.bestBlankNVMe(ctx, "", 0, allowEphemeral); poolDev != "" {
+					return poolDev, nil
+				}
+			}
+			continue
+		}
 		if strings.HasPrefix(dev, "/dev/nvme") && !d.hasFilesystem(ctx, dev) {
 			if bestSize := d.deviceSizeBytes(ctx, dev); bestSize > 0 {
-				bestDev := dev
-				for _, nvme := range []string{"/dev/nvme0n1", "/dev/nvme1n1", "/dev/nvme2n1", "/dev/nvme3n1"} {
-					if nvme == dev {
-						continue
-					}
-					if _, err := d.runner.Run(ctx, "test", "-b", nvme); err != nil {
-						continue
-					}
-					if d.carriesPartitionTable(ctx, nvme) || d.hasFilesystem(ctx, nvme) {
-						continue
-					}
-					if sz := d.deviceSizeBytes(ctx, nvme); sz > bestSize {
-						bestSize = sz
-						bestDev = nvme
-					}
+				if poolDev := d.bestBlankNVMe(ctx, dev, bestSize, allowEphemeral); poolDev != "" {
+					return poolDev, nil
 				}
-				return bestDev, nil
 			}
 		}
 		return dev, nil
 	}
 	return "", nil
+}
+
+// bestBlankNVMe scans the Nitro NVMe pool (/dev/nvme0n1..nvme3n1) for the
+// largest blank, unpartitioned NVMe disk (excluding ephemeral NVMe when
+// allowEphemeral is false).
+func (d *DiskManager) bestBlankNVMe(ctx context.Context, currentBest string, currentSize uint64, allowEphemeral bool) string {
+	bestDev := currentBest
+	bestSize := currentSize
+	for _, nvme := range nvmePoolDevices[:4] {
+		if nvme == currentBest {
+			continue
+		}
+		if _, err := d.runner.Run(ctx, "test", "-b", nvme); err != nil {
+			continue
+		}
+		if d.carriesPartitionTable(ctx, nvme) || d.hasFilesystem(ctx, nvme) {
+			continue
+		}
+		if !allowEphemeral && d.isEphemeralNVMe(ctx, nvme) {
+			continue
+		}
+		sz := d.deviceSizeBytes(ctx, nvme)
+		if sz > bestSize || bestDev == "" {
+			bestSize = sz
+			bestDev = nvme
+		}
+	}
+	return bestDev
+}
+
+// deviceModel returns the hardware model reported by lsblk for a block
+// device (e.g. "Amazon Elastic Block Store", "Amazon EC2 NVMe Instance
+// Storage", "Microsoft NVMe Direct Disk"), or "" when unavailable.
+func (d *DiskManager) deviceModel(ctx context.Context, device string) string {
+	out, err := d.runner.Run(ctx, "lsblk", "-d", "-n", "-o", "MODEL", device)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// isEphemeralNVMe reports whether a block device is a local ephemeral
+// NVMe instance-store disk (AWS Nitro Instance Storage or Azure NVMe
+// Direct Disk). Ephemeral disks are ideal for S3/CAS read-write cache
+// (cold cache on VM replacement) and must never back metadata or keeper
+// state.
+func (d *DiskManager) isEphemeralNVMe(ctx context.Context, device string) bool {
+	if !strings.HasPrefix(device, "/dev/nvme") {
+		return false
+	}
+	model := d.deviceModel(ctx, device)
+	return strings.Contains(model, "Instance Storage") ||
+		strings.Contains(model, "NVMe Direct Disk")
+}
+
+// resolveEphemeralCacheDevice discovers blank local ephemeral NVMe
+// instance-store disks for the cache volume. When multiple blank
+// ephemeral NVMe drives are present (e.g. r8gd.8xlarge, i4g.4xlarge,
+// Azure L16s_v3) and mdadm is available, they are striped into a single
+// RAID-0 array (/dev/md/ch-cache) to pool full local NVMe capacity and
+// IOPS; when a single drive is present, it is used directly.
+func (d *DiskManager) resolveEphemeralCacheDevice(ctx context.Context, excludeDevice string) (string, error) {
+	var ephemerals []string
+	var bestDev string
+	var bestSize uint64
+	for _, nvme := range nvmePoolDevices {
+		if nvme == excludeDevice {
+			continue
+		}
+		if _, err := d.runner.Run(ctx, "test", "-b", nvme); err != nil {
+			continue
+		}
+		if d.carriesPartitionTable(ctx, nvme) || d.hasFilesystem(ctx, nvme) {
+			continue
+		}
+		if !d.isEphemeralNVMe(ctx, nvme) {
+			continue
+		}
+		ephemerals = append(ephemerals, nvme)
+		if sz := d.deviceSizeBytes(ctx, nvme); sz >= bestSize {
+			bestSize = sz
+			bestDev = nvme
+		}
+	}
+	if len(ephemerals) == 0 {
+		return "", nil
+	}
+	if len(ephemerals) == 1 {
+		return ephemerals[0], nil
+	}
+	// Multiple blank ephemeral NVMe drives: stripe with mdadm RAID-0 when
+	// mdadm is installed; fall back to the largest single drive otherwise.
+	raidDev := "/dev/md/ch-cache"
+	args := append([]string{
+		"--create", raidDev,
+		"--level=0",
+		fmt.Sprintf("--raid-devices=%d", len(ephemerals)),
+		"--metadata=1.2",
+		"--force",
+		"--run",
+	}, ephemerals...)
+	if _, err := d.runner.Run(ctx, "mdadm", args...); err == nil {
+		return raidDev, nil
+	}
+	if bestDev != "" {
+		return bestDev, nil
+	}
+	return ephemerals[0], nil
 }
 
 // deviceSizeBytes returns the block device's size in bytes via lsblk, or 0
@@ -177,7 +302,21 @@ func (d *DiskManager) ResolveDevice(ctx context.Context, label, fallbackCandidat
 	if byLabel, err := d.ResolveByLabel(ctx, label); err == nil && byLabel != "" {
 		return byLabel, nil
 	}
-	return d.resolveFirstExisting(ctx, fallbackCandidates)
+	return d.resolveFirstExisting(ctx, fallbackCandidates, false)
+}
+
+// ResolveCacheDevice resolves the S3/CAS cache disk: label first (repeat
+// boots), then any blank local ephemeral NVMe instance-store disk (or
+// RAID-0 stripe across multiple ephemeral NVMe disks), falling back to
+// the platform's attached cache volume candidates.
+func (d *DiskManager) ResolveCacheDevice(ctx context.Context, label, fallbackCandidates, excludeDevice string) (string, error) {
+	if byLabel, err := d.ResolveByLabel(ctx, label); err == nil && byLabel != "" && byLabel != excludeDevice {
+		return byLabel, nil
+	}
+	if ephDev, err := d.resolveEphemeralCacheDevice(ctx, excludeDevice); err == nil && ephDev != "" {
+		return ephDev, nil
+	}
+	return d.resolveFirstExisting(ctx, fallbackCandidates, true)
 }
 
 // isMounted reports whether the mountpoint is an active mount.
@@ -299,9 +438,11 @@ func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnam
 	}
 	mounted = append(mounted, md)
 
-	// Cache: optional; falls back to a subdirectory on the metadata disk.
+	// Cache: optional; prefers ephemeral local NVMe instance store when
+	// present, then attached cache volume, and falls back to a
+	// subdirectory on the metadata disk.
 	if spec.Disks.CacheLabel != "" {
-		cacheDev, err := d.ResolveDevice(ctx, spec.Disks.CacheLabel, cacheCands)
+		cacheDev, err := d.ResolveCacheDevice(ctx, spec.Disks.CacheLabel, cacheCands, dev)
 		if err != nil {
 			return mounted, err
 		}

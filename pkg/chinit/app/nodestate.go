@@ -272,6 +272,18 @@ func (is *inventorySpec) writerCeiling() int {
 	return is.WriterCount
 }
 
+// readerCeiling is the reader slot ceiling (reader_max, falling back
+// to reader_count). Nil-receiver-safe.
+func (is *inventorySpec) readerCeiling() int {
+	if is == nil {
+		return -1
+	}
+	if is.ReaderMax > 0 {
+		return is.ReaderMax
+	}
+	return is.ReaderCount
+}
+
 // writerPrefix defaults the leased-writer hostname prefix.
 // Nil-receiver-safe (see writerCeiling).
 func (is *inventorySpec) writerPrefix() string {

@@ -13,7 +13,7 @@ module "clickhouse" {
 
   cluster_name  = "demo"
   region        = "us-west-2"
-  golden_ami_id = "ami-…" # built from images/aws with Packer
+  golden_ami_id = "ami-0f8511dd30c68ca21" # Altinity Antalya golden AMI (or build from images/aws)
 
   dns_zone_name = "clickhouse.internal"
   subnet_cidr   = "10.42.0.0/24"
@@ -61,13 +61,17 @@ External load balancers, custom scaling policies, secret rotation Lambdas, and b
 | `/dev/sdc` | `ch-cache` | `/var/lib/clickhouse/disks` | Local S3 read cache (`writer`, `reader`) |
 | `/dev/sdf` | `ch-keeper` | `/var/lib/clickhouse-keeper` | Persistent Raft log (`keeper`) |
 
-`chinit` mounts volumes by filesystem `LABEL` so NVMe device-node numbering differences across instance types do not affect mounts.
+`chinit` mounts volumes by filesystem `LABEL` so NVMe device-node numbering differences across instance types do not affect mounts. On NVMe instance-store families (`r8gd`, `c8gd`, `i4g`), `chinit` never places `ch-metadata` or `ch-keeper` on ephemeral NVMe, automatically prefers local ephemeral NVMe (striping multiple drives with `mdadm` RAID-0 when present) for `ch-cache`, and dynamically sizes `<max_size>` across active cache wrappers (`s3_cache` / `cas_cache`) to 90% of the mounted cache volume.
+
+## Shared S3 CAS Cold Tier (Altinity Antalya)
+
+Set `cas_enabled = true` (with an Altinity Antalya golden AMI such as `ami-0f8511dd30c68ca21`) to render the `cas` (`metadata_type = cas`) shared S3 pool, `cas_cache` local cache wrapper, and `tiered_cas` storage policy so cold parts are stored once across all replicas rather than duplicated per `{replica}`.
 
 ## Sizing Notes
 
 - `writer_max` and `reader_max` must match the maximum capacity of their respective Auto Scaling Groups.
 - `keeper_count` must be an odd number (typically 3) to maintain Raft quorum.
-- `cache_disk_size_gb` automatically sets `<max_size>` in `storage.xml` to 90% of the cache volume size.
+- `cache_disk_size_gb` sets the baseline `<max_size>` in `storage.xml` to 90% of the cache volume size, and `chinit` dynamically overrides `<max_size>` in `z_hardware-sizing.xml` (and exports `CH_CACHE_MAX_SIZE_BYTES`) to 90% of the actual mounted `/var/lib/clickhouse/disks` capacity at boot.
 - `metadata_disk_size_gb` can grow online via `chinit disk-autoscale` when free space drops below the threshold.
 
 ## Key Outputs
