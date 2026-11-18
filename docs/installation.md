@@ -64,8 +64,9 @@ sudo install -m 0755 chinit /usr/local/bin/chinit
 
 The [`images/`](https://github.com/stackgenhq/chinit/tree/main/images) directory ships production-ready Packer templates for AWS and Azure:
 
-| Cloud | Packer Output | Pre-Baked Stack |
+| Cloud | Image Artifact | Pre-Baked Stack |
 |---|---|---|
+| **Local Docker Compose** (`deploy/compose`) | `ghcr.io/stackgenhq/chinit-node:latest` (`linux/amd64`, `linux/arm64`) | ClickHouse `26.8.36.3`, `systemd`, OpenTelemetry Collector, `chinit`, and default local bundle/secrets/specs |
 | **AWS** (`images/aws`) | Golden AMI (`arm64`) | Ubuntu 24.04 LTS, ClickHouse, `clickhouse-backup`, AWS CLI v2, CloudWatch & OTel Collector agents, `chinit` |
 | **Azure** (`images/azure`) | Azure Compute Gallery Image | Ubuntu 24.04 LTS, ClickHouse, `clickhouse-backup`, Azure CLI, OTel Collector agent, `chinit` |
 

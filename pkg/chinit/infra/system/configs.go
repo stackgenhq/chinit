@@ -315,7 +315,7 @@ func HardwareSizingOverlayXML(vcpus int, memBytes uint64, cacheDisks ...CacheDis
 	}
 	bgPool := clampInt(vcpus*2, 4, 32)
 	concurrencyRatio := 4
-	if vcpus <= 2 {
+	if vcpus <= 2 || memBytes <= 12<<30 {
 		concurrencyRatio = 2
 	}
 	movePool := clampInt(vcpus, 2, 8)

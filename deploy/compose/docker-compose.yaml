@@ -5,7 +5,7 @@ x-chinit-node: &chinit-node
   build:
     context: ../..
     dockerfile: deploy/compose/Dockerfile
-  image: chinit-node:compose
+  image: ghcr.io/stackgenhq/chinit-node:latest
   privileged: true
   cgroup: host
   stop_signal: SIGRTMIN+3
@@ -21,9 +21,33 @@ x-chinit-node: &chinit-node
 services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.118.0
-    command: ["--config=/etc/otelcol-contrib/config.yaml"]
-    volumes:
-      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command:
+      - |
+        --config=yaml:
+        receivers:
+          otlp:
+            protocols:
+              http:
+                endpoint: 0.0.0.0:4318
+        processors:
+          batch: {}
+        exporters:
+          debug:
+            verbosity: detailed
+        service:
+          pipelines:
+            logs:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
+            metrics:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
+            traces:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
     ports:
       - "4318:4318"
     networks:
@@ -35,6 +59,7 @@ services:
     hostname: keeper-0
     environment:
       CHINIT_CLOUD: compose
+      CHINIT_ROLE: keeper
       CHINIT_REGION: local
       CHINIT_PRIVATE_IP: 10.142.0.20
       CHINIT_INSTANCE_ID: compose-keeper-0
@@ -69,6 +94,7 @@ services:
         condition: service_healthy
     environment:
       CHINIT_CLOUD: compose
+      CHINIT_ROLE: writer
       CHINIT_REGION: local
       CHINIT_PRIVATE_IP: 10.142.0.10
       CHINIT_INSTANCE_ID: compose-writer-0
@@ -103,6 +129,7 @@ services:
         condition: service_healthy
     environment:
       CHINIT_CLOUD: compose
+      CHINIT_ROLE: reader
       CHINIT_REGION: local
       CHINIT_PRIVATE_IP: 10.142.0.30
       CHINIT_INSTANCE_ID: compose-reader-0

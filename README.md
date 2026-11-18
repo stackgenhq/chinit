@@ -54,7 +54,192 @@ The companion **Packer templates** in [`images/`](./images) pre-bake ClickHouse,
 
 ## Getting Started
 
-The quickest way to deploy a full cluster is with the **Terraform modules**, which provision the lease table, private DNS zone, secrets, instance IAM/RBAC roles, SHA-verified configuration bundle, and the four node roles (`writer`, `reader`, `keeper`, and optional `backup`):
+### Try It Locally with Docker Compose (Copy & Paste)
+
+Want to see `chinit` bootstrap a 3-node ClickHouse + Keeper cluster (`keeper-0`, `writer-0`, `reader-0`) with full `systemd` timer parity on your laptop before touching AWS or Azure?
+
+Our GitHub Actions workflow publishes a prebuilt multi-arch (`linux/amd64`, `linux/arm64`) node image to `ghcr.io/stackgenhq/chinit-node:latest` with the default configuration bundle, secrets, and per-role specs baked in. Drop this `compose.yaml` into any empty directory and run `docker compose up -d --wait`:
+
+```yaml
+x-chinit-node: &chinit-node
+  image: ghcr.io/stackgenhq/chinit-node:latest
+  privileged: true
+  cgroup: host
+  stop_signal: SIGRTMIN+3
+  stop_grace_period: 30s
+  tmpfs:
+    - /run
+    - /run/lock
+  ulimits:
+    nofile:
+      soft: 262144
+      hard: 262144
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.118.0
+    command:
+      - |
+        --config=yaml:
+        receivers:
+          otlp:
+            protocols:
+              http:
+                endpoint: 0.0.0.0:4318
+        processors:
+          batch: {}
+        exporters:
+          debug:
+            verbosity: detailed
+        service:
+          pipelines:
+            logs:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
+            metrics:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
+            traces:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
+    ports:
+      - "4318:4318"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.5
+
+  keeper-0:
+    <<: *chinit-node
+    hostname: keeper-0
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_ROLE: keeper
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.20
+      CHINIT_INSTANCE_ID: compose-keeper-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ch-leases:/var/lib/chinit-cluster
+      - keeper-0-data:/var/lib/clickhouse-keeper
+      - keeper-0-ch:/var/lib/clickhouse
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.20
+        aliases:
+          - keeper-0
+          - keeper-0.ch.local
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && systemctl is-active --quiet clickhouse-keeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  writer-0:
+    <<: *chinit-node
+    hostname: writer-node-0
+    depends_on:
+      otel-collector:
+        condition: service_started
+      keeper-0:
+        condition: service_healthy
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_ROLE: writer
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.10
+      CHINIT_INSTANCE_ID: compose-writer-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ch-leases:/var/lib/chinit-cluster
+      - writer-0-data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "9150:9150"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && curl -sf http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  reader-0:
+    <<: *chinit-node
+    hostname: reader-node-0
+    depends_on:
+      otel-collector:
+        condition: service_started
+      keeper-0:
+        condition: service_healthy
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_ROLE: reader
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.30
+      CHINIT_INSTANCE_ID: compose-reader-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ch-leases:/var/lib/chinit-cluster
+      - reader-0-data:/var/lib/clickhouse
+    ports:
+      - "18123:8123"
+      - "19150:9150"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.30
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && curl -sf http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+networks:
+  chnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.142.0.0/24
+
+volumes:
+  ch-leases:
+  keeper-0-data:
+  keeper-0-ch:
+  writer-0-data:
+  reader-0-data:
+```
+
+Boot the cluster, inspect fleet health, and verify `ReplicatedMergeTree` replication from `writer-0` to `reader-0`:
+
+```bash
+docker compose up -d --wait
+
+# Inspect settled leases, node health, and active systemd maintenance timers
+docker compose exec writer-0 chinit fleet-status
+docker compose exec writer-0 systemctl list-timers 'chinit-*' --no-pager
+
+# Write a row on writer-0 and read it back from reader-0
+docker compose exec writer-0 clickhouse-client --user admin --password compose-admin-pass \
+  --query "INSERT INTO default.events (source, message) VALUES ('compose', 'hello chinit')"
+docker compose exec reader-0 clickhouse-client --user admin --password compose-admin-pass \
+  --query "SELECT * FROM default.events"
+
+# Tear down when finished
+docker compose down -v
+```
+
+See [`deploy/compose/README.md`](./deploy/compose/README.md) for custom bundle/spec mounts and the end-to-end Ginkgo acceptance suite.
+
+### Deploy on AWS or Azure with Terraform
+
+The quickest way to deploy a full cloud cluster is with the **Terraform modules**, which provision the lease table, private DNS zone, secrets, instance IAM/RBAC roles, SHA-verified configuration bundle, and the four node roles (`writer`, `reader`, `keeper`, and optional `backup`):
 
 ```hcl
 module "clickhouse" {
@@ -115,6 +300,7 @@ Then run `chinit boot -spec /var/lib/clickhouse-bootstrap/chinit.yaml`. See the 
 
 - Pushing a `v0.*` tag triggers CI to build and publish static binaries (`linux`/`darwin`, `arm64`/`amd64`) along with `chinit-SHA256SUMS` via GoReleaser.
 - Release asset names (`chinit-<os>-<arch>` and `chinit-SHA256SUMS`) are stable so golden-image builds and bootstrap wrappers can pin and verify them before installation.
+- Multi-arch Docker Compose node images (`linux/amd64` and `linux/arm64`) are built and published to GitHub Container Registry at `ghcr.io/stackgenhq/chinit-node:latest` (and versioned tags `ghcr.io/stackgenhq/chinit-node:v0.*`) via [`.github/workflows/publish-compose-image.yaml`](./.github/workflows/publish-compose-image.yaml).
 
 ## License
 

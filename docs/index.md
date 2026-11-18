@@ -131,14 +131,22 @@ Need to roll out a new ClickHouse version or configuration change across 20 VMs 
 
 | Path | What It Provides |
 |---|---|
-| `cmd/chinit` + `pkg/chinit` | The `chinit` Go binary, convergent boot engine, maintenance subcommands, AWS & Azure adapters, and conformance test suite |
+| `cmd/chinit` + `pkg/chinit` | The `chinit` Go binary, convergent boot engine, maintenance subcommands, AWS, Azure & Compose adapters, and conformance test suite |
+| `deploy/compose` | Multi-node local Docker Compose cluster (`keeper-0`, `writer-0`, `reader-0`, `otel-collector`) running real `systemd` units using `ghcr.io/stackgenhq/chinit-node` |
 | `images/aws` & `images/azure` | Packer definitions that pre-bake Ubuntu 24.04, ClickHouse, `chinit`, `clickhouse-backup`, and monitoring agents into Golden AMIs and Azure Gallery Images |
 | `terraform/aws` & `terraform/azure` | Turnkey Terraform modules that provision the lease table, Private DNS zone, KMS/Key Vault secrets, SHA-256 verified config bundle, and node fleets |
-| `.github/workflows` | Automated CI, GoReleaser multi-arch static binary releases, and golden image build pipelines |
+| `.github/workflows` | Automated CI, GoReleaser multi-arch static binary releases, GHCR Compose image publishing, and golden image build pipelines |
 
-## Get Started in Minutes — Two Fast Paths
+## Get Started in Minutes — Three Fast Paths
 
-**Path A — Launch a node immediately.** Prebuilt, **public** golden AMIs are published in `us-west-2` (both Altinity Antalya 26.8 LTS with CAS `ami-04292dd0d9281579e` and upstream ClickHouse 26.8 LTS `ami-0075eb79e447956ca`), so you can evaluate `chinit` from any AWS account without waiting for a Packer build:
+**Path A — Run a 3-node cluster locally with Docker Compose (Copy & Paste).** Save the standalone [`compose.yaml` in the Quickstart]({{ '/quickstart/#try-it-locally-with-docker-compose-copy--paste' | relative_url }}) and boot a full `systemd`-managed `keeper-0` + `writer-0` + `reader-0` cluster on your laptop using our prebuilt `ghcr.io/stackgenhq/chinit-node:latest` image:
+
+```bash
+docker compose up -d --wait
+docker compose exec writer-0 chinit fleet-status
+```
+
+**Path B — Launch a cloud VM immediately.** Prebuilt, **public** golden AMIs are published in `us-west-2` (both Altinity Antalya 26.8 LTS with CAS `ami-04292dd0d9281579e` and upstream ClickHouse 26.8 LTS `ami-0075eb79e447956ca`), so you can evaluate `chinit` from any AWS account without waiting for a Packer build:
 
 ```bash
 aws ec2 run-instances --region us-west-2 \
@@ -149,7 +157,7 @@ aws ec2 run-instances --region us-west-2 \
 
 The images ship with Ubuntu 24.04 (`arm64`), ClickHouse 26.8 LTS (`26.8.34.20001.altinityantalya` or `26.8.36.3`), `chinit` `0.2.6`, `clickhouse-backup`, and observability agents pre-installed. See [Installation]({{ '/installation/' | relative_url }}) for multi-region copy instructions or building custom images in your own account.
 
-**Path B — Deploy a full cluster.** The [Terraform modules]({{ '/terraform/' | relative_url }}) provision everything — lease table, Private DNS zone, secrets, SHA-256-verified config bundle, IAM/RBAC, and all four node roles — in one `apply`:
+**Path C — Deploy a full cloud cluster.** The [Terraform modules]({{ '/terraform/' | relative_url }}) provision everything — lease table, Private DNS zone, secrets, SHA-256-verified config bundle, IAM/RBAC, and all four node roles — in one `apply`:
 
 ```hcl
 module "clickhouse" {
