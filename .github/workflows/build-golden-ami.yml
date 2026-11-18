@@ -18,6 +18,16 @@ name: Build ClickHouse Golden AMI (AWS)
 # deletes their snapshots.
 
 on:
+  # Manual roll (optionally also building the PUBLIC share flavor):
+  # dispatch with an explicit chinit_version — or leave it empty to
+  # bake the clickhouse.pkr.hcl pin as committed on main (the
+  # release-chinit roll-ami job owns that pin after every release).  # There is deliberately NO push trigger: a plain push to main would
+  # bake whichever pin main happens to carry — typically the PREVIOUS
+  # release's version, because release-chinit's roll-ami bumps the
+  # pin only after its release run completes (and GITHUB_TOKEN pushes
+  # never fire this workflow anyway). Release-driven builds chain
+  # solely on the workflow_run trigger above, which resolves the
+  # version from the released tag AFTER the assets exist.
   workflow_dispatch:
     inputs:
       clickhouse_version:
@@ -63,11 +73,6 @@ on:
     # break the roll. The build itself checks out main below.
     workflows: ["Release chinit"]
     types: [completed]
-  push:
-    branches: [main, master]
-    paths:
-      - "images/aws/**"
-      - ".github/workflows/build-golden-ami.yml"
 
 env:
   AWS_REGION: us-west-2
