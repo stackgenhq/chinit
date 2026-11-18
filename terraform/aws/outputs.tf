@@ -10,6 +10,11 @@ output "cluster_name" {
   value       = var.cluster_name
 }
 
+output "golden_ami_id" {
+  description = "The effective Golden AMI ID used by writers, readers, keepers, and backup (either explicitly pinned via var.golden_ami_id or auto-resolved from the public stackgenhq/chinit Golden AMI matching var.cas_enabled)."
+  value       = local.golden_ami_id
+}
+
 output "dns_zone_name" {
   description = "The private DNS zone nodes register into (writer-N/reader-N/keeper-N/backup-0.<zone>)."
   value       = var.dns_zone_name

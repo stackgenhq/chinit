@@ -146,16 +146,16 @@ docker compose up -d --wait
 docker compose exec writer-0 chinit fleet-status
 ```
 
-**Path B — Launch a cloud VM immediately.** A prebuilt, **public** golden AMI is published in `us-west-2`, so you can evaluate `chinit` on AWS without waiting for a Packer build:
+**Path B — Launch a cloud VM immediately.** Prebuilt, **public** golden AMIs are published in `us-west-2` (both Altinity Antalya 26.8 LTS with CAS `ami-04292dd0d9281579e` and upstream ClickHouse 26.8 LTS `ami-0075eb79e447956ca`), so you can evaluate `chinit` from any AWS account without waiting for a Packer build:
 
 ```bash
 aws ec2 run-instances --region us-west-2 \
-  --image-id ami-0eaa398497899f070 \
+  --image-id ami-04292dd0d9281579e \
   --instance-type c8g.large \
   --user-data file://wrapper.sh
 ```
 
-The image ships with Ubuntu 24.04 (`arm64`), ClickHouse `26.8.36.3`, `chinit`, `clickhouse-backup`, and observability agents pre-installed. See [Installation]({{ '/installation/' | relative_url }}) for multi-region copy instructions or building custom images in your own account.
+The images ship with Ubuntu 24.04 (`arm64`), ClickHouse 26.8 LTS (`26.8.34.20001.altinityantalya` or `26.8.36.3`), `chinit` `0.2.6`, `clickhouse-backup`, and observability agents pre-installed. See [Installation]({{ '/installation/' | relative_url }}) for multi-region copy instructions or building custom images in your own account.
 
 **Path C — Deploy a full cloud cluster.** The [Terraform modules]({{ '/terraform/' | relative_url }}) provision everything — lease table, Private DNS zone, secrets, SHA-256-verified config bundle, IAM/RBAC, and all four node roles — in one `apply`:
 

@@ -20,4 +20,4 @@ Both image definitions can be built locally with Packer or via GitHub Actions wo
 
 During the Packer build, the pinned `chinit` release binary is downloaded from GitHub Releases and verified against `chinit-SHA256SUMS` before being installed at `/usr/local/bin/chinit`.
 
-**Prebuilt public AMI**: A public AWS golden AMI is available in `us-west-2` (`ami-0eaa398497899f070`) — see [`aws/README.md`](./aws/README.md) for details.
+**Prebuilt public AMIs**: Public AWS golden AMIs are available in `us-west-2` for both upstream ClickHouse 26.8 LTS (`ami-0075eb79e447956ca`) and Altinity Antalya 26.8 LTS with CAS (`ami-04292dd0d9281579e`) — see [`aws/README.md`](./aws/README.md) for details.

@@ -64,12 +64,12 @@ variable "chinit_version" {
   description = "chinit release version to pre-install (from stackgenhq/chinit releases)"
   # Version history lives in CHANGELOG.md next to this template.
   # Keep `default = "<semver>"` on a single line for the release workflow.
-  default = "0.2.3"
+  default = "0.2.6"
 }
 
 variable "clickhouse_version" {
   type        = string
-  description = "ClickHouse version to pre-install (full version string). Must exist in the repo selected by build_flavor — Altinity Antalya ships its own version line (e.g. 26.6.8.20004.altinityantalya), upstream ships e.g. 26.8.36.3."
+  description = "ClickHouse version to pre-install (full version string). Must exist in the repo selected by build_flavor (or antalya_ci_sha on altinity-build-artifacts) — Altinity Antalya ships its own version line (e.g. 26.8.34.20001.altinityantalya or 26.6.8.20004.altinityantalya), upstream ships e.g. 26.8.36.3."
   # 26.8 S3Queue legacy-prefix caveat (fleet finding, 2026-11-15): a
   # format setting declared with the legacy `s3queue_` prefix in the
   # SETTINGS clause (e.g. s3queue_input_format_csv_skip_first_lines)
@@ -77,18 +77,30 @@ variable "clickhouse_version" {
   # silently parses with defaults (ClickHouse/ClickHouse#125459). All
   # fleet DDL must use canonical spellings (input_format_*). Upstream
   # fix ClickHouse/ClickHouse#131835 (draft) — re-check when it lands.
-  default     = "26.8.36.3"
+  default = "26.8.36.3"
 }
 
 variable "build_flavor" {
   type        = string
-  description = "Which ClickHouse apt repo to install from: 'upstream' (packages.clickhouse.com, ClickHouse Inc.) or 'antalya' (builds.altinity.cloud, Altinity Antalya — Apache-2.0, adds the ContentAddressed (metadata_type=cas) disk used by the CAS cold tier)."
+  description = "Which ClickHouse build to install: 'upstream' (packages.clickhouse.com, ClickHouse Inc.) or 'antalya' (builds.altinity.cloud + altinity-build-artifacts fallback, Altinity Antalya — Apache-2.0, adds the ContentAddressed (metadata_type=cas) disk used by the CAS cold tier)."
   default     = "upstream"
 
   validation {
     condition     = contains(["upstream", "antalya"], var.build_flavor)
     error_message = "Build flavor must be either 'upstream' or 'antalya'."
   }
+}
+
+variable "antalya_ci_ref" {
+  type        = string
+  description = "Altinity/ClickHouse git ref path in s3://altinity-build-artifacts/REFs/<ref>/<sha>/ used when clickhouse_version is not yet promoted to builds.altinity.cloud/antalya-apt-repo (e.g. antalya-26.8 branch builds)."
+  default     = "antalya-26.8"
+}
+
+variable "antalya_ci_sha" {
+  type        = string
+  description = "Altinity/ClickHouse commit SHA in s3://altinity-build-artifacts/REFs/<antalya_ci_ref>/<sha>/ providing signed build_arm_release .deb packages when clickhouse_version is not yet in builds.altinity.cloud/antalya-apt-repo."
+  default     = "52d93c0c359961d2a540fda0bcb5bd3d56f69266"
 }
 
 variable "clickhouse_backup_version" {
@@ -127,13 +139,13 @@ variable "ami_tags" {
 
 variable "public_ami" {
   type        = bool
-  description = "Build the public shareable flavor: unencrypted root snapshot + public launch permission (AWS refuses public encrypted AMIs). The default build stays encrypted."
-  default     = false
+  description = "Build a public, cross-account consumable AMI: unencrypted root snapshot + public launch permission (ami_groups=[\"all\"]) + public snapshot copy permission (snapshot_groups=[\"all\"]) so any AWS account can launch or copy-image it directly. Set to false for private encrypted builds."
+  default     = true
 }
 
 variable "ami_author" {
   type        = string
-  description = "Author stamped as a tag on the AMI (visible to anyone who can see the image)."
+  description = "Author stamped as a tag on the AMI."
   default     = "stackgen.com"
 }
 
@@ -146,8 +158,8 @@ variable "chinit_download_token" {
 
 variable "ami_description" {
   type        = string
-  description = "Description shown in DescribeImages and the console launch dialog for the public AMI."
-  default     = "ClickHouse golden image (Ubuntu 24.04 arm64) with chinit - https://github.com/stackgenhq/chinit"
+  description = "Optional custom Description shown in DescribeImages and the console launch dialog (empty = auto-generated with ClickHouse version, build_flavor, and chinit_version so external AWS accounts can inspect metadata without owner-only tags)."
+  default     = ""
 }
 
 # ============================================================================
@@ -175,9 +187,9 @@ source "amazon-ebs" "clickhouse" {
   associate_public_ip_address = true
 
   launch_block_device_mappings {
-    device_name           = "/dev/sda1"
-    volume_size           = 30
-    volume_type           = "gp3"
+    device_name = "/dev/sda1"
+    volume_size = 30
+    volume_type = "gp3"
     # NOTE: a public (or cross-account) AMI cannot be EBS-encrypted —
     # AWS refuses encrypted public images. The public_ami flavor builds
     # an unencrypted snapshot; the default build stays encrypted.
@@ -185,36 +197,48 @@ source "amazon-ebs" "clickhouse" {
     delete_on_termination = true
   }
 
-  # ami_name carries the ClickHouse version + git sha so Terraform can pin
-  # `golden_ami_id` exactly, and the cleanup step can recognize generations.
-  ami_name      = "clickhouse-golden-${var.clickhouse_version}-{{timestamp}}"
-  ami_regions   = [var.region]
-  # Author/usage metadata for the public listing: every consumer can see
-  # these in DescribeImages / the console launch dialog.
-  ami_description = var.ami_description
+  # ami_name carries the ClickHouse version + timestamp so Terraform and
+  # external AWS accounts can pin or filter `golden_ami_id` by name/flavor.
+  ami_name    = "clickhouse-golden-${var.clickhouse_version}-{{timestamp}}"
+  ami_regions = [var.region]
+  # Cross-account metadata: AWS hides resource tags from other AWS accounts
+  # on public AMIs, so Description carries the flavor, ClickHouse version,
+  # and chinit version visible in DescribeImages across all accounts.
+  ami_description = var.ami_description != "" ? var.ami_description : "ClickHouse ${var.clickhouse_version} (${var.build_flavor}) golden image (Ubuntu 24.04 arm64, chinit v${var.chinit_version}) - https://github.com/stackgenhq/chinit"
 
-  # The public flavor carries its own Purpose tag so the private
-  # generation-prune step never sweeps published images (one published
-  # generation, retired by its own workflow job). Flavor stamps upstream
-  # vs antalya so parallel matrix builds prune only their own flavor track.
+  # Keep Purpose=clickhouse-golden-ami across all builds so owner-account
+  # Terraform data sources, CI IAM tag conditions, and per-flavor generation
+  # pruning work uniformly.
   snapshot_tags = merge(
-    var.public_ami ? merge(var.ami_tags, { Purpose = "clickhouse-golden-ami-public" }) : var.ami_tags,
-    { Flavor = var.build_flavor }
+    var.ami_tags,
+    {
+      Author            = var.ami_author
+      Flavor            = var.build_flavor
+      ClickHouseVersion = var.clickhouse_version
+      ChinitVersion     = var.chinit_version
+      Public            = var.public_ami ? "true" : "false"
+    }
   )
   tags = merge(
-    var.public_ami ? merge(var.ami_tags, { Purpose = "clickhouse-golden-ami-public" }) : var.ami_tags,
+    var.ami_tags,
     {
-      Author = var.ami_author
-      Flavor = var.build_flavor
+      Author            = var.ami_author
+      Flavor            = var.build_flavor
+      ClickHouseVersion = var.clickhouse_version
+      ChinitVersion     = var.chinit_version
+      Public            = var.public_ami ? "true" : "false"
     }
   )
 
-  # Public launch permission when building the share flavor:
-  # ami_groups=["all"] makes the image launchable by any AWS account.
-  # An encrypted AMI cannot be public — the public_ami variable gates
-  # both the encryption flag and this group.
-  ami_users   = []
-  ami_groups  = var.public_ami ? ["all"] : []
+  # Public launch + snapshot copy permissions by default (var.public_ami = true):
+  # - ami_groups=["all"] grants launchPermission to all AWS accounts (RunInstances).
+  # - snapshot_groups=["all"] grants createVolumePermission on the backing root
+  #   snapshot so other AWS accounts can also `aws ec2 copy-image` into their own
+  #   account or region with their own KMS encryption key.
+  ami_users       = []
+  ami_groups      = var.public_ami ? ["all"] : []
+  snapshot_users  = []
+  snapshot_groups = var.public_ami ? ["all"] : []
 
   # run_tags / run_volume_tags: applied via TagSpecification AT LAUNCH so
   # the CI role's IAM conditions (aws:RequestTag/aws:ResourceTag
@@ -223,11 +247,11 @@ source "amazon-ebs" "clickhouse" {
   run_tags = merge({
     Name    = "clickhouse-golden-builder"
     Purpose = "packer"
-    }, var.build_id != "" ? { BuildId = var.build_id } : {})
+  }, var.build_id != "" ? { BuildId = var.build_id } : {})
   run_volume_tags = merge({
     Name    = "clickhouse-golden-builder"
     Purpose = "packer"
-    }, var.build_id != "" ? { BuildId = var.build_id } : {})
+  }, var.build_id != "" ? { BuildId = var.build_id } : {})
 }
 
 # ============================================================================
@@ -267,7 +291,27 @@ build {
       var.build_flavor == "antalya" ? "sudo curl -fsSL 'https://builds.altinity.cloud/antalya-apt-repo/pubkey.gpg' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg" : "sudo curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg",
       var.build_flavor == "antalya" ? "echo 'deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=arm64] https://builds.altinity.cloud/antalya-apt-repo stable main' | sudo tee /etc/apt/sources.list.d/clickhouse.list" : "echo 'deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=arm64] https://packages.clickhouse.com/deb stable main' | sudo tee /etc/apt/sources.list.d/clickhouse.list",
       "sudo apt-get update -qq",
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clickhouse-server=${var.clickhouse_version} clickhouse-client=${var.clickhouse_version} clickhouse-common-static=${var.clickhouse_version}",
+      # Install from the configured apt repo when clickhouse_version is present in its index;
+      # otherwise (for antalya-26.8 builds published to Altinity's CI S3 bucket before apt promotion),
+      # fetch the signed arm64 .deb packages from altinity-build-artifacts and verify their SHA-512.
+      "if apt-cache madison clickhouse-server | grep -qF '${var.clickhouse_version}'; then",
+      "  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clickhouse-server=${var.clickhouse_version} clickhouse-client=${var.clickhouse_version} clickhouse-common-static=${var.clickhouse_version}",
+      "elif [ '${var.build_flavor}' = 'antalya' ] && [ -n '${var.antalya_ci_sha}' ]; then",
+      "  BASE=\"https://altinity-build-artifacts.s3.amazonaws.com/REFs/${var.antalya_ci_ref}/${var.antalya_ci_sha}\"",
+      "  for pkg in clickhouse-common-static clickhouse-server clickhouse-client; do",
+      "    DEB=\"$pkg\"_\"${var.clickhouse_version}\"_arm64.deb",
+      "    echo \"Downloading Antalya CI package $DEB from $BASE\"",
+      "    sudo curl -fsSL --retry 3 --retry-delay 5 \"$BASE/build_arm_release/$DEB\" -o \"/tmp/$DEB\"",
+      "    EXPECTED=$(curl -fsSL --retry 3 --retry-delay 5 \"$BASE/sign_release_arm_release/$DEB.sha512.gpg\" | grep -aoE '[0-9a-f]{128}' | head -1)",
+      "    [ -n \"$EXPECTED\" ] || { echo \"Failed to extract SHA-512 digest for $DEB\"; exit 1; }",
+      "    echo \"$EXPECTED  /tmp/$DEB\" | sha512sum -c -",
+      "  done",
+      "  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /tmp/clickhouse-common-static_${var.clickhouse_version}_arm64.deb /tmp/clickhouse-server_${var.clickhouse_version}_arm64.deb /tmp/clickhouse-client_${var.clickhouse_version}_arm64.deb",
+      "  sudo rm -f /tmp/clickhouse-*_${var.clickhouse_version}_arm64.deb",
+      "else",
+      "  echo 'ClickHouse version ${var.clickhouse_version} not found in apt repository and no antalya_ci_sha fallback matched'",
+      "  exit 1",
+      "fi",
       # ------------------------------------------------------------------
       # clickhouse-backup
       # ------------------------------------------------------------------

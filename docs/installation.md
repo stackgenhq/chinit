@@ -70,21 +70,19 @@ The [`images/`](https://github.com/stackgenhq/chinit/tree/main/images) directory
 | **AWS** (`images/aws`) | Golden AMI (`arm64`) | Ubuntu 24.04 LTS, ClickHouse, `clickhouse-backup`, AWS CLI v2, CloudWatch & OTel Collector agents, `chinit` |
 | **Azure** (`images/azure`) | Azure Compute Gallery Image | Ubuntu 24.04 LTS, ClickHouse, `clickhouse-backup`, Azure CLI, OTel Collector agent, `chinit` |
 
-### Start Immediately with the Public AWS Golden AMI
+### Start Immediately with the Public AWS Golden AMIs
 
-To evaluate `chinit` without running Packer first, launch our prebuilt public AMI in `us-west-2`:
+To evaluate `chinit` without running Packer first, launch one of our prebuilt public AMIs in `us-west-2`:
 
-| Attribute | Value |
-|---|---|
-| **AMI ID** | `ami-0eaa398497899f070` |
-| **Region** | `us-west-2` |
-| **Architecture & OS** | Ubuntu 24.04 LTS (`arm64` — AWS Graviton `c8g` / `m8g` / `r8g`) |
-| **Pre-Installed Stack** | ClickHouse `26.8.36.3`, `chinit`, `clickhouse-backup` `2.5.0`, AWS CLI v2, CloudWatch agent |
+| Flavor | AMI ID (`us-west-2`) | Pre-Installed Stack |
+|---|---|---|
+| **Upstream ClickHouse 26.8 LTS** | `ami-0075eb79e447956ca` | Ubuntu 24.04 LTS (`arm64`), ClickHouse `26.8.36.3`, `chinit` `0.2.6`, `clickhouse-backup` `2.5.0`, AWS CLI v2, CloudWatch & OTel Collector agents |
+| **Altinity Antalya 26.8 LTS (CAS)** | `ami-04292dd0d9281579e` | Ubuntu 24.04 LTS (`arm64`), Altinity Antalya ClickHouse `26.8.34.20001.altinityantalya`, `chinit` `0.2.6`, `clickhouse-backup` `2.5.0`, AWS CLI v2, CloudWatch & OTel Collector agents |
 
 ```bash
 aws ec2 run-instances \
   --region us-west-2 \
-  --image-id ami-0eaa398497899f070 \
+  --image-id ami-04292dd0d9281579e \
   --instance-type c8g.large \
   --user-data file://wrapper.sh
 ```
@@ -94,10 +92,10 @@ Running in another AWS region? Copy the AMI into your own account (which also en
 ```bash
 aws ec2 copy-image \
   --source-region us-west-2 \
-  --source-image-id ami-0eaa398497899f070 \
+  --source-image-id ami-04292dd0d9281579e \
   --region <your-region> \
   --encrypted \
-  --name clickhouse-golden-26.8.36.3
+  --name clickhouse-golden-26.8.34.20001.altinityantalya
 ```
 
 <div class="callout callout-warn">

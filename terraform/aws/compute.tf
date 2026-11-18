@@ -18,11 +18,52 @@
 # ----------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------
+# Public Golden AMI auto-discovery (cross-account safe)
+# ----------------------------------------------------------------------------
+# AWS hides resource tags on public AMIs from other accounts, so cross-account
+# discovery filters on public visibility, architecture, name, and description
+# (which embeds `(antalya)` or `(upstream)` plus the stackgenhq/chinit URL).
+data "aws_ami" "public_golden" {
+  count            = var.golden_ami_id == null ? 1 : 0
+  most_recent      = true
+  executable_users = ["all"]
+
+  filter {
+    name   = "name"
+    values = [var.cas_enabled ? "clickhouse-golden-*altinityantalya-*" : "clickhouse-golden-*"]
+  }
+
+  filter {
+    name   = "description"
+    values = [var.cas_enabled ? "*(antalya)*https://github.com/stackgenhq/chinit*" : "*(upstream)*https://github.com/stackgenhq/chinit*"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+
+  filter {
+    name   = "is-public"
+    values = ["true"]
+  }
+
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+}
+
+locals {
+  golden_ami_id = var.golden_ami_id != null ? var.golden_ami_id : data.aws_ami.public_golden[0].id
+}
+
+# ----------------------------------------------------------------------------
 # Writers ASG
 # ----------------------------------------------------------------------------
 resource "aws_launch_template" "writer" {
   name_prefix   = "${local.name_prefix}-writer-"
-  image_id      = var.golden_ami_id
+  image_id      = local.golden_ami_id
   instance_type = var.instance_type
   user_data     = base64encode(module.chinit.bootstrap_script["writer"])
 
@@ -38,6 +79,20 @@ resource "aws_launch_template" "writer" {
   }
 
   vpc_security_group_ids = [aws_security_group.nodes["writers"].id]
+
+  # Root volume: public AMIs have an unencrypted backing snapshot (AWS
+  # requirement for public sharing); setting encrypted = true here encrypts
+  # every launched instance's root EBS volume with the consumer account's
+  # default EBS KMS key.
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      encrypted             = true
+      volume_size           = var.root_disk_size_gb
+      volume_type           = "gp3"
+      delete_on_termination = true
+    }
+  }
 
   # delete_on_termination: writers are stateful-ish (hot parts), but the
   # durable tier is S3 + replication; a replaced writer re-syncs via
@@ -132,7 +187,7 @@ resource "aws_autoscaling_group" "writers" {
 # ----------------------------------------------------------------------------
 resource "aws_launch_template" "reader" {
   name_prefix   = "${local.name_prefix}-reader-"
-  image_id      = var.golden_ami_id
+  image_id      = local.golden_ami_id
   instance_type = var.instance_type
   user_data     = base64encode(module.chinit.bootstrap_script["reader"])
 
@@ -148,6 +203,16 @@ resource "aws_launch_template" "reader" {
   }
 
   vpc_security_group_ids = [aws_security_group.nodes["readers"].id]
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      encrypted             = true
+      volume_size           = var.root_disk_size_gb
+      volume_type           = "gp3"
+      delete_on_termination = true
+    }
+  }
 
   block_device_mappings {
     device_name = "/dev/sdb"
@@ -264,7 +329,7 @@ resource "aws_ebs_volume" "keeper_raft" {
 resource "aws_instance" "keeper" {
   count = var.keeper_count
 
-  ami           = var.golden_ami_id
+  ami           = local.golden_ami_id
   instance_type = var.keeper_instance_type
   subnet_id     = local.subnet_id
   private_ip    = local.keeper_ips[count.index]
@@ -336,7 +401,7 @@ resource "aws_volume_attachment" "keeper_raft" {
 resource "aws_instance" "backup" {
   count = var.enable_backup ? 1 : 0
 
-  ami           = var.golden_ami_id
+  ami           = local.golden_ami_id
   instance_type = var.instance_type
   subnet_id     = local.subnet_id
   private_ip    = local.backup_ip

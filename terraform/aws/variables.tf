@@ -168,12 +168,13 @@ variable "keeper_disk_size_gb" {
 # ----------------------------------------------------------------------------
 
 variable "golden_ami_id" {
-  description = "The chinit golden AMI id (see images/aws; e.g. `ami-0f8511dd30c68ca21` for the Altinity Antalya build). REQUIRED — the wrapper refuses to boot a node without the baked chinit binary."
+  description = "The chinit golden AMI id (see images/aws). Optional in us-west-2: when null, Terraform automatically resolves the latest public stackgenhq/chinit Golden AMI matching cas_enabled (antalya when cas_enabled = true, upstream when false)."
   type        = string
+  default     = null
 
   validation {
-    condition     = can(regex("^ami-[0-9a-f]{8,17}$", var.golden_ami_id))
-    error_message = "golden_ami_id must look like ami-xxxxxxxx (build it from images/aws with packer)."
+    condition     = var.golden_ami_id == null || can(regex("^ami-[0-9a-f]{8,17}$", var.golden_ami_id))
+    error_message = "golden_ami_id must be null (auto-resolve latest public golden AMI) or look like ami-xxxxxxxx."
   }
 }
 
@@ -226,7 +227,7 @@ variable "s3_data_prefix" {
 }
 
 variable "cas_enabled" {
-  description = "Enable the Altinity Antalya Content-Addressable Storage (CAS) shared S3 cold tier (`metadata_type = cas`, single copy across replicas). Requires an Antalya golden AMI (e.g. `ami-0f8511dd30c68ca21`)."
+  description = "Enable the Altinity Antalya Content-Addressable Storage (CAS) shared S3 cold tier (`metadata_type = cas`, single copy across replicas). Requires an Antalya golden AMI (e.g. `ami-04292dd0d9281579e`, or auto-resolved when `golden_ami_id = null` in `us-west-2`)."
   type        = bool
   default     = false
 }
