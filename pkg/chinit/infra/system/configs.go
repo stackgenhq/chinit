@@ -306,6 +306,27 @@ func defaultBackupOverlayXML() string {
 // background_pool_size so ClickHouse 26.x never refuses startup with
 // Code 36 when background_pool_size < 20 (the upstream default of
 // number_of_free_entries_in_pool_to_execute_mutation).
+func backgroundPoolSizing(vcpus int, memBytes uint64) (bgPool, concurrencyRatio, freeEntries int) {
+	bgPool = clampInt(vcpus*2, 4, 32)
+	concurrencyRatio = 4
+	if vcpus <= 2 {
+		concurrencyRatio = 2
+	}
+	// Memory-aware guard (the 2026-11-18 c8g.xlarge 8 GiB Code 241 OOM):
+	// wide Map(String, String) MergeTree merges can consume ~1.5-2 GiB per
+	// concurrent slot, so cap pool concurrency when total RAM is constrained.
+	switch {
+	case memBytes < 12<<30:
+		bgPool = clampInt(bgPool, 2, 4)
+		concurrencyRatio = 1
+	case memBytes < 24<<30:
+		bgPool = clampInt(bgPool, 4, 6)
+		concurrencyRatio = min(concurrencyRatio, 2)
+	}
+	freeEntries = clampInt(bgPool/2, 1, 20)
+	return bgPool, concurrencyRatio, freeEntries
+}
+
 func HardwareSizingOverlayXML(vcpus int, memBytes uint64, cacheDisks ...CacheDiskSizing) string {
 	if vcpus < 1 {
 		vcpus = 2
@@ -313,16 +334,15 @@ func HardwareSizingOverlayXML(vcpus int, memBytes uint64, cacheDisks ...CacheDis
 	if memBytes == 0 {
 		memBytes = 8 << 30
 	}
-	bgPool := clampInt(vcpus*2, 4, 32)
-	concurrencyRatio := 4
-	if vcpus <= 2 || memBytes <= 12<<30 {
-		concurrencyRatio = 2
-	}
+	bgPool, concurrencyRatio, freeEntries := backgroundPoolSizing(vcpus, memBytes)
 	movePool := clampInt(vcpus, 2, 8)
 	schedulePool := clampInt(vcpus*2, 8, 16)
-	freeEntries := clampInt(bgPool/2, 1, 20)
 
-	markCache := clampUint64(memBytes*15/100, 512<<20, 8<<30)
+	markPct := uint64(15)
+	if memBytes < 12<<30 {
+		markPct = 10
+	}
+	markCache := clampUint64(memBytes*markPct/100, 512<<20, 8<<30)
 	uncompressedCache := clampUint64(memBytes*5/100, 256<<20, 2<<30)
 
 	storageBlock := CacheDiskSizings(cacheDisks).renderCacheStorageOverlay()
