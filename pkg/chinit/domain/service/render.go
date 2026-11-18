@@ -533,8 +533,7 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 	// S3 disk health probe (a failed disk health check at boot marks
 	// the S3 disk broken and excludes it — surfacing it in the boot log
 	// is the diagnostic the bash script printed).
-	out, _ := runCommand(ctx, "clickhouse-client", "--query",
-		"SELECT name, is_broken FROM system.disks WHERE name = 's3'")
+	out, _ := execAdminQuery(ctx, "SELECT name, is_broken FROM system.disks WHERE name = 's3'")
 	if strings.Contains(out, "\t1") {
 		logger.GetLogger(ctx).Warn("WARNING: S3 disk is marked broken — check the instance role's s3:GetObject/PutObject on the data bucket")
 	}
@@ -1130,20 +1129,33 @@ func (t taggedStatement) appliesToRole(role string) bool {
 	return t.roles[strings.ToLower(strings.TrimSpace(role))]
 }
 
-// execClient runs one SQL statement as admin over the local client (the
-// same credential shape the drain/disk-autoscale probes use — env, never
-// argv).
+// execClient runs one SQL statement as admin over the local client.
+// Credentials travel via CLICKHOUSE_USER/CLICKHOUSE_PASSWORD in the child
+// environment rather than process argv so they are not exposed in /proc.
 func execClient(ctx context.Context, adminPw, query string) (string, error) {
 	if execClientFn != nil {
 		return execClientFn(ctx, adminPw, query)
 	}
-	cmd := exec.CommandContext(ctx, "clickhouse-client", "--user", "admin", "--password", adminPw, "--query", query)
-	cmd.Env = append(os.Environ(), "CLICKHOUSE_USER=admin", "CLICKHOUSE_PASSWORD="+adminPw)
+	cmd := exec.CommandContext(ctx, "clickhouse-client", "--query", query)
+	if adminPw != "" {
+		cmd.Env = append(os.Environ(), "CLICKHOUSE_USER=admin", "CLICKHOUSE_PASSWORD="+adminPw)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("clickhouse-client: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
+}
+
+// execAdminQuery reads the admin password file when present and runs query
+// via execClient. Falls back to an unauthenticated local call when the
+// password file does not exist (passwordless setups).
+func execAdminQuery(ctx context.Context, query string) (string, error) {
+	var adminPw string
+	if pw, err := os.ReadFile(bootstrapAdminPasswordPath()); err == nil {
+		adminPw = strings.TrimSpace(string(pw))
+	}
+	return execClient(ctx, adminPw, query)
 }
 
 // execClientFn is the exec seam (tests substitute; production runs the
@@ -1320,27 +1332,41 @@ func (b *Boot) gateSchemaSync(ctx context.Context) error {
 	})
 }
 
+var serverPrometheusPath = func() string { return filepath.Join(ConfigDir, "server-prometheus.xml") }
+
 // prometheusReload reloads the config so the metrics endpoint comes up
 // without a restart, and verifies the endpoint answers.
+//
+// Reload must authenticate as admin: on clusters where the default user is
+// password-protected or restricted to a readonly profile, an unauthenticated
+// clickhouse-client call always fails with AUTHENTICATION_FAILED and falls
+// back to `systemctl restart clickhouse-server`, which can stall shutdown
+// under active replication or merges.
 func (b *Boot) prometheusReload(ctx context.Context) error {
 	if b.Spec.Role == model.RoleKeeper {
 		return nil
 	}
-	if _, err := os.Stat(ConfigDir + "/server-prometheus.xml"); err != nil {
+	if _, err := os.Stat(serverPrometheusPath()); err != nil {
 		return fmt.Errorf("server-prometheus.xml not found — config should have been rendered by chctl (spec files)")
 	}
-	if _, err := runCommand(ctx, "clickhouse-client", "--query", "SYSTEM RELOAD CONFIG"); err != nil {
-		// The reload is a convenience; a restart covers it.
+	if _, err := execAdminQuery(ctx, "SYSTEM RELOAD CONFIG"); err != nil {
+		// The reload is a convenience; a restart covers it when reload fails.
 		_, _ = runCommand(ctx, "systemctl", "restart", "clickhouse-server")
 	}
 	return waitForHTTP(ctx, "http://localhost:9363/metrics", 10, 2)
 }
 
+// runCommandFn is the test seam for runCommand.
+var runCommandFn func(ctx context.Context, name string, args ...string) (string, error)
+
 // runCommand is the local exec helper for service management (the
 // injectable Runner lives in the system package for host ops; these
 // step-level calls go through the same recording-friendly surface in
-// tests via the Boot's runner injection point).
+// tests via runCommandFn).
 func runCommand(ctx context.Context, name string, args ...string) (string, error) {
+	if runCommandFn != nil {
+		return runCommandFn(ctx, name, args...)
+	}
 	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
