@@ -370,6 +370,15 @@ ALTER TABLE default.events MODIFY SETTING max_replicated_merges_in_queue = 3000,
 		Expect(queries).NotTo(ContainElement(ContainSubstring("SYSTEM DROP REPLICA")))
 	})
 
+	It("refuses to emit SYSTEM DROP REPLICA '' when replica name is empty", func() {
+		result := &DDLApplyResult{}
+		ok := applyConflictRetry(context.Background(), "pw",
+			"CREATE TABLE IF NOT EXISTS events (id String) ENGINE = ReplicatedMergeTree('/clickhouse/tables/01/events', '{replica}')",
+			"", result)
+		Expect(ok).To(BeFalse())
+		Expect(queries).NotTo(ContainElement(ContainSubstring("SYSTEM DROP REPLICA ''")))
+	})
+
 	It("skips role-scoped ALTERs on excluded roles", func() {
 		Expect(os.WriteFile(filepath.Join(dir, "bootstrap-ddl.sql"), []byte(
 			`-- chinit:roles=writer,reader

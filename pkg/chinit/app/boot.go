@@ -135,6 +135,9 @@ func runBoot(args []string) error {
 	// the state file (never re-claimed) — see Boot.Refresh.
 	engine = engine.WithIdentity(nil, detected.Provider, specHash).WithRefresh(flags.refresh)
 	boot.PersistIdentity = engine.IdentityPersister(detected.Provider)
+	if !flags.refresh {
+		boot.HydrateIdentityFromState(flags.statePath)
+	}
 	res := engine.Run(ctx, steps)
 
 	service.FormatTimingSummary(os.Stdout, res)

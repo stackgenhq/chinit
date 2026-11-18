@@ -631,6 +631,11 @@ var (
 // S3Queue + MV are writer/reader-only: the backup's IAM role cannot
 // list staging).
 func ApplyBootstrapDDL(ctx context.Context, hostname, role string) (*DDLApplyResult, error) {
+	if hostname == "" {
+		if h, err := os.Hostname(); err == nil {
+			hostname = h
+		}
+	}
 	ddlPath := bootstrapDDLPath()
 	data, err := os.ReadFile(ddlPath)
 	if err != nil {
@@ -1058,7 +1063,7 @@ func convergeTableStoragePolicy(ctx context.Context, adminPw, stmt string) {
 // failure accounting applies).
 func applyConflictRetry(ctx context.Context, adminPw, stmt, hostname string, result *DDLApplyResult) bool {
 	tablePath, replicaName := ddlReplicaIdentity(stmt, hostname)
-	if tablePath == "" {
+	if tablePath == "" || replicaName == "" {
 		return false
 	}
 	dropSQL := fmt.Sprintf("SYSTEM DROP REPLICA '%s' FROM ZKPATH '%s'", replicaName, tablePath)

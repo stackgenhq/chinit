@@ -455,6 +455,35 @@ func (b *Boot) restoreIdentity(ctx context.Context) error {
 	return nil
 }
 
+// HydrateIdentityFromState populates b.Identity from the persisted boot
+// state file when present for this instance. Called before the resume
+// engine runs so that if settle_identity is skipped ("already done") on a
+// restarted boot, downstream steps (configure_keeper, bootstrap_schema,
+// configure_server_env) still receive the settled hostname and CR slot.
+func (b *Boot) HydrateIdentityFromState(statePath string) {
+	if b.Identity.Hostname != "" {
+		return
+	}
+	if statePath == "" {
+		statePath = ChinitStatePath
+	}
+	if stored, err := loadBootIdentity(statePath); err == nil && stored.Hostname != "" && stored.InstanceID == b.Meta.InstanceID {
+		b.Identity = model.NodeIdentity{
+			Role:        model.Role(stored.Role),
+			Hostname:    stored.Hostname,
+			InstanceID:  b.Meta.InstanceID,
+			PrivateIP:   b.Meta.PrivateIP,
+			Region:      b.Meta.Region,
+			ClusterName: b.Spec.ClusterName,
+			DNSZone:     b.Spec.DNSZoneName,
+			CRName:      stored.CRName,
+			CROrdinal:   stored.CROrdinal,
+			ZoneID:      stored.ZoneID,
+			LeaseTable:  stored.LeaseTable,
+		}
+	}
+}
+
 // settleIdentity derives or claims the node identity and registers DNS.
 // Static nodes (keepers/backup — and writers while the static path still
 // exists) map the IP octet; lease nodes (BOTH ASG roles — readers and,
@@ -481,40 +510,7 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 		return b.restoreIdentity(ctx)
 	}
 
-	// RESUME HYDRATION (the 2026-11-17 keeper-ensemble boot failure):
-	// when settle_identity is SKIPPED by the resume engine (recorded
-	// done from a prior run), this process's Boot.Identity is empty —
-	// later steps that read it (configure_keeper's keeper_nodes
-	// lookup; renders that use {replica}) run with "" and fail with
-	// misleading "keeper  not in spec" errors on every retry. The
-	// persisted identity is the authority: hydrate it into the Boot
-	// BEFORE the skip applies. Static roles (keepers/backup) take the
-	// snapshot's hostname verbatim — their identity derives from the
-	// static IP offset, which cannot change under a running instance;
-	// lease roles fall through to the real claim path (a skipped
-	// settle_identity for a lease role re-claims below, and the
-	// hydrate is harmlessly overwritten by the claim result).
-	if b.Identity.Hostname == "" {
-		statePath := ChinitStatePath
-		if b.StatePath != "" {
-			statePath = b.StatePath
-		}
-		if stored, err := loadBootIdentity(statePath); err == nil && stored.Hostname != "" && stored.InstanceID == b.Meta.InstanceID {
-			b.Identity = model.NodeIdentity{
-				Role:        model.Role(stored.Role),
-				Hostname:    stored.Hostname,
-				InstanceID:  b.Meta.InstanceID,
-				PrivateIP:   b.Meta.PrivateIP,
-				Region:      b.Meta.Region,
-				ClusterName: b.Spec.ClusterName,
-				DNSZone:     b.Spec.DNSZoneName,
-				CRName:      stored.CRName,
-				CROrdinal:   stored.CROrdinal,
-				ZoneID:      stored.ZoneID,
-				LeaseTable:  stored.LeaseTable,
-			}
-		}
-	}
+	b.HydrateIdentityFromState(b.StatePath)
 
 	id := model.NodeIdentity{
 		Role:        b.Spec.Role,

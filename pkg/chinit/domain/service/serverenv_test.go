@@ -183,4 +183,19 @@ var _ = Describe("configureServerEnv cloud gate", func() {
 		Expect(content).To(ContainSubstring(
 			`CH_CAS_SERVER_ROOT_ID="` + deterministicServerUUID("ch-int-dev", "writer-0") + `"`))
 	})
+
+	It("hydrates Boot.Identity from state.json before resume skips settle_identity", func() {
+		dir := GinkgoT().TempDir()
+		stateFile := filepath.Join(dir, "state.json")
+		Expect(os.WriteFile(stateFile, []byte(`{"identity":{"role":"keeper","hostname":"keeper-0","instance_id":"i-k0","cr_name":"0-0","cr_ordinal":0}}`), 0644)).To(Succeed())
+
+		b := &Boot{
+			Spec: &model.BootSpec{ClusterName: "ch-int-dev", Role: model.RoleKeeper, DNSZoneName: "ch.internal"},
+			Meta: port.InstanceMetadata{InstanceID: "i-k0", PrivateIP: "10.0.1.20", Region: "us-west-2"},
+		}
+		b.HydrateIdentityFromState(stateFile)
+		Expect(b.Identity.Hostname).To(Equal("keeper-0"))
+		Expect(b.Identity.Role).To(Equal(model.RoleKeeper))
+		Expect(b.Identity.CRName).To(Equal("0-0"))
+	})
 })

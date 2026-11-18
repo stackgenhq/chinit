@@ -218,16 +218,45 @@ func (r *SchemaRunner) DropReplica(ctx context.Context, request domain.ReplicaDr
 	return nil
 }
 
-// SyncReplica re-queues replication on a restarted node
-// (HostSyncTables — SYSTEM SYNC REPLICA).
-//
-// Without it: a restarted node can lag behind with empty replication queues.
+// SyncReplica re-queues replication on a restarted or recovering node
+// using SYSTEM SYNC REPLICA ... LIGHTWEIGHT so replication logs are pulled
+// and data-visibility entries (GET_PART/ATTACH_PART/DROP_*) converge
+// without blocking 300s on background MERGE_PARTS under heavy ingest.
 func (r *SchemaRunner) SyncReplica(ctx context.Context, request domain.ReplicaSyncRequest) error {
 	host, err := r.host(request.HostName)
 	if err != nil {
 		return err
 	}
-	return r.schemer.HostSyncTables(ctx, host)
+	cluster := clickhouse.NewCluster()
+	cluster.ClusterConnectionParams = r.params
+	cluster.SetHosts([]string{host.Runtime.Address.FQDN})
+
+	qCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	res, err := cluster.QueryAny(qCtx, "SELECT database, table FROM system.replicas")
+	if err != nil {
+		return r.schemer.HostSyncTables(ctx, host)
+	}
+	if res == nil {
+		return nil
+	}
+	var dbs, tbls []string
+	scanErr := res.UnzipColumnsAsStrings(&dbs, &tbls)
+	res.Close()
+	if scanErr != nil {
+		return scanErr
+	}
+	if len(dbs) == 0 {
+		return nil
+	}
+
+	syncSQLs := make([]string, 0, len(dbs))
+	for i := range dbs {
+		syncSQLs = append(syncSQLs, fmt.Sprintf(`SYSTEM SYNC REPLICA "%s"."%s" LIGHTWEIGHT`, dbs[i], tbls[i]))
+	}
+	opts := clickhouse.NewQueryOptions().SetRetry(false).SetLogQueries(true)
+	return cluster.ExecAll(qCtx, syncSQLs, opts)
 }
 
 // FindStuckQueueTables returns every table whose replication queue holds

@@ -51,15 +51,19 @@ const limitsConfEntry = `
 # ClickHouse file descriptor limits
 clickhouse soft nofile 262144
 clickhouse hard nofile 262144
+clickhouse soft nproc 65536
+clickhouse hard nproc 65536
 root soft nofile 262144
 root hard nofile 262144
 `
 
-// limitsDropin raises LimitNOFILE via systemd so clickhouse-server
+// limitsDropin raises LimitNOFILE and LimitNPROC via systemd so clickhouse-server
 // itself inherits the ceiling (ulimit alone does not cross the unit
-// boundary).
+// boundary; 8 GiB nodes otherwise log Context: Maximum number of threads is lower than 30000).
 const limitsDropin = `[Service]
 LimitNOFILE=262144
+LimitNPROC=65536
+TasksMax=infinity
 `
 
 // sysctlConf is the persisted fs.file-max raise.
