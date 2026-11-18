@@ -23,6 +23,12 @@ type SpecLoader interface {
 type LoadCHIRequest struct {
 	// Spec names the document and carries its bytes.
 	Spec domain.SpecReference
+	// Secrets, when non-nil, resolves valueFrom-style secret references
+	// the spec declares (security.clickhouse.tls.rootCASecretRef is the
+	// one the normalizer resolves at load time). nil keeps the
+	// historical behavior: specs carrying secret refs are rejected at
+	// load with RootCASecretUnresolved instead of resolved.
+	Secrets SecretSource
 }
 
 // LoadCHKRequest is the input to SpecLoader.LoadCHK.

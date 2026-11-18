@@ -125,6 +125,9 @@ func (b *Boot) renderRemoteServersContent(ctx context.Context) (string, error) {
 			Name: b.Spec.ClusterName,
 			Data: data,
 		},
+		// Secret refs resolve through the cloud secret store — the
+		// same wiring LoadCHI applies (providerSecrets' source).
+		Secrets: b.Provider,
 	})
 	if err != nil {
 		return "", fmt.Errorf("load chi.yaml: %w", err)

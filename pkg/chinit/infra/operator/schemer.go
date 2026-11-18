@@ -49,6 +49,53 @@ func NewSchemaClientFactory() *SchemaClientFactory {
 // HostSyncTables query timeout is 120s; creation is bounded the same way).
 const defaultSchemaTimeout = 120 * time.Second
 
+// defaultVersionProbeTimeout bounds the whole version-detection pass
+// (the operator's app-based version detection runs the same query
+// unbounded inside reconcile; chinit bounds it so an unreachable fleet
+// fails fast to MinVersion instead of stalling the factory call —
+// a large inventory of down hosts cannot stretch the probe).
+const defaultVersionProbeTimeout = 5 * time.Second
+
+// detectSoftwareVersion resolves the ClickHouse version the schemer's
+// version-gated SQL shapes should assume. Mirrors the operator's
+// app-based version detection (getHostSoftwareVersion →
+// HostClickHouseVersion → SELECT version()): one query against the
+// first inventory host that answers; a fleet that answers no probe
+// falls back to swversion.MinVersion(), the operator's own "unable to
+// acquire" answer.
+//
+// Why not hardcode: the schemer switches SQL shapes on the version
+// (sqlCreateDatabaseDistributed gates ">= 22.12" on
+// engine_full/engine); a stale hardcoded value takes the wrong branch
+// silently. Why MinVersion and not an error: the operator's own
+// behavior on an unresponsive host is exactly this fallback, and
+// schema ops are also run against a single live node whose peers may
+// be down (reader bootstrap) — the query then reaches the one host
+// that does answer, which is the version that matters.
+func detectSoftwareVersion(ctx context.Context, params *clickhouse.ClusterConnectionParams, hosts []domain.HostIdentity) *swversion.SoftWareVersion {
+	ctx, cancel := context.WithTimeout(ctx, defaultVersionProbeTimeout)
+	defer cancel()
+
+	for _, host := range hosts {
+		cluster := clickhouse.NewCluster()
+		cluster.ClusterConnectionParams = params
+		cluster.SetHosts([]string{host.Address})
+		result, err := cluster.QueryAny(ctx, "SELECT version()")
+		if err != nil || result == nil {
+			continue
+		}
+		version, err := result.String()
+		result.Close()
+		if err != nil {
+			continue
+		}
+		if v := swversion.NewSoftWareVersion(strings.TrimSpace(version)); v != nil {
+			return v
+		}
+	}
+	return swversion.MinVersion()
+}
+
 // NewClient builds a SchemaRunner bound to a cluster's inventory.
 //
 // Why the normalized CR: the operator's schemer names replicas by walking
@@ -106,7 +153,12 @@ func (f *SchemaClientFactory) NewClient(ctx context.Context, request port.NewSch
 	// Names promotes), so setting only the schemer's embedded field
 	// leaves the Cluster's default namer active — "no such host"
 	//
-	s := schemer.NewClusterSchemer(params, swversion.NewSoftWareVersion("24.3"))
+	// The version comes from the fleet itself (SELECT version() on the
+	// first inventory host that answers — the operator's app-based
+	// detection), never a hardcoded constant: version-gated SQL shapes
+	// (sqlCreateDatabaseDistributed's engine_full branch) must follow
+	// the ClickHouse actually running.
+	s := schemer.NewClusterSchemer(params, detectSoftwareVersion(ctx, params, request.Hosts))
 	namer := newCloudNamer(addresses)
 	s.INameManager = namer
 	s.Cluster.INameManager = namer
