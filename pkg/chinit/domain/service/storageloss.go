@@ -161,7 +161,7 @@ func (b *Boot) detectStorageLoss(ctx context.Context) error {
 		log.Warn("storage-loss: admin password unavailable (no verdict this boot)", "err", perr.Error())
 		return nil
 	}
-	out, err := execClient(ctx, strings.TrimSpace(string(pwBytes)), "SELECT name FROM system.replicas FORMAT TSV")
+	out, err := execClient(ctx, strings.TrimSpace(string(pwBytes)), "SELECT table FROM system.replicas FORMAT TSV")
 	if err != nil {
 		// A server that just started may not answer yet — the DDL pass
 		// and the health gate own the startup convergence. No verdict.

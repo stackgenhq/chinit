@@ -104,6 +104,15 @@ type BootSpec struct {
 	S3DataBucket string `yaml:"s3_data_bucket,omitempty" json:"s3_data_bucket,omitempty"`
 	Timezone     string `yaml:"timezone,omitempty"        json:"timezone,omitempty"`
 
+	// CasEnabled mirrors the Terraform cas_config.enabled opt-in. When
+	// true, the server EnvironmentFile pins CH_CAS_SERVER_ROOT_ID to the
+	// node's deterministic root id (storage.xml's from_env contract), so
+	// every ASG replacement of an ordinal claims the SAME CAS server-root
+	// anchor across fresh EBS. Unset/false keeps the /etc payload exactly
+	// as before 0.2.1 (no env contract), and CAS disks using from_env
+	// resolve per-incarnation roots (empty var → server uuid).
+	CasEnabled bool `yaml:"cas_enabled,omitempty" json:"cas_enabled,omitempty"`
+
 	// ClaimerTableName is the provider's ordinal-lease table (lease
 	// identity: DynamoDB on AWS, Table storage on Azure). The settle
 	// step claims reader-N/writer-N from it.

@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -826,7 +827,11 @@ func defaultProbeCacheDiskMaxBytes(ctx context.Context) uint64 {
 }
 
 // serverEnvContent builds the /etc/default/clickhouse-server payload
-// for the node (pure over the spec + probed cache size).
+// for the node (pure over the spec + probed cache size). With
+// spec.cas_enabled, the deterministic CAS root id rides along — the
+// storage.xml from_env contract pairs it with CH_S3_ENDPOINT, so the
+// emitted payload always satisfies every from_env reference the config
+// can render.
 func (b *Boot) serverEnvContent(ctx context.Context) (string, error) {
 	if b.Spec.S3DataBucket == "" && b.Provider.Name() == "aws" {
 		return "", Fatal(fmt.Errorf("spec s3_data_bucket is empty — storage.xml's endpoint env cannot be set (Code 36 at server start)"))
@@ -845,7 +850,106 @@ func (b *Boot) serverEnvContent(ctx context.Context) (string, error) {
 	if cacheMax := probeCacheDiskMaxBytes(ctx); cacheMax > 0 {
 		fmt.Fprintf(&sb, "CH_CACHE_MAX_SIZE_BYTES=\"%d\"\n", cacheMax)
 	}
+	if b.Spec.CasEnabled && b.Identity.Hostname != "" {
+		// The identity rides WITH the endpoint: storage.xml's
+		// cas_server_root_id from_env resolves the SAME deterministic
+		// server-root across fresh-EBS ASG replacement (never per-boot).
+		fmt.Fprintf(&sb, "CH_CAS_SERVER_ROOT_ID=\"%s\"\n", b.serverRootID())
+	}
 	return sb.String(), nil
+}
+
+// serverUUIDPath is the seam for tests verifying deterministic server UUID seeding.
+var serverUUIDPath = func() string { return "/var/lib/clickhouse/uuid" }
+
+// chStorePath is the state-fulness seam (test redirect; production binds
+// the MergeTree store path — its non-emptiness is the CAS anchor signal).
+var chStorePath = func() string { return "/var/lib/clickhouse/store" }
+
+// deterministicServerUUID derives a stable RFC-4122 UUID from
+// clusterName + "/" + hostname so that an ASG replacement node claiming the
+// same ordinal slot (and mounting the same CAS cas_server_root_id in S3)
+// presents the exact same server_uuid across ephemeral EBS volumes. Without
+// this, ClickHouse generates a random /var/lib/clickhouse/uuid on every fresh
+// EBS volume and Altinity Antalya CAS refuses to mount the slot with Code 246
+// ("CAS server-root is owned by a different server").
+func deterministicServerUUID(clusterName, hostname string) string {
+	sum := sha256.Sum256([]byte("chinit-server-uuid:" + clusterName + "/" + hostname))
+	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x50 // version 5
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// CAS root identifier. A server-root anchor exists only BEFORE ClickHouse
+// writes its first blob (fresh roots with no data mount cleanly — the
+// 2026-11-18 ch-int-dev roll proved both), so a machine with CH state
+// keeps its existing uuid line and the step only records the divergence.
+func (b *Boot) serverRootID() string {
+	cluster := b.Spec.ClusterName
+	if cluster == "" {
+		cluster = b.Meta.InstanceID
+	}
+	return deterministicServerUUID(cluster, b.Identity.Hostname)
+}
+
+// adoptServerUUID aligns /var/lib/clickhouse/uuid with the deterministic
+// root id, with adoption semantics that mirror CAS's own claim guard:
+// the uuid line is rewritten ONLY when the machine carries no ClickHouse
+// state (fresh EBS — the exact Code 246 window); a stateful node keeps
+// its existing lineage (its server-root anchor already records the old
+// uuid) and the divergence is journaled instead of silently breaking the
+// mounted identity.
+func (b *Boot) adoptServerUUID(ctx context.Context) {
+	if b.Spec == nil || b.Spec.Role == model.RoleKeeper || b.Identity.Hostname == "" {
+		return
+	}
+	uuidFile := serverUUIDPath()
+	current, readErr := os.ReadFile(uuidFile)
+	if readErr == nil {
+		want := b.serverRootID()
+		got := strings.TrimSpace(string(current))
+		if got == want {
+			return
+		}
+		// CAS adoption guard (ContentAddressedSettings.cpp): a server-root
+		// anchor exists once the pool holds the node's first blob. Over
+		// /var/lib/clickhouse state, the old uuid IS the live anchor match —
+		// replacing it would Code 246 the very next start.
+		if b.statefulNode() {
+			logger.GetLogger(ctx).Warn("server uuid diverges from the deterministic root id; keeping the existing lineage (CAS claims over data would Code 246)",
+				"file", uuidFile, "existing", got, "deterministic", want)
+			return
+		}
+	}
+	identical := readErr == nil && strings.TrimSpace(string(current)) == b.serverRootID()
+	if identical {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(uuidFile), 0750); err != nil {
+		logger.GetLogger(ctx).Warn("server uuid seeding skipped", "err", err.Error())
+		return
+	}
+	if writeErr := os.WriteFile(uuidFile, []byte(b.serverRootID()+"\n"), 0640); writeErr != nil {
+		logger.GetLogger(ctx).Warn("server uuid seeding skipped", "err", writeErr.Error())
+		return
+	}
+	logger.GetLogger(ctx).Info("seeded the deterministic CAS server uuid",
+		"file", uuidFile, "uuid", b.serverRootID())
+	_, _ = runCommand(ctx, "chown", "clickhouse:clickhouse", uuidFile)
+}
+
+// statefulNode reports whether the machine carries ClickHouse data state
+// (/var/lib/clickhouse/store, the MergeTree write path). The metadata disk
+// is the CAS claim surface — its presence, not the EBS volume itself,
+// decides whether a uuid rewrite would orphan a live server-root anchor.
+func (b *Boot) statefulNode() bool {
+	entries, err := os.ReadDir(chStorePath())
+	if err != nil {
+		return false
+	}
+	return len(entries) > 0
 }
 
 func (b *Boot) configureServerEnv(ctx context.Context) error {
@@ -853,6 +957,7 @@ func (b *Boot) configureServerEnv(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	b.adoptServerUUID(ctx)
 	// Nothing to pin (Azure with no timezone and no mounted cache disk):
 	// skip the file write AND the drop-in — an EnvironmentFile pointing
 	// at nothing is noise, and the step must not touch /etc on a node

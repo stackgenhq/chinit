@@ -511,6 +511,10 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 		}
 	}
 
+	// The golden AMI bakes the distro unit masked (the random-package-uuid
+	// boot race — see the packer template comment): enable silently
+	// no-ops on a masked unit, so unmask before the enable.
+	_, _ = runCommand(ctx, "systemctl", "unmask", "clickhouse-server")
 	if out, err := runCommand(ctx, "systemctl", "enable", "clickhouse-server"); err != nil {
 		return Fatal(fmt.Errorf("enable clickhouse-server: %w: %s", err, out))
 	}
@@ -687,6 +691,7 @@ func ApplyBootstrapDDL(ctx context.Context, hostname, role string) (*DDLApplyRes
 				continue
 			}
 		}
+		convergeTableStoragePolicy(ctx, adminPw, s)
 		out, err := execClient(ctx, adminPw, s)
 		if err == nil {
 			result.Created++
@@ -936,6 +941,101 @@ func extractS3QueueEndpoint(stmt string) (string, bool) {
 // recycled-ordinal generation), and CREATE refuses to attach over it.
 func isStaleReplicaConflict(out string, err error) bool {
 	return strings.Contains(out, "Code: 253") || strings.Contains(err.Error(), "Code: 253")
+}
+
+// reconcileStoragePolicyMetadata aligns on-disk table metadata (.sql files
+// under /var/lib/clickhouse/store and /var/lib/clickhouse/metadata) with
+// whether /etc/clickhouse-server/config.d/storage.xml enables CAS
+// (<metadata_type>cas</metadata_type>) before clickhouse-server starts or
+// restarts. This allows toggling cas_config.enabled in Terraform without
+// leaving persistent disks (e.g. backup-0 or in-place refreshes) pinned to
+// the previous storage_policy ('tiered' <-> 'tiered_cas').
+func reconcileStoragePolicyMetadata(ctx context.Context) {
+	storageXML, err := os.ReadFile(filepath.Join(ConfigDir, "storage.xml"))
+	if err != nil {
+		return
+	}
+	casActive := strings.Contains(string(storageXML), "<metadata_type>cas</metadata_type>")
+	fromPolicy, toPolicy := "storage_policy = 'tiered_cas'", "storage_policy = 'tiered'"
+	if casActive {
+		fromPolicy, toPolicy = "storage_policy = 'tiered'", "storage_policy = 'tiered_cas'"
+	}
+	patterns := []string{
+		"/var/lib/clickhouse/store/*/*/*.sql",
+		"/var/lib/clickhouse/metadata/*/*.sql",
+	}
+	for _, pat := range patterns {
+		matches, _ := filepath.Glob(pat)
+		for _, p := range matches {
+			info, statErr := os.Lstat(p)
+			if statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			raw, readErr := os.ReadFile(p)
+			if readErr != nil || !strings.Contains(string(raw), fromPolicy) {
+				continue
+			}
+			updated := strings.ReplaceAll(string(raw), fromPolicy, toPolicy)
+			if writeErr := os.WriteFile(p, []byte(updated), info.Mode().Perm()); writeErr == nil {
+				logger.GetLogger(ctx).Info("reconciled table metadata storage_policy on disk",
+					"path", p, "cas_active", casActive)
+			}
+		}
+	}
+}
+
+// convergeTableStoragePolicy detects when a CREATE TABLE statement in
+// bootstrap-ddl.sql declares a different storage_policy ('tiered' vs
+// 'tiered_cas') than an already-existing live table and converges the
+// local table's metadata file + attachment so CREATE TABLE IF NOT EXISTS
+// does not silently leave the table on the old storage policy.
+func convergeTableStoragePolicy(ctx context.Context, adminPw, stmt string) {
+	if !strings.Contains(stmt, "CREATE TABLE") || !strings.Contains(stmt, "storage_policy") {
+		return
+	}
+	declaredPolicy, ok := extractQuotedSetting(stmt, "storage_policy")
+	if !ok || declaredPolicy == "" {
+		return
+	}
+	_, table, _ := s3QueueDeclaredPath(stmt)
+	if table == "" {
+		return
+	}
+	out, err := execClient(ctx, adminPw,
+		fmt.Sprintf("SELECT storage_policy, metadata_path FROM system.tables WHERE database = 'default' AND name = '%s'", table))
+	if err != nil || strings.TrimSpace(out) == "" {
+		return
+	}
+	parts := strings.SplitN(strings.TrimSpace(out), "\t", 2)
+	livePolicy := strings.TrimSpace(parts[0])
+	if livePolicy == "" || livePolicy == declaredPolicy {
+		return
+	}
+	var metaPath string
+	if len(parts) > 1 {
+		metaPath = strings.TrimSpace(parts[1])
+	}
+	if metaPath == "" {
+		return
+	}
+	raw, readErr := os.ReadFile(metaPath)
+	if readErr != nil {
+		return
+	}
+	oldToken := fmt.Sprintf("storage_policy = '%s'", livePolicy)
+	newToken := fmt.Sprintf("storage_policy = '%s'", declaredPolicy)
+	if !strings.Contains(string(raw), oldToken) {
+		return
+	}
+	logger.GetLogger(ctx).Info("schema bootstrap: converging live table storage_policy",
+		"table", table, "from", livePolicy, "to", declaredPolicy)
+	if _, err := execClient(ctx, adminPw, fmt.Sprintf("DETACH TABLE default.%s", table)); err != nil {
+		return
+	}
+	updated := strings.ReplaceAll(string(raw), oldToken, newToken)
+	_ = os.WriteFile(metaPath, []byte(updated), 0640)
+	_, _ = execClient(ctx, adminPw, fmt.Sprintf("ATTACH TABLE default.%s", table))
+	_, _ = execClient(ctx, adminPw, fmt.Sprintf("SYSTEM RESTART REPLICA default.%s", table))
 }
 
 // applyConflictRetry runs the stale-znode drop-then-retry for one

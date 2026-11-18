@@ -55,11 +55,12 @@ spec:
       ingest/insert_quorum_timeout: "180000"
       ingest/select_sequential_consistency: "1"
     settings:
-      # The secure INTERSERVER port (ssl.xml serves it on 9010): with
-      # secure: yes this setting renders <port> into remote_servers —
-      # without it the CR renders the client TLS port (9440) and
-      # distributed traffic dies with "No route to host".
-      tcp_port_secure: "9010"
+      # Native TCP TLS port (ssl.xml serves tcp_port_secure on 9440 and
+      # interserver_https_port on 9010): with secure: yes this setting
+      # renders <port>9440</port> into remote_servers so distributed
+      # queries speak Native TCP TLS on 9440 instead of hitting the
+      # HTTPS part-exchange listener on 9010 (Code 102).
+      tcp_port_secure: "9440"
       max_concurrent_queries: "150"
       max_server_memory_usage_to_ram_ratio: "0.9"
       timezone: "UTC"

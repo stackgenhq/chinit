@@ -325,9 +325,19 @@ build {
       "printf '#!/bin/bash\\necho never > /sys/kernel/mm/transparent_hugepage/enabled\\necho never > /sys/kernel/mm/transparent_hugepage/defrag\\nexit 0\\n' | sudo tee /etc/rc.local",
       "sudo chmod +x /etc/rc.local",
       "echo 'fs.file-max = 2097152' | sudo tee /etc/sysctl.d/99-clickhouse.conf",
-      "printf '\\nclickhouse soft nofile 262144\\nclickhouse hard nofile 262144\\nroot soft nofile 262144\\nroot hard nofile 262144\\n' | sudo tee -a /etc/security/limits.conf",
++      # chinit owns the clickhouse-server lifecycle end to end: the
++      # distro-presets-ENABLED unit + a random package-seeded UUID raced
++      # chinit's uuid seeding on every fresh-EBS boot (the 2026-11-18
++      # Code 246 / random-UUID roll incident — every node came up with a
++      # random v4 uuid despite the deterministic seeder in the binary).
++      # Disabling the unit at bake time defers the first CH start to
++      # chinit's start_clickhouse step (it systemctl-enables it), which
++      # runs AFTER configure_server_env has pinned the deterministic
++      # uuid + CH_CAS_SERVER_ROOT_ID.
++      "sudo systemctl disable clickhouse-server 2>/dev/null || true",
++      "sudo systemctl mask clickhouse-server 2>/dev/null || true",      "printf '\\nclickhouse soft nofile 262144\\nclickhouse hard nofile 262144\\nclickhouse soft nproc 65536\\nclickhouse hard nproc 65536\\nroot soft nofile 262144\\nroot hard nofile 262144\\n' | sudo tee -a /etc/security/limits.conf",
       "sudo mkdir -p /etc/systemd/system/clickhouse-server.service.d",
-      "printf '[Service]\\nLimitNOFILE=262144\\n' | sudo tee /etc/systemd/system/clickhouse-server.service.d/limits.conf",
+      "printf '[Service]\\nLimitNOFILE=262144\\nLimitNPROC=65536\\nTasksMax=infinity\\n' | sudo tee /etc/systemd/system/clickhouse-server.service.d/limits.conf",
       # ------------------------------------------------------------------
       # chinit — cloud-adaptive node bootstrapper (the cloud-init.sh Go
       # port): replaces the stage-2 bash script AND bootstrap.sh, and —

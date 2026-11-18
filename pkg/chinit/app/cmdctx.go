@@ -53,6 +53,27 @@ func specInventoryHosts(st *nodeState) []clusterops.Host {
 	return hosts
 }
 
+// ceilingClusterRequest builds a ClusterRequest populated with the full
+// ceiling slot inventory (0..writer_max-1, 0..reader_max-1, backup) from
+// chinit.yaml so dead-replica-gc's DropReplica membership check accepts
+// retired ordinals whose active lease has already expired or been released.
+func ceilingClusterRequest(st *nodeState) clusterops.ClusterRequest {
+	if spec, err := loadInventorySpec(); err == nil && spec != nil && spec.DNSZoneName != "" {
+		hosts := make([]clusterops.Host, 0)
+		for _, pair := range hostInventory(*spec) {
+			name, addr, ok := strings.Cut(pair, "=")
+			if !ok {
+				continue
+			}
+			hosts = append(hosts, clusterops.Host{Name: name, Address: addr})
+		}
+		if len(hosts) > 0 {
+			return clusterRequestWithHosts(st, hosts)
+		}
+	}
+	return clusterRequest(st)
+}
+
 // runCommand is the exec seam: production shells out via
 // exec.CommandContext (CombinedOutput), tests substitute a recorder.
 // A package-level var rather than a runner struct on purpose — the

@@ -324,11 +324,12 @@ func writerGcExcludes(ctx context.Context, st *nodeState, lister port.LeaseListe
 // node's rendered remote_servers config — self is the only host the
 // request must reach.
 func deadReplicaGc(ctx context.Context, st *nodeState, lister port.LeaseLister) error {
+	clusterReq := ceilingClusterRequest(st)
 	// Pass 1: readers, unconditionally (the empty pattern keeps the
 	// service's reader-* default).
 	logger.GetLogger(ctx).Info("dead-replica-gc: reader pass starting", "on", st.Identity.Hostname)
 	res, err := clusterOps.GcReplica(ctx, clusterops.GcReplicaRequest{
-		Cluster: clusterRequest(st),
+		Cluster: clusterReq,
 		RunOn:   st.Identity.Hostname,
 	})
 	if err != nil {
@@ -347,7 +348,7 @@ func deadReplicaGc(ctx context.Context, st *nodeState, lister port.LeaseLister) 
 		return nil
 	}
 	res, err = clusterOps.GcReplica(ctx, clusterops.GcReplicaRequest{
-		Cluster:      clusterRequest(st),
+		Cluster:      clusterReq,
 		RunOn:        st.Identity.Hostname,
 		NamePattern:  model.DefaultWriterHostPrefix + "*",
 		ExcludeHosts: excludes,

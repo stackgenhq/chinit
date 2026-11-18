@@ -117,4 +117,70 @@ var _ = Describe("configureServerEnv cloud gate", func() {
 		Expect(content).To(ContainSubstring(`CH_S3_ENDPOINT="https://data-bucket.s3.us-east-1.amazonaws.com"`))
 		Expect(content).To(ContainSubstring(`CH_CACHE_MAX_SIZE_BYTES="458058269491"`))
 	})
+
+	It("seeds a deterministic /var/lib/clickhouse/uuid per (cluster, hostname) when absent", func() {
+		dir := GinkgoT().TempDir()
+		uuidFile := filepath.Join(dir, "uuid")
+		origPath := serverUUIDPath
+		serverUUIDPath = func() string { return uuidFile }
+		DeferCleanup(func() { serverUUIDPath = origPath })
+
+		b := &Boot{
+			Spec: &model.BootSpec{
+				ClusterName: "ch-int-dev",
+				Role:        model.RoleReader,
+			},
+			Identity: model.NodeIdentity{Hostname: "reader-0"},
+			Provider: &stubProvider{name: "azure"},
+		}
+		Expect(b.configureServerEnv(context.Background())).To(Succeed())
+		data, err := os.ReadFile(uuidFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(Equal(deterministicServerUUID("ch-int-dev", "reader-0") + "\n"))
+		Expect(deterministicServerUUID("ch-int-dev", "reader-0")).NotTo(Equal(deterministicServerUUID("ch-int-dev", "reader-1")))
+	})
+
+	It("does NOT rewrite the uuid over existing ClickHouse state (the CAS lineage guard)", func() {
+		dir := GinkgoT().TempDir()
+		uuidFile := filepath.Join(dir, "uuid")
+		storeDir := filepath.Join(dir, "store")
+		Expect(os.MkdirAll(storeDir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(storeDir, "any"), []byte("x"), 0644)).To(Succeed())
+		Expect(os.WriteFile(uuidFile, []byte("random-uuid\n"), 0640)).To(Succeed())
+		origPath, origStore := serverUUIDPath, chStorePath
+		serverUUIDPath = func() string { return uuidFile }
+		chStorePath = func() string { return storeDir }
+		DeferCleanup(func() { serverUUIDPath, chStorePath = origPath, origStore })
+
+		b := &Boot{
+			Spec: &model.BootSpec{
+				ClusterName: "ch-int-dev",
+				Role:        model.RoleWriter,
+			},
+			Identity: model.NodeIdentity{Hostname: "writer-0"},
+			Provider: &stubProvider{name: "aws"},
+		}
+		b.adoptServerUUID(context.Background())
+		data, err := os.ReadFile(uuidFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(Equal("random-uuid\n"),
+			"a stateful node's uuid IS the live CAS anchor match — rewriting it would Code 246 on the next start")
+	})
+
+	It("emits CH_CAS_SERVER_ROOT_ID for the storage.xml from_env contract", func() {
+		b := &Boot{
+			Spec: &model.BootSpec{
+				ClusterName: "ch-int-dev",
+				Role:        model.RoleWriter,
+				S3DataBucket: "data-bucket",
+				CasEnabled:  true,
+			},
+			Identity: model.NodeIdentity{Hostname: "writer-0"},
+			Provider: &stubProvider{name: "aws"},
+		}
+		content, err := b.serverEnvContent(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(content).To(ContainSubstring(
+			`CH_CAS_SERVER_ROOT_ID="` + deterministicServerUUID("ch-int-dev", "writer-0") + `"`))
+	})
 })

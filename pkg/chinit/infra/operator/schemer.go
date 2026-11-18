@@ -204,16 +204,18 @@ func (r *SchemaRunner) DropReplica(ctx context.Context, request domain.ReplicaDr
 	replicaName := request.HostName
 	shardIndex := hostToRunOn.Runtime.Address.ShardIndex
 
-	dropSQLs := []string{
-		fmt.Sprintf("SYSTEM DROP REPLICA '%s'", replicaName),
-		fmt.Sprintf("SYSTEM DROP DATABASE REPLICA '%d|%s'", shardIndex, replicaName),
-	}
-
 	cluster := clickhouse.NewCluster()
 	cluster.ClusterConnectionParams = r.params
 	cluster.SetHosts([]string{hostToRunOn.Runtime.Address.FQDN})
 	opts := clickhouse.NewQueryOptions().SetRetry(false).SetLogQueries(true)
-	return cluster.ExecAll(ctx, dropSQLs, opts)
+	if err := cluster.ExecAll(ctx, []string{fmt.Sprintf("SYSTEM DROP REPLICA '%s'", replicaName)}, opts); err != nil {
+		return err
+	}
+	// Best-effort database replica drop: only applies when DatabaseReplicated
+	// is used; Atomic databases ignore or reject it after the table replica
+	// drop has already succeeded.
+	_ = cluster.ExecAll(ctx, []string{fmt.Sprintf("SYSTEM DROP DATABASE REPLICA '%d|%s'", shardIndex, replicaName)}, opts)
+	return nil
 }
 
 // SyncReplica re-queues replication on a restarted node
