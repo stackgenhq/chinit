@@ -1,0 +1,232 @@
+// Copyright (C) 2026 StackGen, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/stackgenhq/chinit/pkg/chinit/domain"
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
+	"github.com/stackgenhq/chinit/pkg/chinit/domain/port"
+	"github.com/stackgenhq/chinit/pkg/chinit/infra/operator"
+)
+
+// Paths the boot pipeline owns (mirrors the bash script's constants).
+const (
+	// ConfigD / UsersD are the ClickHouse drop directories.
+	ConfigDir = "/etc/clickhouse-server/config.d"
+	UsersDir  = "/etc/clickhouse-server/users.d"
+
+	// ChinitStatePath is the state file (resume + subcommand identity).
+	ChinitStatePath = "/var/lib/chinit/state.json"
+
+	// NodeEnvPath is the shell identity contract for unit scripts that
+	// still source it (kept until every consumer is a chinit
+	// subcommand).
+	NodeEnvPath = "/var/lib/clickhouse-bootstrap/node-env"
+
+	// BootFinishedMarker is what health verification greps for.
+	BootFinishedMarker = "/var/lib/cloud/instance/boot-finished"
+)
+
+// BootstrapDir is where the fetched bundle lands (and where chinit
+// writes node-env for legacy consumers during migration). A var (not
+// part of the const block) so tests can redirect it — the
+// bootstrapDDLPath/bootstrapAdminPasswordPath seam pattern.
+var BootstrapDir = "/var/lib/clickhouse-bootstrap"
+
+// Boot is one node's boot pipeline: spec + provider + host. The 19-step
+// order is load-bearing — identity settles BEFORE renders (the ip-*
+// macro bug), passwords land BEFORE the render (passwordFrom refs),
+// keepers skip the server start, and the health gate is non-fatal by
+// design.
+type Boot struct {
+	Spec     *model.BootSpec
+	Provider port.Provider
+	// Meta is the probed instance metadata (fetched once, reused).
+	Meta port.InstanceMetadata
+
+	// Identity is filled by the identity step; later steps and the
+	// node-env writer read it.
+	Identity model.NodeIdentity
+
+	// Refresh marks the run as an in-place refresh of a converged node
+	// (vs. a first boot): every step re-executes, the identity is taken
+	// from the state file when present (a refresh must NEVER re-claim an
+	// ordinal lease — the node is a live cluster member), and the
+	// keeper-ensemble wipe is skipped (raft state is live, not residue).
+	Refresh bool
+	// StatePath overrides ChinitStatePath (tests); empty means default.
+	StatePath string
+
+	// SpecHash gates resume: a new bundle hash invalidates prior step
+	// results so the pipeline re-renders.
+	SpecHash string
+
+	// PersistIdentity is called by the settle_identity step right after
+	// the identity is settled (claimed/derived + DNS): the app wires it
+	// to the engine's state so the job subcommands and a crash-recovery
+	// re-run always see the SETTLED identity, even if a later critical
+	// step fails the boot. Nil (tests) = no persistence.
+	PersistIdentity func(model.NodeIdentity)
+
+	// SetHostname is how the settle_identity step sets the system
+	// hostname. Production leaves it nil (settleIdentity falls back to
+	// the hostnamectl/hostname sequence — best-effort by design); tests
+	// inject a recorder so specs never rename the machine they run on.
+	SetHostname func(ctx context.Context, hostname string) error
+}
+
+// StaticHostname derives writer-N, keeper-N, or backup-0 from the private
+// IP's last octet (allocated at fixed offsets: writers at +10..+19,
+// keepers at +20..+29, backup at +30).
+func StaticHostname(privateIP string) (string, int) {
+	octets := strings.Split(privateIP, ".")
+	if len(octets) != 4 {
+		return "", -1
+	}
+	last := 0
+	if _, err := fmt.Sscanf(octets[3], "%d", &last); err != nil {
+		return "", -1
+	}
+	switch {
+	case last >= 10 && last <= 19:
+		return fmt.Sprintf("writer-%d", last-10), last - 10
+	case last >= 20 && last <= 29:
+		return fmt.Sprintf("keeper-%d", last-20), last - 20
+	case last == 30:
+		return "backup-0", 0
+	default:
+		return "", -1
+	}
+}
+
+// CRName computes the operator CR host name for server nodes. The CHI
+// spec names its single shard "01", so CR hosts are "01-0".."01-(N-1)"
+// in a fixed order: writers first, then readers offset by WriterCeiling,
+// and the backup replica at 01-(WriterCeiling + ReaderCeiling). Keepers
+// return an empty name.
+func (b *Boot) CRName() (string, int) {
+	switch b.Spec.Role {
+	case model.RoleWriter:
+		ordinal := b.Identity.CROrdinal
+		if ordinal < 0 {
+			return "", -1
+		}
+		return fmt.Sprintf("01-%d", ordinal), ordinal
+	case model.RoleReader:
+		ordinal := b.Identity.CROrdinal
+		if ordinal < 0 {
+			return "", -1
+		}
+		offset := b.Spec.WriterCeiling()
+		return fmt.Sprintf("01-%d", offset+ordinal), offset + ordinal
+	case model.RoleBackup:
+		ordinal := b.Spec.WriterCeiling() + b.Spec.ReaderCeiling()
+		return fmt.Sprintf("01-%d", ordinal), ordinal
+	default:
+		return "", -1
+	}
+}
+
+// WriteNodeEnv snapshots the settled identity into the shell contract
+// file root-owned, 0600, single-quote-escaped (the bash node_env_kv
+// semantics: a value can never inject live shell into a file root
+// sources).
+func (b *Boot) WriteNodeEnv(path string) error {
+	kv := func(key, val string) string {
+		escaped := strings.ReplaceAll(val, "'", `'\''`)
+		return fmt.Sprintf("%s='%s'\n", key, escaped)
+	}
+	var sb strings.Builder
+	sb.WriteString("# Generated by chinit — the settled node identity contract.\n")
+	sb.WriteString(kv("NODE_ROLE", string(b.Spec.Role)))
+	sb.WriteString(kv("HOSTNAME", b.Identity.Hostname))
+	sb.WriteString(kv("CLUSTER_NAME", b.Spec.ClusterName))
+	sb.WriteString(kv("DNS_ZONE_NAME", b.Spec.DNSZoneName))
+	sb.WriteString(kv("CR_NAME", b.Identity.CRName))
+	sb.WriteString(kv("INSTANCE_ID", b.Identity.InstanceID))
+	sb.WriteString(kv("AWS_REGION", b.Identity.Region))
+	sb.WriteString(kv("CHCTL_SPEC", filepath.Join(BootstrapDir, "chi.yaml")))
+	sb.WriteString(kv("ADMIN_PASSWORD_FILE", filepath.Join(BootstrapDir, "admin-password")))
+	if b.Identity.ZoneID != "" {
+		sb.WriteString(kv("ROUTE53_ZONE_ID", b.Identity.ZoneID))
+	}
+	if b.Identity.LeaseTable != "" {
+		sb.WriteString(kv("CLAIMER_TABLE_NAME", b.Identity.LeaseTable))
+	}
+	sb.WriteString(kv("CLOUD_PROVIDER", b.Provider.Name()))
+
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	return os.WriteFile(path, []byte(sb.String()), 0600)
+}
+
+// loadBootIdentity reads the persisted identity snapshot from the state
+// file. Used by the refresh path; distinct from the subcommands' nodeState
+// because the service package owns the state schema. Fails closed: an
+// unreadable or empty state means we know NOTHING about who this node is,
+// and refreshing under a guessed identity would re-key the cluster.
+func loadBootIdentity(path string) (bootIdentity, error) {
+	var st struct {
+		Identity bootIdentity `json:"identity"`
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return bootIdentity{}, fmt.Errorf("read %s: %w (was `chinit boot` ever run on this node?)", path, err)
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		return bootIdentity{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if st.Identity.Hostname == "" {
+		return bootIdentity{}, fmt.Errorf("%s carries no settled identity — run the boot path first", path)
+	}
+	return st.Identity, nil
+}
+
+// LoadCHI loads the CHI spec the bundle delivered (the chctl library
+// seam — no process boundary, no flag parsing).
+func (b *Boot) LoadCHI(ctx context.Context) (any, error) {
+	data, err := os.ReadFile(filepath.Join(BootstrapDir, "chi.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("read chi.yaml: %w", err)
+	}
+	loader := operator.NewSpecLoader()
+	cr, err := loader.LoadCHI(ctx, port.LoadCHIRequest{
+		Spec: domain.SpecReference{
+			Name: b.Spec.ClusterName,
+			Data: data,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("load chi.yaml: %w", err)
+	}
+	return cr, nil
+}
+
+// LoadCHK loads keeper.yaml (the CHK spec) from the fetched bundle
+// configure_keeper renders the node's single-file config from it.
+func (b *Boot) LoadCHK(ctx context.Context) (any, error) {
+	data, err := os.ReadFile(filepath.Join(BootstrapDir, "keeper.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("read keeper.yaml: %w", err)
+	}
+	loader := operator.NewSpecLoader()
+	cr, err := loader.LoadCHK(ctx, port.LoadCHKRequest{
+		Spec: domain.SpecReference{
+			Name: b.Spec.ClusterName,
+			Data: data,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("load keeper.yaml: %w", err)
+	}
+	return cr, nil
+}

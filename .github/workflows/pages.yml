@@ -1,0 +1,75 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build & publish docs site (GitHub Pages)
+
+# Publishes docs/ as a Jekyll site on every push to main.
+#
+# NOTE: Pages on a PRIVATE repo needs a paid plan (the org is on
+# free today). When the repo flips public — or the plan changes —
+# enable Pages in repo Settings → Pages with "GitHub Actions" as the
+# source; this workflow takes it from there (no source path config
+# needed: it uploads an artifact and calls deploy-pages).
+#
+# Local preview (matches what GitHub Pages builds):
+#   cd docs && bundle install
+#   bundle exec jekyll serve --baseurl ""   # http://localhost:4000
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+# A guard step keeps this green until Pages can be enabled: the
+# configure-pages step 404s when Pages is not enabled on the repo.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        # Pages on private repos needs a paid plan; until enabled this
+        # workflow skips itself instead of failing on every push.
+        run: |
+          if gh api "repos/${{ github.repository }}/pages" >/dev/null 2>&1; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "GitHub Pages is not enabled for this repo — skipping site deploy."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.enabled == 'true'
+      - uses: actions/configure-pages@v5
+        if: steps.check.outputs.enabled == 'true'
+      - uses: actions/jekyll-build-pages@v1
+        if: steps.check.outputs.enabled == 'true'
+        with:
+          source: docs
+          destination: ./_site
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.check.outputs.enabled == 'true'
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

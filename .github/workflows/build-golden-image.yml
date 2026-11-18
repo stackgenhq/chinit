@@ -1,0 +1,161 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build ClickHouse Golden Image
+
+on:
+  # Manual-only: the Azure destination (gallery + resource group) is
+  # provisioned by the consuming Terraform stack, which does not
+  # currently exist — running on push would be a permanent red X.
+  # Re-enable push triggers (branches: [main, master], paths:
+  # images/azure/**) once a destination gallery is stood up.
+  workflow_dispatch:
+    inputs:
+      clickhouse_version:
+        description: 'ClickHouse version (e.g., 25.12.4.35)'
+        required: false
+        default: ''
+      force_version:
+        description: 'Force specific image version (e.g., 1.0.0)'
+        required: false
+        default: ''
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  PACKER_DIR: images/azure
+
+jobs:
+  build-image:
+    name: Build Golden Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Mask account identifiers
+        # The subscription ID embeds in every Azure resource ID the
+        # workflow echoes (gallery image IDs, ARM output) — mask it
+        # everywhere once. Secrets are auto-masked; this guards the
+        # derived forms (resource IDs) too.
+        run: echo "::add-mask::${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Needed for git describe
+
+      - name: Compute Version
+        id: version
+        run: |
+          # Get git describe against image tags only (the repo's bare
+          # v0.x tags are chinit BINARY releases, not image versions —
+          # filter them out so image versions don't collide with the
+          # binary's version line)
+          GIT_DESCRIBE=$(git describe --tags --always --match 'image-v*' 2>/dev/null || echo "v0.0.0")
+          echo "Git describe: $GIT_DESCRIBE"
+          
+          # Check if we got a valid version tag (contains dots) or just a SHA
+          if echo "$GIT_DESCRIBE" | grep -qE '^v?[0-9]+\.[0-9]+'; then
+            # Extract base version without 'v' prefix
+            GIT_VERSION=$(echo "$GIT_DESCRIBE" | sed 's/^v//' | sed 's/-.*//')
+            
+            # Count commits since last tag
+            COMMITS_SINCE=$(echo "$GIT_DESCRIBE" | grep -oE '\-[0-9]+\-' | tr -d '-' || echo "0")
+            if [ -z "$COMMITS_SINCE" ]; then COMMITS_SINCE=0; fi
+            
+            # Compute final version
+            if [ "$COMMITS_SINCE" -gt 0 ]; then
+              MAJOR=$(echo "$GIT_VERSION" | cut -d. -f1)
+              MINOR=$(echo "$GIT_VERSION" | cut -d. -f2)
+              PATCH=$(echo "$GIT_VERSION" | cut -d. -f3)
+              [ -z "$PATCH" ] && PATCH=0
+              NEW_PATCH=$((PATCH + COMMITS_SINCE))
+              VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+            else
+              VERSION="$GIT_VERSION"
+            fi
+          else
+            # No valid tag found, use fallback with commit count
+            COMMIT_COUNT=$(git rev-list --count HEAD 2>/dev/null || echo "1")
+            VERSION="0.0.${COMMIT_COUNT}"
+            echo "No tags found, using fallback version: $VERSION"
+          fi
+          
+          # Ensure version has 3 parts (X.Y.Z)
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            VERSION="${VERSION}.0"
+          fi
+          
+          # Allow manual override
+          if [ -n "${{ github.event.inputs.force_version }}" ]; then
+            VERSION="${{ github.event.inputs.force_version }}"
+          fi
+          
+          # Get short SHA
+          GIT_SHA=$(git rev-parse --short HEAD)
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "git_sha=$GIT_SHA" >> $GITHUB_OUTPUT
+          echo "Computed version: $VERSION (sha: $GIT_SHA)"
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ env.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ env.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ env.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ env.AZURE_TENANT_ID }}"
+            }
+
+      - name: Packer Init
+        run: |
+          cd ${{ env.PACKER_DIR }}
+          packer init .
+
+      - name: Build Override Variables
+        id: vars
+        run: |
+          EXTRA_VARS=""
+          if [ -n "${{ github.event.inputs.clickhouse_version }}" ]; then
+            EXTRA_VARS="-var clickhouse_version=${{ github.event.inputs.clickhouse_version }}"
+          fi
+          # subscription_id comes from the secret (defaults.pkrvars.hcl
+          # leaves it empty on purpose — account identifiers are not
+          # checked into a shareable repo). Written to GITHUB_OUTPUT via
+          # a heredoc so the value never lands in the step log.
+          # multiline output value; printf does not echo to the log
+          printf 'extra_vars<<EXTRA_EOF\n%s -var subscription_id=%s\nEXTRA_EOF\n' \
+            "$EXTRA_VARS" '${{ secrets.AZURE_SUBSCRIPTION_ID }}' >> "$GITHUB_OUTPUT"
+
+      - name: Packer Build
+        run: |
+          cd ${{ env.PACKER_DIR }}
+          packer build \
+            -var "image_version=${{ steps.version.outputs.version }}" \
+            -var "git_sha=${{ steps.version.outputs.git_sha }}" \
+            -var "git_dirty=" \
+            ${{ steps.vars.outputs.extra_vars }} \
+            -var-file=defaults.pkrvars.hcl \
+            clickhouse.pkr.hcl
+
+      - name: Output Image ID
+        run: |
+          echo "## Golden Image Built Successfully! 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ steps.version.outputs.git_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image version:** ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "To use this image, update your tfvars (subscription/RG from your environment):" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
+          # subscription/RG/gallery left as placeholders: the step summary is NOT masked (add-mask covers logs only)
+          echo "golden_image_id  = \"/subscriptions/<subscription>/resourceGroups/<rg>/providers/Microsoft.Compute/galleries/<gallery>/images/clickhouse-node/versions/${{ steps.version.outputs.version }}\"" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

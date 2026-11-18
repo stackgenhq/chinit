@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+    <interserver_http_host>::</interserver_http_host>
+</clickhouse>

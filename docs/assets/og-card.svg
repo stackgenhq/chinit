@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <radialGradient id="glow" cx="85%" cy="15%" r="65%">
+      <stop offset="0%" stop-color="#1d4ed8" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#1d4ed8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tile" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="#0f172a"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+
+  <!-- brand tile (scaled-up favicon power mark) -->
+  <g transform="translate(90, 96) scale(2.1875)">
+    <rect width="64" height="64" rx="14" fill="url(#tile)"/>
+    <path d="M32 14v18M21.5 21.5a15 15 0 1 0 21 0" fill="none" stroke="#ffffff" stroke-width="5.5" stroke-linecap="round"/>
+  </g>
+  <text x="262" y="205" font-family="Helvetica, Arial, sans-serif" font-size="96" font-weight="700" fill="#ffffff" letter-spacing="-2">chinit</text>
+  <text x="264" y="262" font-family="Helvetica, Arial, sans-serif" font-size="30" font-weight="400" fill="#94a3b8">&#8220;ch-init&#8221; &#183; short for ClickHouse init</text>
+
+  <text x="90" y="350" font-family="Helvetica, Arial, sans-serif" font-size="44" font-weight="400" fill="#cbd5e1">Operator-grade lifecycle management</text>
+  <text x="90" y="412" font-family="Helvetica, Arial, sans-serif" font-size="44" font-weight="400" fill="#cbd5e1">for ClickHouse on cloud VMs</text>
+
+  <text x="90" y="486" font-family="Helvetica, Arial, sans-serif" font-size="28" font-weight="600" fill="#7dd3fc">One static binary &#183; One YAML spec &#183; AWS &amp; Azure &#8212; no Kubernetes</text>
+
+  <text x="90" y="566" font-family="Menlo, Courier, monospace" font-size="24" fill="#64748b">github.com/stackgenhq/chinit</text>
+</svg>

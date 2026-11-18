@@ -1,0 +1,152 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# chinit node spec (rendered per role by Terraform; consumed by the
+# chinit binary at boot). This file is data, not a script: the node's
+# entire intent — role, identity, disks, secret NAMES, bundle location —
+# lives here, and the same binary converges every role and every cloud
+# to it (only this file differs).
+#
+# templatefile() note: the interpolations below render from the
+# module's locals; any literal dollar-dollar-brace would be an escaped
+# dollar.
+role: "${role}"
+identity_mode: "${identity_mode}"
+
+# Ordinal lease identity: writer-N/reader-N claimed from the claims
+# table at boot. The *_max fields are the ASG maxima = the claim
+# ceilings — they must be the MAXIMUM the fleet can reach, never the
+# live count, or a scale-out node can never claim an identity.
+claimer_table_name: "${claimer_table_name}"
+writer_hostname_prefix: "writer-"
+reader_hostname_prefix: "reader-"
+writer_max: ${writer_max}
+reader_max: ${reader_max}
+reader_count: ${reader_count}
+
+cluster_name: "${cluster_name}"
+dns_zone_name: "${dns_zone_name}"
+
+# Static-writer compat fields (deprecated for lease identity; kept so
+# pre-lease binaries on the static path keep working — lease-mode
+# binaries ignore them in slot arithmetic).
+writer_count: ${writer_count}
+writer_nodes: [${writer_nodes_list}]
+
+# Keeper inventory (Raft ensemble) — every role carries it: the CHI
+# spec's zookeeper section and the peer-hosts entries resolve keepers
+# by name.
+keeper_nodes: [${keeper_nodes_list}]
+
+# Vertical autoscaling (the chinit `autoscale` coordinator): the
+# ladders are the ascending instance types the coordinator steps
+# through; min/max bound the steps (the runaway cap). The writers'
+# fleet identity names the ASG + launch template the ordinal-0
+# holder rolls (AutoRollback armed). Empty lists = the vertical path
+# disabled (the subcommand skips with a logged reason; native ASG
+# policies own horizontal regardless).
+autoscaling:
+  keeper_type_ladder: [${keeper_ladder_list}]
+  keeper_min_type: "${keeper_min_type}"
+  keeper_max_type: "${keeper_max_type}"
+  writer_type_ladder: [${writer_ladder_list}]
+  writer_min_type: "${writer_min_type}"
+  writer_max_type: "${writer_max_type}"
+  # The launch template is NOT rendered: the coordinator resolves the
+  # ASG's CURRENT template at decision time (the template the ASG
+  # runs can change between spec renders; the coordinator versions
+  # the live one).
+  writers_asg_name: "${writers_asg_name}"
+
+# The tiered-storage bucket root: storage.xml resolves the endpoint
+# via <endpoint from_env="CH_S3_ENDPOINT"> and chinit writes that env
+# from this field at boot (an empty value is a server START error on
+# AWS — Code 36).
+s3_data_bucket: "${s3_data_bucket}"
+timezone: "${timezone}"
+
+config_bundle:
+  bucket: "${bundle_bucket}"
+  prefix: "${bundle_prefix}"
+  # The gate: sha256 over the bundle members, computed identically by
+  # Terraform (here) and chinit (at boot). A mismatch is Fatal — the
+  # tfvars hash is stale or the bucket was overwritten.
+  sha256: "${config_hash}"
+
+disks:
+  metadata_label: "${metadata_disk_label}"
+  cache_label: "${cache_disk_label}"
+  keeper_label: "${keeper_disk_label}"
+
+# Secret NAMES only — chinit resolves the values over the instance
+# role into 0600 files; plaintext never enters the spec, the state
+# file, S3, or logs.
+secrets:
+  default_password: "${default_password_secret_name}"
+  admin_password: "${admin_password_secret_name}"
+  writer_password: "${writer_password_secret_name}"
+  tls_certificate: "${tls_certificate_secret_name}"
+  tls_private_key: "${tls_private_key_secret_name}"
+  tls_ca_certificate: "${tls_ca_certificate_secret_name}"
+
+network:
+  subnet_cidr: "${subnet_cidr}"
+  # Multi-AZ extras (empty in the Single-AZ posture — the pre-multi-AZ
+  # shape): the per-AZ nodes subnets peers can arrive from. Renders
+  # render-beside subnet_cidr via NodeSubnetCIDRs so cross-AZ peers
+  # never hit Code 516 Authentication failed.
+%{if subnet_cidrs_multi_az != ""}
+  subnet_cidrs: [${subnet_cidrs_multi_az}]
+%{endif~}
+  nlb_subnet_cidr: "${nlb_subnet_cidr}"
+  admin_allowed_networks: [${admin_networks_list}]
+  writer_allowed_networks: [${writer_networks_list}]
+  default_user_allowed_networks: [${default_networks_list}]
+
+# Backup: the cluster's backup member (identity for the backup's own
+# spec; the other roles carry it so their host inventories include it).
+backup:
+  bucket: "${backup_bucket}"
+  prefix: "${backup_prefix}"
+  retention_days: ${backup_retention_days}
+  compression_format: "${backup_compression_format}"
+  schedule: "${backup_schedule}"
+  on_demand: ${backup_on_demand}
+  is_backup_replica: ${is_backup_replica}
+  backup_replica_hostname: "${backup_replica_hostname}"
+
+# The fleet policy — disruption budget (the PDB equivalent: the
+# healthy-node floors the voluntary paths enforce; 0 takes the safe
+# defaults) and lifecycle hooks (commands at the boot/drain
+# boundaries; critical hooks abort a BOOT, never a drain).
+disruption:
+  min_healthy_writers: ${min_healthy_writers}
+  min_healthy_readers: ${min_healthy_readers}
+
+# Compute placement (the cross-AZ part-traffic contract). The
+# Terraform module renders this section EMPTY for the default
+# Single-AZ posture — writers/readers pinned to one AZ per shard:
+# sub-ms peer RTT, $0 cross-AZ part traffic (an AZ failure is an ASG
+# re-launch; S3 is already 3-AZ durable). Enabled = replicas
+# distributed across AZs, which on stock ReplicatedMergeTree bills
+# $0.02/GB cross-AZ on EVERY peer part fetch — the opt-in therefore
+# carries the shared-blob cold_tier it rides on, and chinit Fatals
+# at spec load when enabled arrives without one.
+%{if multi_az_enabled != ""}
+multi_az:
+  enabled: true
+  cold_tier: "${multi_az_cold_tier}"
+%{endif~}
+hooks:
+  items:
+${hooks_yaml}
+
+# Remote log shipping (inert when the endpoint is empty — the golden
+# image's otel/fluentbit agents idle without it).
+log_shipping:
+  agent: "${log_shipping_agent}"
+  endpoint: "${log_shipping_endpoint}"
+  headers: "${log_shipping_headers}"
+  fluentbit_output: "${fluentbit_output}"
+
+region: "${region}"

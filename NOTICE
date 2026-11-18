@@ -1,0 +1,20 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# NOTICE
+
+This product, chinit, was originally developed inside a fork of the
+Altinity Kubernetes Operator for ClickHouse
+(https://github.com/Altinity/clickhouse-operator, Apache-2.0) and
+extracted into its own repository. The extraction retains the
+operator's Apache-2.0 license and attribution.
+
+Portions of the Go module dependency graph derive from the Altinity
+clickhouse-operator (Apache-2.0) and its vendored sunsingerus mergo
+fork (BSD-3-Clause, see THIRD_PARTY_NOTICES.md and
+pkg/util/mergo/provenance.go in the dependency).
+
+## Copyright
+
+Copyright 2026 StackGen, Inc.
+Copyright 2019 Altinity Ltd and/or its affiliates. (extracted portions)

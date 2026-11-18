@@ -1,0 +1,55 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# chinit docs site (GitHub Pages)
+
+title: chinit
+tagline: ch-init (ClickHouse init) — node bootstrapper for cloud VMs
+description: >-
+  chinit — pronounced "ch-init", short for ClickHouse init — gets a
+  ClickHouse server ready to join its cluster on any cloud:
+  automatically, reliably, and without a pile of boot scripts.
+  One binary, one YAML spec, every cloud.
+# GitHub Pages project site is served under /chinit.
+# For local root preview, pass `--baseurl ""` to `jekyll serve/build`.
+url: "https://stackgenhq.github.io"
+baseurl: "/chinit"
+
+# Where the source lives — used for "edit this page" links and SEO sameAs.
+repository: stackgenhq/chinit
+author: StackGen, Inc.
+social:
+  name: StackGen
+  links:
+    - https://github.com/stackgenhq/chinit
+
+# GitHub Pages ships these plugins in the github-pages gem, so they
+# run identically in CI and local preview (`jekyll serve`).
+plugins:
+  - jekyll-seo-tag   # per-page title/description, Open Graph & Twitter cards, canonical URLs
+  - jekyll-sitemap   # /sitemap.xml for search engines
+
+markdown: kramdown
+kramdown:
+  syntax_highlighter: rouge
+  input: GFM
+
+# Plain layouts (no remote theme): the mermaid loader needs a custom
+# head, and a docs site wants a nav sidebar, not a giant banner.
+layouts_dir: _layouts
+includes_dir: _includes
+
+# chinit.md / chinit-architecture.md are the repo's developer docs;
+# the site pages are the reworked versions — do not publish both.
+exclude:
+  - chinit.md
+  - chinit-architecture.md
+  - Gemfile
+
+# Sidebar order (permalink style: /page/).
+defaults:
+  - scope: { path: "" }
+    values:
+      layout: default
+      # Default social-share card; pages can override with their own image.
+      image: /assets/og-card.png

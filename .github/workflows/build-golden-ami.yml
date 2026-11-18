@@ -1,0 +1,413 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build ClickHouse Golden AMI (AWS)
+
+# Builds the golden AMI from images/aws - the prebuilt image that
+# (a) cuts node bootstrap from ~8-12 min to ~2-3 min, and (b) allows nodes
+# to boot without internet egress when everything is pre-installed.
+#
+# Auth: GitHub OIDC -> the role in secrets.AWS_PACKER_ROLE_ARN assumed via
+# aws-actions/configure-aws-credentials (NO static keys).
+# The ARN and account ID are SECRETS, not variables: registered secret
+# values are auto-masked in public logs; a repo variable would print the
+# role ARN (and the account ID embedded in it) verbatim.
+#
+# Cleanup: keeps the KEEP_GENERATIONS most recent AMIs tagged
+# Purpose=clickhouse-golden-ami in the region; deregisters older ones and
+# deletes their snapshots.
+
+on:
+  workflow_dispatch:
+    inputs:
+      clickhouse_version:
+        description: "ClickHouse version (e.g. 26.8.36.3; empty = packer default)"
+        required: false
+        default: ""
+      build_flavor:
+        description: "Package repo: upstream (packages.clickhouse.com) or antalya (Altinity builds, Apache-2.0, CAS-capable)"
+        required: false
+        default: "upstream"
+        type: choice
+        options:
+          - upstream
+          - antalya
+      publish:
+        description: "ALSO build the PUBLIC share flavor (unencrypted + launchable by any AWS account; keep one published generation)"
+        required: false
+        default: false
+        type: boolean
+  workflow_run:
+    # The release→AMI roll, WITHOUT the explicit dispatch: the
+    # release-chinit.yaml roll-ami job bumps the packer pin and pushes
+    # it to main, then its run completes — THIS trigger fires on that
+    # completion and builds against main, which by then carries the
+    # bumped pin. The explicit `gh workflow run` dispatch this
+    # replaces was the old close-the-loop step; workflow_run is the
+    # GitHub-blessed chaining mechanism (GITHUB_TOKEN pushes do NOT
+    # fire the paths trigger below — the anti-recursion guard — so
+    # the bump commit alone could never start the build).
+    #
+    # NO branches filter ON PURPOSE: the release runs are TAG-push
+    # runs whose head_branch is the tag name (v0.3.0), not main — a
+    # branches: [main] filter would never match them and silently
+    # break the roll. The build itself checks out main below.
+    workflows: ["Release chinit"]
+    types: [completed]
+  push:
+    branches: [main, master]
+    paths:
+      - "images/aws/**"
+      - ".github/workflows/build-golden-ami.yml"
+
+env:
+  AWS_REGION: us-west-2
+  PACKER_DIR: images/aws
+  KEEP_GENERATIONS: "3"
+
+permissions:
+  id-token: write # OIDC
+  contents: read
+
+# Serialize builds — never let two builds race (a double-trigger once launched
+# two builders minutes apart). Queued, not cancelled: cancelling a running
+# build is exactly what leaks builders.
+concurrency:
+  group: build-golden-ami
+  cancel-in-progress: false
+
+jobs:
+  build-ami:
+    name: Build golden AMI
+    # The publish-public job builds its own flavor; when dispatching with
+    # publish=true, skip the private build entirely (one build per run).
+    # The workflow_run arm ALSO gates on the triggering release's
+    # conclusion: a failed release bumped no pin, so building would
+    # only re-bake the previous generation on a 15-45min build slot.
+    if: >-
+      (github.event_name != 'workflow_dispatch' || !inputs.publish) &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Mask account identifiers
+        # The AWS account ID appears in log lines the action cannot
+        # avoid printing (arn:aws:iam::<account>:… from the role ARN,
+        # account numbers in aws CLI output). Secrets are auto-masked,
+        # but this guards every OTHER place the ID could surface.
+        run: echo "::add-mask::${{ secrets.AWS_ACCOUNT_ID }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PACKER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Packer init
+        run: packer init ${{ env.PACKER_DIR }}
+
+      - name: Verify the chinit release exists (fail fast, no wait)
+        # The tag lives in THIS repo — ls-remote authenticates with the
+        # workflow GITHUB_TOKEN (contents:read) so the check works on a
+        # private repo too.
+        # The chinit download itself moved to the LAST packer install
+        # step (see clickhouse.pkr.hcl): the builder spends ~10 minutes
+        # on apt/ClickHouse/backup/AWS-CLI/OTEL installs FIRST, and the
+        # GoReleaser publish (which races every packer/** push — three
+        # builds failed on the 404 before this) finishes during them.
+        # This step only checks the tag exists so a typo'd pin fails in
+        # seconds instead of after a 15-minute build.
+        run: |
+          CHINIT_VERSION=$(awk '/variable "chinit_version"/,/^\}/' \
+            ${{ env.PACKER_DIR }}/clickhouse.pkr.hcl \
+            | grep -oE 'default *= *"[0-9.]+"' | head -1 \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          [ -z "$CHINIT_VERSION" ] && { echo "chinit_version default not found in packer template"; exit 1; }
+          # chinit releases are bare semver tags (v0.2.0+): GoReleaser OSS
+          # publishes under the CURRENT_TAG ref, which must be semver — the
+          # old chinit-v* prefix failed the git-state and semver checks.
+          # The fail-fast checks the git TAG via ls-remote: the REST API
+          # 403s from shared runner IPs (unauthenticated rate limits —
+          # the third live failure shape), and the RELEASE object itself
+          # races the GoReleaser publish (the second shape). The tag is
+          # instantly visible; assets publish during the build's ~10
+          # minutes of package installs and the last step polls for
+          # whatever window remains.
+          echo "checking chinit ${CHINIT_VERSION} tag (the release + assets may still be publishing — the build's last step waits)"
+          git ls-remote --tags "https://x-access-token:${GITHUB_TOKEN}@github.com/stackgenhq/chinit.git" "refs/tags/v${CHINIT_VERSION}" \
+            | grep -q "v${CHINIT_VERSION}" \
+            || { echo "chinit v${CHINIT_VERSION} tag not found"; exit 1; }
+          mkdir -p ${{ env.PACKER_DIR }}/chinit-artifacts
+          echo "$CHINIT_VERSION" > ${{ env.PACKER_DIR }}/chinit-artifacts/.version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        id: build
+        env:
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          # The repo is private: release assets are not anonymously
+          # fetchable, and the packer template's LAST install step
+          # downloads chinit from the release. Without this token the
+          # download falls to the anonymous branch and 404s for the
+          # full 20-minute poll window (the 0.2.36 stuck build: the
+          # release was published and the assets existed — the job
+          # just had no credentials to see them). contents:read
+          # GITHUB_TOKEN; packer passes it into the builder as
+          # CHINIT_DOWNLOAD_TOKEN (sensitive var — never printed).
+          CHINIT_DOWNLOAD_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # pipefail: without it `packer build | tee` reports tee's exit code
+          # (always 0) and a FAILED build looks like a green job.
+          set -o pipefail
+          EXTRA=""
+          [ -n "${{ github.event.inputs.clickhouse_version }}" ] && \
+            EXTRA="-var clickhouse_version=${{ github.event.inputs.clickhouse_version }}"
+          FLAVOR="${{ github.event.inputs.build_flavor }}"
+          [ -z "$FLAVOR" ] && FLAVOR="upstream"
+          EXTRA="$EXTRA -var build_flavor=$FLAVOR"
+          # Stamp every temporary resource (instance, key pair, security group,
+          # volume) with BuildId so the cleanup step can sweep this exact run's
+          # leftovers even if packer is killed before it can clean up itself.
+          EXTRA="$EXTRA -var build_id=${BUILD_ID}"
+          packer build \
+            -var "region=${{ env.AWS_REGION }}" \
+            -var "chinit_download_token=${CHINIT_DOWNLOAD_TOKEN}" \
+            $EXTRA \
+            -var-file=${{ env.PACKER_DIR }}/defaults.pkrvars.hcl \
+            ${{ env.PACKER_DIR }}/clickhouse.pkr.hcl \
+            | tee build.log
+          # Extract the produced AMI id from the log
+          AMI_ID=$(grep -oE 'ami-[a-z0-9]+' build.log | tail -1)
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Prune old generations (keep ${{ env.KEEP_GENERATIONS }})
+        run: |
+          # List golden AMIs oldest-first; deregister everything past the
+          # KEEP_GENERATIONS newest, then delete their (only) snapshot.
+          IDS=$(aws ec2 describe-images \
+            --region ${{ env.AWS_REGION }} \
+            --owners self \
+            --filters "Name=tag:Purpose,Values=clickhouse-golden-ami" \
+            --query "sort_by(Images,&CreationDate)[].ImageId" \
+            --output text | tr '[:space:]' '\n' | grep '^ami-' || true)
+          TOTAL=$(echo "$IDS" | grep -c '^ami-' || true)
+          echo "golden AMIs: $TOTAL (keeping newest ${{ env.KEEP_GENERATIONS }})"
+          echo "$IDS" | head -n -${{ env.KEEP_GENERATIONS }} | while read -r AMI; do
+            [ -z "$AMI" ] && continue
+            # Never prune an AMI the repo still references (e.g. a tfvars
+            # golden_ami_id that a copy-image was built from). The checked-out
+            # tree is $GITHUB_WORKSPACE — grep it before deregistering.
+            if grep -rF "$AMI" "$GITHUB_WORKSPACE" --exclude-dir=.git --exclude-dir=node_modules -q; then
+              echo "keeping $AMI — referenced in repository, skipping"
+              continue
+            fi
+            IN_USE=$(aws ec2 describe-instances --region "${{ env.AWS_REGION }}" \
+              --filters "Name=image-id,Values=$AMI" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'length(Reservations[].Instances[])' --output text)
+            if [ "$IN_USE" != "0" ]; then
+              echo "keeping $AMI — $IN_USE instance(s) still use it, skipping"
+              continue
+            fi
+            SNAP=$(aws ec2 describe-images --region "${{ env.AWS_REGION }}" \
+              --image-ids "$AMI" --query "Images[0].BlockDeviceMappings[0].Ebs.SnapshotId" --output text)
+            echo "deregistering $AMI (snapshot $SNAP)"
+            aws ec2 deregister-image --region ${{ env.AWS_REGION }} --image-id "$AMI"
+            [ "$SNAP" != "None" ] && aws ec2 delete-snapshot --region ${{ env.AWS_REGION }} --snapshot-id "$SNAP"
+          done
+
+      # Packer cleans up its own temporary resources on success AND on
+      # failure — but NOT when the runner is hard-cancelled mid-build (packer
+      # is SIGKILLed before it can reap the builder instance, key pair, SG).
+      # Sweep anything this run left behind, on every outcome. Scoped to this
+      # run's BuildId tag so it can never touch another build's resources.
+      - name: Cleanup orphaned builder resources
+        if: always()
+        env:
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+          echo "Sweeping leftover packer resources for BuildId=${BUILD_ID}"
+
+          # Terminate first — the instance is the expensive leak. Key pairs are
+          # deletable immediately (independent of instance state). On a hard
+          # cancellation the runner may kill this step at any point, so do the
+          # high-value, quick actions before the slow wait loop; SGs require
+          # the instance to be gone first.
+          IDS=$(aws ec2 describe-instances \
+            --region "${{ env.AWS_REGION }}" \
+            --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ -n "$IDS" ]; then
+            echo "terminating instances: $IDS"
+            aws ec2 terminate-instances --region "${{ env.AWS_REGION }}" --instance-ids $IDS || true
+          fi
+
+          for kp in $(aws ec2 describe-key-pairs --region "${{ env.AWS_REGION }}" \
+              --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
+              --query 'KeyPairs[].KeyName' --output text); do
+            echo "deleting orphaned key pair: $kp"
+            aws ec2 delete-key-pair --region "${{ env.AWS_REGION }}" --key-name "$kp" || true
+          done
+
+          if [ -n "$IDS" ]; then
+            for i in $(seq 1 24); do
+              STATE=$(aws ec2 describe-instances --region "${{ env.AWS_REGION }}" --instance-ids $IDS \
+                --query 'Reservations[].Instances[].State.Name' --output text)
+              case "$STATE" in *pending*|*running*|*stopping*|*shutting-down*) sleep 5;; *) break;; esac
+            done
+          fi
+
+          for sg in $(aws ec2 describe-security-groups --region "${{ env.AWS_REGION }}" \
+              --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
+              --query 'SecurityGroups[].GroupId' --output text); do
+            echo "deleting orphaned security group: $sg"
+            aws ec2 delete-security-group --region "${{ env.AWS_REGION }}" --group-id "$sg" || true
+          done
+
+          # The CI role has no ec2:DeleteVolume permission, but the root
+          # volume is delete_on_termination, so nothing should linger.
+          # Describe (allowed) and surface any leftovers for manual review.
+          # This must never fail the build — it is best-effort diagnostics.
+          aws ec2 describe-volumes --region "${{ env.AWS_REGION }}" \
+            --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
+            --query 'Volumes[].[VolumeId,State]' --output text | \
+          while read -r v state; do
+            [ -z "$v" ] && continue
+            echo "WARN: volume $v (state=$state) carries BuildId=${BUILD_ID}; needs manual deletion"
+          done || true
+
+      - name: Summary
+        run: |
+          echo "## Golden AMI built 🎉" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**AMI id:** \`${{ steps.build.outputs.ami_id }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "To use it, set in tfvars:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```hcl' >> "$GITHUB_STEP_SUMMARY"
+          echo "golden_ami_id = \"${{ steps.build.outputs.ami_id }}\"" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # The PUBLIC share flavor: unencrypted root snapshot + public launch
+  # permission (AWS refuses public encrypted AMIs), Author=stackgen.com
+  # stamped on the image. Triggered via workflow_dispatch with
+  # publish=true. Keeps exactly one published generation.
+  publish-public:
+    name: Publish public AMI flavor
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mask account identifiers
+        run: echo "::add-mask::${{ secrets.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PACKER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Packer init
+        run: packer init images/aws
+
+      - name: Build public flavor
+        id: build
+        env:
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          # The repo is private: release assets need auth to download.
+          # contents:read GITHUB_TOKEN; packer passes it into the builder
+          # as CHINIT_DOWNLOAD_TOKEN (sensitive var — never printed).
+          CHINIT_DOWNLOAD_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          EXTRA=""
+          [ -n "${{ github.event.inputs.clickhouse_version }}" ] && \
+            EXTRA="-var clickhouse_version=${{ github.event.inputs.clickhouse_version }}"
+          packer build \
+            -var "region=${{ env.AWS_REGION }}" \
+            -var "build_flavor=${{ github.event.inputs.build_flavor }}" \
+            -var "public_ami=true" \
+            -var "ami_author=stackgen.com" \
+            -var "chinit_download_token=${CHINIT_DOWNLOAD_TOKEN}" \
+            -var "build_id=${BUILD_ID}" \
+            $EXTRA \
+            -var-file=images/aws/defaults.pkrvars.hcl \
+            images/aws/clickhouse.pkr.hcl \
+            | tee build.log
+          AMI_ID=$(grep -oE 'ami-[a-z0-9]+' build.log | tail -1)
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Retire the previous public generation
+        # One published generation: the newest stays, older public AMIs
+        # (same Purpose tag + IsPublic) are deregistered and their
+        # snapshots deleted. Consumers pin the AMI id; a pinned id is
+        # never retired while a reference exists in the repo.
+        run: |
+          KEEP=$(aws ec2 describe-images \
+            --region ${{ env.AWS_REGION }} --owners self \
+            --filters "Name=tag:Purpose,Values=clickhouse-golden-ami-public" \
+            --query "sort_by(Images[?ImageId!='${{ steps.build.outputs.ami_id }}'],&CreationDate)[].ImageId" \
+            --output text)
+          for AMI in $KEEP; do
+            [ -z "$AMI" ] && continue
+            if grep -rF "$AMI" "$GITHUB_WORKSPACE" --exclude-dir=.git -q; then
+              echo "keeping $AMI — referenced in repo"
+              continue
+            fi
+            SNAP=$(aws ec2 describe-images --region "${{ env.AWS_REGION }}" \
+              --image-ids "$AMI" \
+              --query "Images[0].BlockDeviceMappings[0].Ebs.SnapshotId" --output text)
+            echo "retiring public AMI $AMI (snapshot $SNAP)"
+            aws ec2 deregister-image --region "${{ env.AWS_REGION }}" --image-id "$AMI"
+            [ "$SNAP" != "None" ] && aws ec2 delete-snapshot --region "${{ env.AWS_REGION }}" --snapshot-id "$SNAP"
+          done
+
+      - name: Cleanup orphaned builder resources
+        if: always()
+        env:
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+          IDS=$(aws ec2 describe-instances --region "${{ env.AWS_REGION }}" \
+            --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          [ -n "$IDS" ] && aws ec2 terminate-instances --region "${{ env.AWS_REGION }}" --instance-ids $IDS || true
+          for kp in $(aws ec2 describe-key-pairs --region "${{ env.AWS_REGION }}" \
+              --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
+              --query 'KeyPairs[].KeyName' --output text); do
+            aws ec2 delete-key-pair --region "${{ env.AWS_REGION }}" --key-name "$kp" || true
+          done
+          for sg in $(aws ec2 describe-security-groups --region "${{ env.AWS_REGION }}" \
+              --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
+              --query 'SecurityGroups[].GroupId' --output text); do
+            aws ec2 delete-security-group --region "${{ env.AWS_REGION }}" --group-id "$sg" || true
+          done
+
+      - name: Summary
+        run: |
+          echo "## Public AMI published 🌍" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**AMI id:** \`${{ steps.build.outputs.ami_id }}\` (us-west-2, launchable by any AWS account)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Author tag: stackgen.com" >> "$GITHUB_STEP_SUMMARY"

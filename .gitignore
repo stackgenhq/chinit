@@ -1,0 +1,17 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build outputs and local artifacts
+/chinit
+manifest.json
+build.log
+_site/
+.jekyll-cache/
+.sass-cache/
+images/**/*.pkrvars.hcl
+!images/aws/defaults.pkrvars.hcl
+!images/aws/prod.pkrvars.hcl
+!images/azure/defaults.pkrvars.hcl
+!images/azure/example.pkrvars.hcl
+images/**/chinit-artifacts/
+images/**/packer-role-temp.json

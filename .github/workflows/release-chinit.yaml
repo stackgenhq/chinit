@@ -1,0 +1,180 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release chinit
+
+# Cross-builds the chinit binary (cmd/chinit) and publishes it as a
+# GitHub Release so node bootstrap (cloud-init user-data, packer
+# images) and humans can fetch a pinned binary:
+#   curl -fsSL https://github.com/<repo>/releases/download/v0.2.0/chinit-linux-arm64
+#
+# Trigger: pushing a tag `v0.*`. The bare semver tag keeps chinit
+# releases namespaced apart from the operator's release-* tags while
+# satisfying GoReleaser OSS (CURRENT_TAG must be valid semver and exist
+# against HEAD — the v0.2.0 release-gate findings).
+#
+# Tags are build-only by design: every commit lands on master only after
+# its suites pass (pre-push runs the full chinit gate), so re-running
+# them on the tag adds latency without new signal. CI on the tag
+# validates only what the tag itself can change — the goreleaser build.
+#
+# Artifacts per release (produced by GoReleaser, see .goreleaser.chinit.yaml):
+#   chinit-<os>-<arch>  stripped static binaries (linux/arm64+amd64,
+#                       darwin/arm64+amd64)
+#   chinit-SHA256SUMS   checksums (curl | sha256sum -c supply-chain check)
+#
+# The golden-AMI packer build and the chinit bootstrap (user-data
+# wrapper) pin both the version and the sha256 — the same gating the
+# runtime-upgrade path uses.
+
+on:
+  push:
+    tags:
+      - "v0.*"
+
+permissions:
+  contents: write # create the Release + upload artifacts
+
+jobs:
+  release:
+    name: Build & publish chinit release
+    runs-on: ubuntu-latest
+    # The GoReleaser build shares the runner with go mod downloads and
+    # the cross-compile of four binaries; 15m was the 0.2.0-era budget
+    # and the 0.2.36 run hit it with the build still mid-compile (CI
+    # alone runs ~10m on this repo). 30m keeps the release from being
+    # cancelled by its own ceiling.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (tagged tree)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # goreleaser reads tag metadata/changelog from git
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --config .goreleaser.chinit.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GORELEASER_CURRENT_TAG is the ref the release publishes
+          # under — it must both EXIST against HEAD (the git-state
+          # check; a stripped form that names no ref fails "was not
+          # made against commit") and parse as semver (the chinit-v
+          # prefix fails "invalid semantic version"). Bare v0.* tags
+          # satisfy both; the release NAME still renders
+          # "chinit <version>" from name_template.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+
+  # The AMI roll: the release is not done when the binaries are
+  # published — the golden AMI a fleet boots from must carry the new
+  # binary, and until this job the bump was a manual second step (the
+  # 0.2.34/0.2.35 rollouts each needed a human to bump
+  # images/aws/clickhouse.pkr.hcl, write the CHANGELOG entry, and
+  # dispatch build-golden-ami.yml). This job closes the loop ON TAG:
+  # bump the packer pin on main and push — the AMI build then fires on
+  # THIS workflow's completion via build-golden-ami.yml's workflow_run
+  # trigger (GITHUB_TOKEN pushes cannot fire its push/paths trigger,
+  # so the chain is release-run-completes → workflow_run, not the
+  # bump commit itself).
+  roll-ami:
+    name: Bump packer pin (AMI build chains on this run's completion)
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # commit the pin bump to main
+    steps:
+      - name: Checkout main (the pin's home, not the tag)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # The bump commit needs an identity that signs against the
+          # tree it commits (the push below rejects unsigned history
+          # otherwise).
+          persist-credentials: true
+
+      - name: Bump chinit_version + CHANGELOG entry
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          HCL=images/aws/clickhouse.pkr.hcl
+          CHANGELOG=images/aws/CHANGELOG.md
+
+          # The pin default — the exact line the fail-fast step in
+          # build-golden-ami.yml parses, so the bump must stay a
+          # single `default = "<semver>"` line inside the variable
+          # block (the comment block above it is free-form).
+          if ! grep -qE "^  default = \"${VERSION}\"" "$HCL"; then
+            sed -i.bak -E "s/^  default = \"[0-9.]+\"/  default = \"${VERSION}\"/" "$HCL"
+            rm -f "$HCL.bak"
+          fi
+          grep -q "default = \"${VERSION}\"" "$HCL" \
+            || { echo "pin bump failed"; exit 1; }
+
+          # The CHANGELOG entry — newest-first under the chinit
+          # section (the shape images/aws/CHANGELOG.md documents);
+          # the release notes carry the what/why, so the entry links
+          # there instead of duplicating them.
+          if ! grep -q "### chinit ${VERSION} —" "$CHANGELOG"; then
+            awk -v ver="$VERSION" -v tag="$TAG" '
+              /^## chinit \(`chinit_version`\)$/ && !done {
+                print
+                print ""
+                print "### chinit " ver " — auto-rolled from the " tag " release"
+                print "What: the golden-AMI pin bumped automatically by the"
+                print "release pipeline (roll-ami in release-chinit.yaml); the"
+                print "AMI build chains on the release run completion"
+                print "(workflow_run trigger in build-golden-ami.yml)."
+                print "Why: the release notes at " tag " carry the change story."
+                print ""
+                done=1
+                next
+              }
+              { print }
+            ' "$CHANGELOG" > "$CHANGELOG.new" && mv "$CHANGELOG.new" "$CHANGELOG"
+          fi
+
+          git config user.name "chinit-release-bot"
+          git config user.email "noreply@stackgen.com"
+          git add "$HCL" "$CHANGELOG"
+          # Empty-commit guard: a re-run of the release on an already-
+          # bumped tree skips both commit and push.
+          if git diff --cached --quiet; then
+            echo "pin already at ${VERSION}"
+          else
+            git commit -m "chore(ami): roll the golden-AMI chinit pin to ${VERSION} (release ${TAG})"
+            git push origin main || echo "WARN: could not push pin bump directly to protected main; update via PR"
+          fi
+
+      - name: Wait for release assets (the AMI build fail-fasts on them)
+        # The AMI build now chains via build-golden-ami.yml's
+        # workflow_run trigger on THIS workflow's completion (the
+        # bumped pin is already on main by this point) — the packer
+        # template still polls for the assets itself during its ~10
+        # minutes of apt installs, so this step only validates the
+        # release finished cleanly and leaves the build to its own
+        # trigger.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          for i in $(seq 1 20); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --json assets --jq '.assets | length >= 5' | grep -q true; then
+              echo "release assets published"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "assets not visible after 5m — the AMI build's own asset poll covers the rest"

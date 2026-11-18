@@ -1,0 +1,17 @@
+{%- comment -%}
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+
+  Sidebar nav, ordered by hand (Jekyll sorts by title/path otherwise).
+  Permalinks are /page/ style; relative_url handles the baseurl.
+{%- endcomment -%}
+{%- assign nav_pages = "" | split: "" -%}
+{%- for p in site.pages -%}
+  {%- if p.nav_order -%}
+    {%- assign nav_pages = nav_pages | push: p -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- assign nav_pages = nav_pages | sort: "nav_order" -%}
+{%- for p in nav_pages -%}
+  <a class="nav-link{% if p.url == page.url %} current{% endif %}" href="{{ p.url | relative_url }}">{{ p.nav_title }}</a>
+{%- endfor -%}

@@ -1,0 +1,146 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CHI spec rendered by Terraform — the cluster definition chinit loads
+# from the bundle (chi.yaml) and renders every node's config from: the
+# remote_servers topology, users, profiles, and the per-node files.
+#
+# The cluster is ${cluster_name}: writers + readers are replicas of ONE
+# named shard ("01" — the {shard} macro renders the shard NAME into every
+# ReplicatedMergeTree keeper path; an anonymous shardsCount layout would
+# render a 0-based index and re-key the fleet's data).
+#
+# Passwords are passwordFrom references (cloud secret NAMES): chinit
+# resolves them at render time and SHA256-hashes them into users.d —
+# plaintext never lands in this spec, the bundle, or the state file.
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: ${cluster_name}
+spec:
+  configuration:
+    clusters:
+      - name: ${cluster_name}
+        # Interserver/distributed traffic uses the TLS port (9010):
+        # tcp_port_secure below flows into every host's TLSPort.
+        secure: "yes"
+        layout:
+          shards:
+            - name: "01"
+              # The CEILING, never live counts: CR host names are
+              # "01-N" (writers first, readers offset by the writer
+              # ceiling, backup after the readers' ceiling) and must
+              # stay stable across every scaling event.
+              replicasCount: ${replica_count}
+    zookeeper:
+      nodes:
+%{for keeper in keepers~}
+        - host: ${keeper}
+          port: 9181
+%{endfor~}
+    profiles:
+      default/async_insert: "1"
+      default/async_insert_max_data_size: "104857600"
+      default/async_insert_busy_timeout_ms: "10000"
+      default/wait_for_async_insert: "1"
+      default/max_bytes_before_external_group_by: "21474836480"
+      default/max_bytes_before_external_sort: "10737418240"
+      default/use_hedged_requests: "1"
+      default/max_download_threads: "32"
+      default/min_bytes_to_use_direct_io: "1048576"
+      default/enable_filesystem_cache_on_write_operations: "1"
+      # The no-data-loss ingest profile (carried by the writer user):
+      # INSERT returns after quorum replicas hold the part.
+      ingest/insert_quorum: "auto"
+      ingest/insert_quorum_timeout: "180000"
+      ingest/select_sequential_consistency: "1"
+    settings:
+      # The secure INTERSERVER port (ssl.xml serves it on 9010): with
+      # secure: yes this setting renders <port> into remote_servers —
+      # without it the CR renders the client TLS port (9440) and
+      # distributed traffic dies with "No route to host".
+      tcp_port_secure: "9010"
+      max_concurrent_queries: "150"
+      max_server_memory_usage_to_ram_ratio: "0.9"
+      timezone: "UTC"
+      mark_cache_size: "5368709120"
+      uncompressed_cache_size: "1073741824"
+      asynchronous_metrics_update_period_s: "1"
+      background_pool_size: "16"
+      background_move_pool_size: "8"
+      background_schedule_pool_size: "16"
+      format_schema_path: /var/lib/clickhouse/format_schemas
+      merge_tree/parts_to_throw_insert: "3000"
+      merge_tree/merge_with_ttl_timeout: "300"
+      merge_tree/ttl_only_drop_parts: "1"
+      # Query/system log bounds: a log table without a TTL is worse than
+      # unbounded — a rotated, readonly log never runs TTL drops.
+      query_log/partition_by: "toYYYYMM(event_date)"
+      query_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      query_thread_log/partition_by: "toYYYYMM(event_date)"
+      query_thread_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      part_log/partition_by: "toYYYYMM(event_date)"
+      part_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      metric_log/partition_by: "toYYYYMM(event_date)"
+      metric_log/ttl: "event_date + INTERVAL 30 DAY DELETE"
+    files:
+      server-logger.xml: |
+        <clickhouse>
+            <logger>
+                <level>${log_level}</level>
+                <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+                <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+                <size>1000M</size>
+                <count>10</count>
+                <formatting>
+                    <type>json</type>
+                    <names>
+                        <date_time>timestamp</date_time>
+                        <level>severity</level>
+                        <message>message</message>
+                        <source_file>source_file</source_file>
+                        <source_line>source_line</source_line>
+                    </names>
+                </formatting>
+            </logger>
+        </clickhouse>
+      server-text-log.xml: |
+        <clickhouse>
+            <!-- system.text_log: verbose logs stay in ClickHouse (ZSTD,
+                 TTL-dropped) instead of shipping to remote logging at
+                 $0.50/GB. The external sinks (rotating file + stdout for
+                 the CW agent) run at <level>; text_log keeps every line
+                 down to <text_log_level> for SSM/SQL debugging. The root
+                 logger stays at least as verbose as text_log.level
+                 (Loggers.cpp raises max_log_level to match). -->
+            <text_log>
+                <level>${text_log_level}</level>
+                <database>system</database>
+                <table>text_log</table>
+                <partition_by>toYYYYMM(event_date)</partition_by>
+${text_log_ttl_line}
+                <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+                <max_size_rows>1048576</max_size_rows>
+            </text_log>
+        </clickhouse>
+      server-prometheus.xml: |
+        <clickhouse>
+            <prometheus>
+                <endpoint>/metrics</endpoint>
+                <port>9363</port>
+                <host>127.0.0.1</host>
+                <metrics>true</metrics>
+                <events>true</events>
+                <asynchronous_metrics>true</asynchronous_metrics>
+                <status_info>true</status_info>
+            </prometheus>
+        </clickhouse>
+    users:
+      default/passwordFrom: "${default_password_secret_name}"
+      default/profile: readonly
+      default/quota: default
+      admin/passwordFrom: "${admin_password_secret_name}"
+      admin/profile: default
+      admin/access_management: "1"
+      writer/passwordFrom: "${writer_password_secret_name}"
+      writer/profile: ingest

@@ -1,0 +1,99 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+# Gate for the chinit binary: build + vet + the full Ginkgo suite,
+# plus golangci-lint on the repo's .golangci.yaml config.
+# Every commit lands with this green (the pre-push gate in the old
+# fork repo ran the same suites).
+#
+# infra/aws is slow (~60s: DynamoDB/route53 conformance logic) and
+# app is slower (~90s: the drain/lease pipelines) — acceptable for a
+# commit gate on a 9-package module.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    # Code-bearing activity types only: label/assign churn must not
+    # re-run the ~20-minute suite as a wasted PR check.
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      # Runs the repo's .golangci.yaml — the same config that
+      # `golangci-lint run ./...` expects locally.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned to the local dev version (the config is v2-format):
+          # "latest" would let a future breaking golangci-lint release
+          # break every PR check at once.
+          version: v2.15.0
+
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -timeout 20m
+
+  release-build:
+    name: goreleaser build check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      # Validates .goreleaser.chinit.yaml, hooks, and ldflags module paths
+      # on every push/PR (--single-target keeps the CI check fast while
+      # release-chinit.yaml builds the full 4-target matrix on tags).
+      - name: Dry-run release build
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --snapshot --single-target --config .goreleaser.chinit.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

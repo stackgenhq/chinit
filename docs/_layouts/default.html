@@ -1,0 +1,61 @@
+{%- comment -%}
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+{%- endcomment -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {%- comment -%}
+    jekyll-seo-tag emits <title>, meta description, canonical URL,
+    Open Graph, and Twitter card tags. Per-page snippets come from
+    each page's `description:` front matter (falling back to the
+    site description in _config.yml).
+  {%- endcomment -%}
+  {% seo %}
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Cpath d='M32 14v18M21.5 21.5a15 15 0 1 0 21 0' fill='none' stroke='%23ffffff' stroke-width='5.5' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
+  {%- include mermaid-loader.html -%}
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+  <aside class="sidebar">
+    <a class="brand" href="{{ '/' | relative_url }}">
+      <span class="brand-mark">⏻</span>
+      <span class="brand-name">chinit</span>
+    </a>
+    <p class="tagline"><em>ch-init</em> · ClickHouse init<br>node bootstrapper for cloud VMs</p>
+    <p class="sidebar-badges">
+      <a href="https://github.com/stackgenhq/chinit/releases"><img src="https://img.shields.io/github/v/release/stackgenhq/chinit?include_prereleases&amp;color=2563eb" alt="Latest release" loading="lazy"></a>
+      <a href="https://github.com/stackgenhq/chinit/stargazers"><img src="https://img.shields.io/github/stars/stackgenhq/chinit" alt="GitHub stars" loading="lazy"></a>
+    </p>
+    <nav>
+      {% include nav.html %}
+    </nav>
+    <a class="star-cta" href="https://github.com/stackgenhq/chinit">
+      ★ Star chinit on GitHub
+    </a>
+    <p class="side-links">
+      <a href="https://github.com/stackgenhq/chinit/releases">Releases</a>
+      · <a href="https://github.com/stackgenhq/chinit/issues">Issues</a>
+      · <a href="https://github.com/stackgenhq/chinit/blob/main/CONTRIBUTING.md">Contribute</a>
+      · <a href="https://github.com/stackgenhq/chinit/blob/main/SECURITY.md">Security</a>
+    </p>
+  </aside>
+  <main id="content">
+    {{ content }}
+    <footer class="doc-footer">
+      <span>Apache-2.0 · StackGen, Inc.</span>
+      <span>
+        {%- if page.path %}
+        <a href="https://github.com/stackgenhq/chinit/edit/main/docs/{{ page.path }}">Edit this page on GitHub</a>
+        ·
+        {%- endif %}
+        <a href="https://github.com/stackgenhq/chinit/issues/new">Found a docs bug?</a>
+      </span>
+    </footer>
+  </main>
+  {%- include site-enhancements.html -%}
+</body>
+</html>

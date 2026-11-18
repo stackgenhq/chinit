@@ -1,0 +1,71 @@
+{%- comment -%}
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+
+  Progressive-enhancement UX helpers (no build plugin, no
+  dependencies — GitHub Pages compatible):
+
+  1. Copy-to-clipboard button on every fenced code block, so
+     install/boot commands can be copied in one click.
+  2. Hover "¶" anchor links on h2/h3 headings, so any section of
+     the docs can be deep-linked and shared.
+  3. Horizontal-scroll wrapper around tables, so wide comparison
+     tables remain readable on phones.
+{%- endcomment -%}
+<script>
+  (function () {
+    /* --- 1. Copy buttons on code blocks --- */
+    function copyText(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text);
+      }
+      return new Promise(function (resolve, reject) {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand("copy") ? resolve() : reject(new Error("copy failed")); }
+        catch (e) { reject(e); }
+        document.body.removeChild(ta);
+      });
+    }
+    Array.prototype.forEach.call(document.querySelectorAll("main pre"), function (pre) {
+      if (pre.parentNode && pre.parentNode.classList && pre.parentNode.classList.contains("mermaid-figure")) return;
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "copy-btn";
+      btn.textContent = "Copy";
+      btn.setAttribute("aria-label", "Copy code block to clipboard");
+      btn.addEventListener("click", function () {
+        copyText(pre.innerText).then(function () {
+          btn.textContent = "Copied ✓";
+          btn.classList.add("copied");
+          setTimeout(function () { btn.textContent = "Copy"; btn.classList.remove("copied"); }, 1600);
+        }).catch(function () {
+          btn.textContent = "Select & copy";
+        });
+      });
+      pre.appendChild(btn);
+    });
+
+    /* --- 2. Heading anchor links --- */
+    Array.prototype.forEach.call(document.querySelectorAll("main h2[id], main h3[id], main h4[id]"), function (h) {
+      var a = document.createElement("a");
+      a.className = "anchor-link";
+      a.href = "#" + h.id;
+      a.setAttribute("aria-label", "Link to this section");
+      a.textContent = "¶";
+      h.appendChild(a);
+    });
+
+    /* --- 3. Wrap wide tables so they scroll sideways on phones --- */
+    Array.prototype.forEach.call(document.querySelectorAll("main table"), function (table) {
+      var wrap = document.createElement("div");
+      wrap.className = "table-wrap";
+      table.parentNode.insertBefore(wrap, table);
+      wrap.appendChild(table);
+    });
+  })();
+</script>

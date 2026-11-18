@@ -1,0 +1,10 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Terraform module dirs: local init artifacts and state must never be
+# committed (the modules are consumable sources, not roots to apply).
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+*.tfplan

@@ -1,0 +1,26 @@
+-- Copyright (C) 2026 StackGen, Inc. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- Bootstrap schema (a bundle member: chinit executes it idempotently on
+-- every server node at boot — the durable home for the fleet's DDL, so
+-- a fully-churned fleet re-materializes its own tables).
+--
+-- INTENTIONALLY EMPTY by default. Schema is the consumer's business
+-- layer, not the contract's: bring your DDL through the config_files
+-- extension hook, e.g.
+--
+--   config_files = {
+--     "configs/bootstrap-ddl.sql" = file("${path.module}/schema.sql")
+--   }
+--
+-- A comment-only file is a safe no-op: chinit's statement splitter
+-- finds no CREATE statements and the boot logs "0 statement(s)
+-- applied" — your tables arrive via your own DDL (or schema-sync from
+-- peers).
+--
+-- Writing yours: ${shard}/${replica} are CLICKHOUSE macros, substituted
+-- server-side at DDL time from the node's rendered macros config.
+-- Every statement must be IF NOT EXISTS. For an EXISTING replicated
+-- table the columns and TTL must match keeper's /metadata znode
+-- EXACTLY or the replica attach fails (Code 342) — change live tables
+-- with ALTER first, then mirror the change in the bundle.

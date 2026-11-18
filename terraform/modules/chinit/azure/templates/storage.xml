@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+
+  ClickHouse tiered storage on Azure Blob: hot parts on the local
+  default disk, cold parts on Blob behind a local cache wrapper.
+
+  KEYLESS BY DESIGN: no account_name/account_key/connection_string in
+  this disk — ClickHouse's auth fallback chain (AzureBlobStorageCommon.cpp
+  getAuthMethod) lands on ManagedIdentityCredential, i.e. the VM's
+  managed identity. The module grants that identity Storage Blob Data
+  Contributor on the storage account; RBAC is the whole auth story and
+  no storage key ever enters Terraform state, the bundle, or user data.
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <default>
+                <keep_free_space_bytes>10737418240</keep_free_space_bytes>
+            </default>
+
+            <azure_blob>
+                <type>azure_blob_storage</type>
+                <storage_account_url>${storage_account_url}</storage_account_url>
+                <container_name>${container_name}</container_name>
+                <!-- Managed identity auth: leave account name/key unset. -->
+                <container_already_exists>true</container_already_exists>
+            </azure_blob>
+
+            <azure_blob_cache>
+                <type>cache</type>
+                <disk>azure_blob</disk>
+                <path>/var/lib/clickhouse/disks/azure_cache/</path>
+                <max_size>${cache_max_size_bytes}</max_size>
+                <cache_on_write_operations>true</cache_on_write_operations>
+            </azure_blob_cache>
+        </disks>
+
+        <policies>
+            <tiered>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                        <volume_priority>1</volume_priority>
+                    </hot>
+                    <cold>
+                        <disk>azure_blob_cache</disk>
+                        <volume_priority>2</volume_priority>
+                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+                    </cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </tiered>
+        </policies>
+    </storage_configuration>
+</clickhouse>

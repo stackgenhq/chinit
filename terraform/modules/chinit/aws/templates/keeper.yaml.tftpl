@@ -1,0 +1,54 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CHK spec rendered by Terraform (uploaded as keeper.yaml) — the keeper
+# fleet's definition. chinit renders each keeper's single-file config from
+# it (raft server entries get their cloud DNS names at render time).
+#
+# server_id is cloud state (derives from the hostname ordinal with
+# myid-disk persistence) and deliberately does NOT live in this spec.
+apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: ${cluster_name}
+spec:
+  replicas: ${keeper_count}
+  configuration:
+    settings:
+      keeper_server/tcp_port: "9181"
+      keeper_server/raft_configuration/server/port: "9234"
+      keeper_server/log_storage_path: /var/lib/clickhouse-keeper/log
+      keeper_server/snapshot_storage_path: /var/lib/clickhouse-keeper/snapshots
+      keeper_server/coordination_settings/operation_timeout_ms: "10000"
+      keeper_server/coordination_settings/session_timeout_ms: "30000"
+      keeper_server/coordination_settings/raft_logs_level: "information"
+      keeper_server/hostname_checks_enabled: "true"
+    files:
+      # listen_host is a ROOT-level setting (keeper_server/listen_host
+      # is ignored — the ensemble stayed unreachable on 127.0.0.1 until
+      # it moved to a dedicated root-level file).
+      keeper-listen.xml: |
+        <clickhouse>
+            <listen_host>0.0.0.0</listen_host>
+        </clickhouse>
+      keeper-prometheus.xml: |
+        <clickhouse>
+            <prometheus>
+                <endpoint>/metrics</endpoint>
+                <port>9363</port>
+                <host>127.0.0.1</host>
+                <metrics>true</metrics>
+                <events>true</events>
+                <asynchronous_metrics>true</asynchronous_metrics>
+            </prometheus>
+        </clickhouse>
+      keeper-logging.xml: |
+        <clickhouse>
+            <logger>
+                <level>information</level>
+                <log>/var/log/clickhouse-keeper/clickhouse-keeper.log</log>
+                <errorlog>/var/log/clickhouse-keeper/clickhouse-keeper.err.log</errorlog>
+                <size>500M</size>
+                <count>5</count>
+            </logger>
+        </clickhouse>
