@@ -588,6 +588,11 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 	if result.Failed > 0 {
 		return fmt.Errorf("schema bootstrap: %d statement(s) failed (retrying; transient keeper races converge on the next pass)", result.Failed)
 	}
+	// Post-DDL reconciliation: a cas_config.enabled toggle lands as a
+	// storage.xml render BEFORE the server restarts — the on-disk table
+	// metadata (and ATTACHed live tables) must match the new policy set,
+	// or the restart Code 452s on tiered_cas tables whose disks vanished.
+	reconcileStoragePolicyMetadata(ctx)
 	return nil
 }
 

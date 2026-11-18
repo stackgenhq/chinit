@@ -170,10 +170,10 @@ var _ = Describe("configureServerEnv cloud gate", func() {
 	It("emits CH_CAS_SERVER_ROOT_ID for the storage.xml from_env contract", func() {
 		b := &Boot{
 			Spec: &model.BootSpec{
-				ClusterName: "ch-int-dev",
-				Role:        model.RoleWriter,
+				ClusterName:  "ch-int-dev",
+				Role:         model.RoleWriter,
 				S3DataBucket: "data-bucket",
-				CasEnabled:  true,
+				CasEnabled:   true,
 			},
 			Identity: model.NodeIdentity{Hostname: "writer-0"},
 			Provider: &stubProvider{name: "aws"},
