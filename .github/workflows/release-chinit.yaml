@@ -169,7 +169,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_name }}"
-          for i in $(seq 1 20); do
+          for _ in $(seq 1 20); do
             if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
                 --json assets --jq '.assets | length >= 5' | grep -q true; then
               echo "release assets published"

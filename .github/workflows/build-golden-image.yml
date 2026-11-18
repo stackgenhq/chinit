@@ -95,8 +95,8 @@ jobs:
           # Get short SHA
           GIT_SHA=$(git rev-parse --short HEAD)
           
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "git_sha=$GIT_SHA" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "git_sha=$GIT_SHA" >> "$GITHUB_OUTPUT"
           echo "Computed version: $VERSION (sha: $GIT_SHA)"
 
       - name: Setup Packer
@@ -138,6 +138,7 @@ jobs:
       - name: Packer Build
         run: |
           cd ${{ env.PACKER_DIR }}
+          # shellcheck disable=SC2086
           packer build \
             -var "image_version=${{ steps.version.outputs.version }}" \
             -var "git_sha=${{ steps.version.outputs.git_sha }}" \
@@ -148,14 +149,16 @@ jobs:
 
       - name: Output Image ID
         run: |
-          echo "## Golden Image Built Successfully! 🎉" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit:** ${{ steps.version.outputs.git_sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image version:** ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "To use this image, update your tfvars (subscription/RG from your environment):" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
-          # subscription/RG/gallery left as placeholders: the step summary is NOT masked (add-mask covers logs only)
-          echo "golden_image_id  = \"/subscriptions/<subscription>/resourceGroups/<rg>/providers/Microsoft.Compute/galleries/<gallery>/images/clickhouse-node/versions/${{ steps.version.outputs.version }}\"" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Golden Image Built Successfully! 🎉"
+            echo ""
+            echo "**Version:** ${{ steps.version.outputs.version }}"
+            echo "**Commit:** ${{ steps.version.outputs.git_sha }}"
+            echo ""
+            echo "**Image version:** ${{ steps.version.outputs.version }}"
+            echo "To use this image, update your tfvars (subscription/RG from your environment):"
+            echo "\`\`\`hcl"
+            # subscription/RG/gallery left as placeholders: the step summary is NOT masked (add-mask covers logs only)
+            echo "golden_image_id  = \"/subscriptions/<subscription>/resourceGroups/<rg>/providers/Microsoft.Compute/galleries/<gallery>/images/clickhouse-node/versions/${{ steps.version.outputs.version }}\""
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -28,6 +28,10 @@ on:
         description: "Altinity Antalya ClickHouse version (e.g. 26.6.8.20004.altinityantalya; empty = default)"
         required: false
         default: ""
+      chinit_version:
+        description: "chinit version override (e.g. 0.1.2; empty = packer default)"
+        required: false
+        default: ""
       build_flavor:
         description: "Package repo flavor(s) to build in parallel: both (default), upstream, or antalya"
         required: false
@@ -89,22 +93,24 @@ jobs:
     # The workflow_run arm ALSO gates on the triggering release's
     # conclusion: a failed release bumped no pin, so building would
     # only re-bake the previous generation on a 15-45min build slot.
-    # Both upstream and antalya build in parallel by default unless a single
-    # flavor is explicitly selected on workflow_dispatch.
+    # NOTE: job-level `if:` cannot reference `matrix.*` in GitHub Actions;
+    # flavor filtering happens in `strategy.matrix.flavor` via fromJSON().
     if: >-
       (github.event_name != 'workflow_dispatch' || !inputs.publish) &&
-      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') &&
-      (github.event_name != 'workflow_dispatch' || inputs.build_flavor == 'both' || inputs.build_flavor == '' || inputs.build_flavor == matrix.flavor)
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - flavor: upstream
-            default_clickhouse_version: "26.8.36.3"
-          - flavor: antalya
-            default_clickhouse_version: "26.6.8.20004.altinityantalya"
+        flavor: >-
+          ${{
+            fromJSON(
+              github.event_name == 'workflow_dispatch' && inputs.build_flavor == 'upstream' && '["upstream"]' ||
+              github.event_name == 'workflow_dispatch' && inputs.build_flavor == 'antalya' && '["antalya"]' ||
+              '["upstream", "antalya"]'
+            )
+          }}
 
     steps:
       - name: Mask account identifiers
@@ -134,38 +140,39 @@ jobs:
         run: packer init ${{ env.PACKER_DIR }}
 
       - name: Verify the chinit release exists (fail fast, no wait)
+        id: chinit_ver
         # The tag lives in THIS repo — ls-remote authenticates with the
         # workflow GITHUB_TOKEN (contents:read) so the check works on a
         # private repo too.
-        # The chinit download itself moved to the LAST packer install
-        # step (see clickhouse.pkr.hcl): the builder spends ~10 minutes
-        # on apt/ClickHouse/backup/AWS-CLI/OTEL installs FIRST, and the
-        # GoReleaser publish (which races every packer/** push — three
-        # builds failed on the 404 before this) finishes during them.
-        # This step only checks the tag exists so a typo'd pin fails in
-        # seconds instead of after a 15-minute build.
+        # Priority for CHINIT_VERSION:
+        #   1. workflow_dispatch inputs.chinit_version (when set)
+        #   2. workflow_run head_branch from "Release chinit" (e.g. v0.1.2 —
+        #      ensures the chained AMI build always bakes the newly released
+        #      tag even when roll-ami cannot push directly to protected main)
+        #   3. default pin in clickhouse.pkr.hcl
         run: |
-          CHINIT_VERSION=$(awk '/variable "chinit_version"/,/^\}/' \
-            ${{ env.PACKER_DIR }}/clickhouse.pkr.hcl \
-            | grep -oE 'default *= *"[0-9.]+"' | head -1 \
-            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          [ -z "$CHINIT_VERSION" ] && { echo "chinit_version default not found in packer template"; exit 1; }
-          # chinit releases are bare semver tags (v0.2.0+): GoReleaser OSS
-          # publishes under the CURRENT_TAG ref, which must be semver — the
-          # old chinit-v* prefix failed the git-state and semver checks.
-          # The fail-fast checks the git TAG via ls-remote: the REST API
-          # 403s from shared runner IPs (unauthenticated rate limits —
-          # the third live failure shape), and the RELEASE object itself
-          # races the GoReleaser publish (the second shape). The tag is
-          # instantly visible; assets publish during the build's ~10
-          # minutes of package installs and the last step polls for
-          # whatever window remains.
+          CHINIT_VERSION="${{ github.event.inputs.chinit_version }}"
+          CHINIT_VERSION="${CHINIT_VERSION#v}"
+          if [ -z "$CHINIT_VERSION" ] && [ "${{ github.event_name }}" = "workflow_run" ]; then
+            WF_BRANCH="${{ github.event.workflow_run.head_branch }}"
+            if echo "$WF_BRANCH" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              CHINIT_VERSION="${WF_BRANCH#v}"
+            fi
+          fi
+          if [ -z "$CHINIT_VERSION" ]; then
+            CHINIT_VERSION=$(awk '/variable "chinit_version"/,/^\}/' \
+              "${{ env.PACKER_DIR }}/clickhouse.pkr.hcl" \
+              | grep -oE 'default *= *"[0-9.]+"' | head -1 \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          fi
+          [ -z "$CHINIT_VERSION" ] && { echo "chinit_version not found"; exit 1; }
           echo "checking chinit ${CHINIT_VERSION} tag (the release + assets may still be publishing — the build's last step waits)"
           git ls-remote --tags "https://x-access-token:${GITHUB_TOKEN}@github.com/stackgenhq/chinit.git" "refs/tags/v${CHINIT_VERSION}" \
             | grep -q "v${CHINIT_VERSION}" \
             || { echo "chinit v${CHINIT_VERSION} tag not found"; exit 1; }
-          mkdir -p ${{ env.PACKER_DIR }}/chinit-artifacts
-          echo "$CHINIT_VERSION" > ${{ env.PACKER_DIR }}/chinit-artifacts/.version
+          mkdir -p "${{ env.PACKER_DIR }}/chinit-artifacts"
+          echo "$CHINIT_VERSION" > "${{ env.PACKER_DIR }}/chinit-artifacts/.version"
+          echo "chinit_version=$CHINIT_VERSION" >> "$GITHUB_OUTPUT"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -195,25 +202,31 @@ jobs:
             if [ -z "$CH_VER" ] && [ "${{ github.event.inputs.build_flavor }}" = "antalya" ]; then
               CH_VER="${{ github.event.inputs.clickhouse_version }}"
             fi
+            [ -z "$CH_VER" ] && CH_VER="26.6.8.20004.altinityantalya"
           else
             CH_VER="${{ github.event.inputs.clickhouse_version }}"
+            [ -z "$CH_VER" ] && CH_VER="26.8.36.3"
           fi
-          [ -z "$CH_VER" ] && CH_VER="${{ matrix.default_clickhouse_version }}"
+          CHINIT_VER="${{ steps.chinit_ver.outputs.chinit_version }}"
           # Pass -var-file FIRST so explicit -var clickhouse_version / build_flavor
           # overrides defaults.pkrvars.hcl (in Packer HCL2 later vars win).
           packer build \
-            -var-file=${{ env.PACKER_DIR }}/defaults.pkrvars.hcl \
+            -var-file="${{ env.PACKER_DIR }}/defaults.pkrvars.hcl" \
             -var "region=${{ env.AWS_REGION }}" \
             -var "chinit_download_token=${CHINIT_DOWNLOAD_TOKEN}" \
+            -var "chinit_version=${CHINIT_VER}" \
             -var "build_flavor=${FLAVOR}" \
             -var "clickhouse_version=${CH_VER}" \
             -var "build_id=${BUILD_ID}" \
-            ${{ env.PACKER_DIR }}/clickhouse.pkr.hcl \
+            "${{ env.PACKER_DIR }}/clickhouse.pkr.hcl" \
             | tee build.log
           # Extract the produced AMI id from the log
           AMI_ID=$(grep -oE 'ami-[a-z0-9]+' build.log | tail -1)
-          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
-          echo "clickhouse_version=$CH_VER" >> "$GITHUB_OUTPUT"
+          {
+            echo "ami_id=$AMI_ID"
+            echo "clickhouse_version=$CH_VER"
+            echo "chinit_version=$CHINIT_VER"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prune old ${{ matrix.flavor }} generations (keep ${{ env.KEEP_GENERATIONS }})
         run: |
@@ -276,6 +289,7 @@ jobs:
             --query 'Reservations[].Instances[].InstanceId' --output text)
           if [ -n "$IDS" ]; then
             echo "terminating instances: $IDS"
+            # shellcheck disable=SC2086
             aws ec2 terminate-instances --region "${{ env.AWS_REGION }}" --instance-ids $IDS || true
           fi
 
@@ -287,7 +301,8 @@ jobs:
           done
 
           if [ -n "$IDS" ]; then
-            for i in $(seq 1 24); do
+            for _ in $(seq 1 24); do
+              # shellcheck disable=SC2086
               STATE=$(aws ec2 describe-instances --region "${{ env.AWS_REGION }}" --instance-ids $IDS \
                 --query 'Reservations[].Instances[].State.Name' --output text)
               case "$STATE" in *pending*|*running*|*stopping*|*shutting-down*) sleep 5;; *) break;; esac
@@ -315,16 +330,19 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## Golden AMI built (${{ matrix.flavor }}) 🎉" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Flavor:** \`${{ matrix.flavor }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **ClickHouse version:** \`${{ steps.build.outputs.clickhouse_version }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **AMI id:** \`${{ steps.build.outputs.ami_id }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "To use it, set in tfvars:" >> "$GITHUB_STEP_SUMMARY"
-          echo '```hcl' >> "$GITHUB_STEP_SUMMARY"
-          echo "golden_ami_id = \"${{ steps.build.outputs.ami_id }}\"" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Golden AMI built (${{ matrix.flavor }}) 🎉"
+            echo ""
+            echo "- **Flavor:** \`${{ matrix.flavor }}\`"
+            echo "- **ClickHouse version:** \`${{ steps.build.outputs.clickhouse_version }}\`"
+            echo "- **chinit version:** \`${{ steps.build.outputs.chinit_version }}\`"
+            echo "- **AMI id:** \`${{ steps.build.outputs.ami_id }}\`"
+            echo ""
+            echo "To use it, set in tfvars:"
+            echo '```hcl'
+            echo "golden_ami_id = \"${{ steps.build.outputs.ami_id }}\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # The PUBLIC share flavor: unencrypted root snapshot + public launch
   # permission (AWS refuses public encrypted AMIs), Author=stackgen.com
@@ -332,20 +350,20 @@ jobs:
   # publish=true. Keeps exactly one published generation per flavor.
   publish-public:
     name: Publish public AMI flavor (${{ matrix.flavor }})
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      inputs.publish &&
-      (inputs.build_flavor == 'both' || inputs.build_flavor == '' || inputs.build_flavor == matrix.flavor)
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - flavor: upstream
-            default_clickhouse_version: "26.8.36.3"
-          - flavor: antalya
-            default_clickhouse_version: "26.6.8.20004.altinityantalya"
+        flavor: >-
+          ${{
+            fromJSON(
+              inputs.build_flavor == 'upstream' && '["upstream"]' ||
+              inputs.build_flavor == 'antalya' && '["antalya"]' ||
+              '["upstream", "antalya"]'
+            )
+          }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -383,10 +401,16 @@ jobs:
             if [ -z "$CH_VER" ] && [ "${{ github.event.inputs.build_flavor }}" = "antalya" ]; then
               CH_VER="${{ github.event.inputs.clickhouse_version }}"
             fi
+            [ -z "$CH_VER" ] && CH_VER="26.6.8.20004.altinityantalya"
           else
             CH_VER="${{ github.event.inputs.clickhouse_version }}"
+            [ -z "$CH_VER" ] && CH_VER="26.8.36.3"
           fi
-          [ -z "$CH_VER" ] && CH_VER="${{ matrix.default_clickhouse_version }}"
+          CHINIT_VER="${{ github.event.inputs.chinit_version }}"
+          CHINIT_VER="${CHINIT_VER#v}"
+          EXTRA=""
+          [ -n "$CHINIT_VER" ] && EXTRA="-var chinit_version=${CHINIT_VER}"
+          # shellcheck disable=SC2086
           packer build \
             -var-file=images/aws/defaults.pkrvars.hcl \
             -var "region=${{ env.AWS_REGION }}" \
@@ -396,11 +420,14 @@ jobs:
             -var "ami_author=stackgen.com" \
             -var "chinit_download_token=${CHINIT_DOWNLOAD_TOKEN}" \
             -var "build_id=${BUILD_ID}" \
+            $EXTRA \
             images/aws/clickhouse.pkr.hcl \
             | tee build.log
           AMI_ID=$(grep -oE 'ami-[a-z0-9]+' build.log | tail -1)
-          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
-          echo "clickhouse_version=$CH_VER" >> "$GITHUB_OUTPUT"
+          {
+            echo "ami_id=$AMI_ID"
+            echo "clickhouse_version=$CH_VER"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Retire the previous public ${{ matrix.flavor }} generation
         # One published generation per flavor: the newest stays, older public AMIs
@@ -424,7 +451,7 @@ jobs:
               --image-ids "$AMI" \
               --query "Images[0].BlockDeviceMappings[0].Ebs.SnapshotId" --output text)
             echo "retiring public AMI $AMI (snapshot $SNAP)"
-            aws ec2 deregister-image --region "${{ env.AWS_REGION }}" --image-id "$AMI"
+            aws ec2 deregister-image --region ${{ env.AWS_REGION }} --image-id "$AMI"
             [ "$SNAP" != "None" ] && aws ec2 delete-snapshot --region "${{ env.AWS_REGION }}" --snapshot-id "$SNAP"
           done
 
@@ -438,6 +465,7 @@ jobs:
             --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
                       "Name=instance-state-name,Values=pending,running,stopping,stopped" \
             --query 'Reservations[].Instances[].InstanceId' --output text)
+          # shellcheck disable=SC2086
           [ -n "$IDS" ] && aws ec2 terminate-instances --region "${{ env.AWS_REGION }}" --instance-ids $IDS || true
           for kp in $(aws ec2 describe-key-pairs --region "${{ env.AWS_REGION }}" \
               --filters "Name=tag:BuildId,Values=${BUILD_ID}" \
@@ -452,10 +480,12 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## Public AMI published (${{ matrix.flavor }}) 🌍" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Flavor:** \`${{ matrix.flavor }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **ClickHouse version:** \`${{ steps.build.outputs.clickhouse_version }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **AMI id:** \`${{ steps.build.outputs.ami_id }}\` (us-west-2, launchable by any AWS account)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Author tag: stackgen.com" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Public AMI published (${{ matrix.flavor }}) 🌍"
+            echo ""
+            echo "- **Flavor:** \`${{ matrix.flavor }}\`"
+            echo "- **ClickHouse version:** \`${{ steps.build.outputs.clickhouse_version }}\`"
+            echo "- **AMI id:** \`${{ steps.build.outputs.ami_id }}\` (us-west-2, launchable by any AWS account)"
+            echo ""
+            echo "Author tag: stackgen.com"
+          } >> "$GITHUB_STEP_SUMMARY"
