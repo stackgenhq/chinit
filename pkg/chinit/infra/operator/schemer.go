@@ -528,6 +528,8 @@ func (r *SchemaRunner) ReplicaKeeperPathExists(ctx context.Context, request doma
 	if err != nil {
 		return false, err
 	}
+	for result.Rows != nil && result.Rows.Next() {
+	}
 	return n > 0, nil
 }
 

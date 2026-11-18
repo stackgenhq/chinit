@@ -83,6 +83,8 @@ func (p *HealthProbe) PingHost(ctx context.Context, request port.HealthPingReque
 	if _, err := result.Int(); err != nil {
 		return port.HealthHostResult{}, err
 	}
+	for result.Rows != nil && result.Rows.Next() {
+	}
 	return port.HealthHostResult{Address: request.Host.Address}, nil
 }
 
@@ -108,6 +110,8 @@ func (p *HealthProbe) QueryVersion(ctx context.Context, request port.HealthPingR
 	s, err := result.String()
 	if err != nil {
 		return "", err
+	}
+	for result.Rows != nil && result.Rows.Next() {
 	}
 	return strings.TrimSpace(s), nil
 }

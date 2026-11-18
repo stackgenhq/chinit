@@ -931,7 +931,12 @@ func (b *Boot) adoptServerUUID(ctx context.Context) {
 		logger.GetLogger(ctx).Warn("server uuid seeding skipped", "err", err.Error())
 		return
 	}
-	if writeErr := os.WriteFile(uuidFile, []byte(b.serverRootID()+"\n"), 0640); writeErr != nil {
+	// IMPORTANT: ClickHouse's ServerUUID::load (src/Core/ServerUUID.cpp:44-45)
+	// runs readUUIDText(uuid, in) followed immediately by assertEOF(in). A
+	// trailing '\n' trips Code 27 CANNOT_PARSE_INPUT_ASSERTION_FAILED
+	// ("expected 'eof' before: '\n'") and causes ClickHouse to overwrite the
+	// file with a random UUIDv4. Write the exact 36-byte UUID string.
+	if writeErr := os.WriteFile(uuidFile, []byte(b.serverRootID()), 0640); writeErr != nil {
 		logger.GetLogger(ctx).Warn("server uuid seeding skipped", "err", writeErr.Error())
 		return
 	}
@@ -941,10 +946,15 @@ func (b *Boot) adoptServerUUID(ctx context.Context) {
 }
 
 // statefulNode reports whether the machine carries ClickHouse data state
-// (/var/lib/clickhouse/store, the MergeTree write path). The metadata disk
-// is the CAS claim surface — its presence, not the EBS volume itself,
-// decides whether a uuid rewrite would orphan a live server-root anchor.
+// (/var/lib/clickhouse/store, the MergeTree write path) from a completed
+// boot. Before first_boot_done is written by start_clickhouse, any store/
+// directory on root/EBS is image-bake residue that start_clickhouse wipes.
 func (b *Boot) statefulNode() bool {
+	if chStorePath() == "/var/lib/clickhouse/store" {
+		if _, err := os.Stat("/var/lib/clickhouse/first_boot_done"); os.IsNotExist(err) {
+			return false
+		}
+	}
 	entries, err := os.ReadDir(chStorePath())
 	if err != nil {
 		return false

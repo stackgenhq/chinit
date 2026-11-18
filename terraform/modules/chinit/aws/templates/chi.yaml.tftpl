@@ -74,7 +74,9 @@ spec:
       merge_tree/parts_to_throw_insert: "3000"
       merge_tree/merge_with_ttl_timeout: "300"
       merge_tree/ttl_only_drop_parts: "1"
-      merge_tree/execute_merges_on_single_replica_time_threshold: "3600"
+      merge_tree/execute_merges_on_single_replica_time_threshold: "0"
+      merge_tree/prefer_fetch_merged_part_time_threshold: "1"
+      merge_tree/prefer_fetch_merged_part_size_threshold: "1"
       # Query/system log bounds: a log table without a TTL is worse than
       # unbounded — a rotated, readonly log never runs TTL drops.
       query_log/partition_by: "toYYYYMM(event_date)"
@@ -90,10 +92,15 @@ spec:
         <clickhouse>
             <logger>
                 <level>${log_level}</level>
+                <errorlog_level>error</errorlog_level>
                 <log>/var/log/clickhouse-server/clickhouse-server.log</log>
                 <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
                 <size>1000M</size>
                 <count>10</count>
+                <levels>
+                    <MergeMutateSelectedEntry>error</MergeMutateSelectedEntry>
+                    <CurrentlyMergingPartsTagger>error</CurrentlyMergingPartsTagger>
+                </levels>
                 <formatting>
                     <type>json</type>
                     <names>

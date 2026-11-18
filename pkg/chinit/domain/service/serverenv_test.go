@@ -136,7 +136,7 @@ var _ = Describe("configureServerEnv cloud gate", func() {
 		Expect(b.configureServerEnv(context.Background())).To(Succeed())
 		data, err := os.ReadFile(uuidFile)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(data)).To(Equal(deterministicServerUUID("ch-int-dev", "reader-0") + "\n"))
+		Expect(string(data)).To(Equal(deterministicServerUUID("ch-int-dev", "reader-0")))
 		Expect(deterministicServerUUID("ch-int-dev", "reader-0")).NotTo(Equal(deterministicServerUUID("ch-int-dev", "reader-1")))
 	})
 

@@ -345,6 +345,12 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 	if b.Spec.Role != model.RoleKeeper {
 		return nil
 	}
+	if b.Identity.Hostname == "" && b.Meta.PrivateIP != "" {
+		if h, ord := StaticHostname(b.Meta.PrivateIP); h != "" {
+			b.Identity.Hostname = h
+			b.Identity.CROrdinal = ord
+		}
+	}
 	// RENDER the complete keeper config from the CHK spec (the same
 	// single-file chctl path the bash era ran): keeper launches with
 	// an explicit --config so config.d auto-include is DISABLED
