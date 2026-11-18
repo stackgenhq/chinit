@@ -51,7 +51,7 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.check.outputs.enabled == 'true'
       - uses: actions/configure-pages@v5
         if: steps.check.outputs.enabled == 'true'
