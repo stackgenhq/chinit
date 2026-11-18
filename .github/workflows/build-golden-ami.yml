@@ -13,9 +13,13 @@ name: Build ClickHouse Golden AMI (AWS)
 # values are auto-masked in public logs; a repo variable would print the
 # role ARN (and the account ID embedded in it) verbatim.
 #
-# Cleanup: keeps the KEEP_GENERATIONS most recent AMIs tagged
-# Purpose=clickhouse-golden-ami in the region; deregisters older ones and
-# deletes their snapshots.
+# Cleanup: public AMIs are capped by the EC2 "Public AMIs" quota (5 per
+# region, L-0E3CBAB9), so the workflow keeps ONE public generation per
+# flavor (docs and consumers pin that id) and KEEP_GENERATIONS private
+# generations; deregisters the rest and deletes their snapshots. Slots
+# for the in-flight build are freed BEFORE the bake — Packer's
+# make-public step fails hard at the quota and a post-build prune could
+# never prevent that (run 44415088053).
 
 on:
   # Manual roll (optionally also building the PUBLIC share flavor):
@@ -82,6 +86,7 @@ env:
   AWS_REGION: us-west-2
   PACKER_DIR: images/aws
   KEEP_GENERATIONS: "3"
+  KEEP_PUBLIC_GENERATIONS: "1"
 
 permissions:
   id-token: write # OIDC
@@ -183,6 +188,55 @@ jobs:
           echo "chinit_version=$CHINIT_VERSION" >> "$GITHUB_OUTPUT"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Free public-AMI quota slots for this build (${{ matrix.flavor }})
+        # The EC2 "Public AMIs" quota (5 per region) counts images, and
+        # this build ADDS one public AMI per flavor. Deregister the
+        # oldest PUBLIC generations of this flavor BEFORE the bake so
+        # Packer's make-public step cannot hit ResourceLimitExceeded
+        # mid-build (run 44415088053) — a post-build prune runs too
+        # late and its 3x2-flavor schedule exceeded the quota anyway.
+        # The just-built AMI keeps public capacity for its own flavor;
+        # private generations live outside the quota and are pruned
+        # after the build.
+        if: >-
+          github.event_name != 'workflow_dispatch' || inputs.publish
+        run: |
+          KEEP_PUBLIC=${KEEP_PUBLIC_GENERATIONS}
+          RESERVED=1 # this build will add one public AMI for this flavor
+          IDS=$(aws ec2 describe-images \
+            --region ${{ env.AWS_REGION }} \
+            --owners self \
+            --filters "Name=tag:Purpose,Values=clickhouse-golden-ami" \
+                      "Name=tag:Flavor,Values=${{ matrix.flavor }}" \
+            --query "sort_by(Images[?Public==\`true\`],&CreationDate)[].ImageId" \
+            --output text | tr '[:space:]' '\n' | grep '^ami-' || true)
+          TOTAL=$(echo "$IDS" | grep -c '^ami-' || true)
+          echo "public golden AMIs (${{ matrix.flavor }}): $TOTAL (pre-build cap: $((KEEP_PUBLIC + RESERVED - 1)))"
+          echo "$IDS" | head -n -$((KEEP_PUBLIC + RESERVED - 1)) | while read -r AMI; do
+            [ -z "$AMI" ] && continue
+            if grep -rF "$AMI" "$GITHUB_WORKSPACE" --exclude-dir=.git --exclude-dir=node_modules -q; then
+              echo "keeping $AMI — referenced in repository, skipping"
+              continue
+            fi
+            IN_USE=$(aws ec2 describe-instances --region "${{ env.AWS_REGION }}" \
+              --filters "Name=image-id,Values=$AMI" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'length(Reservations[].Instances[])' --output text)
+            if [ "$IN_USE" != "0" ]; then
+              echo "keeping $AMI — $IN_USE instance(s) still use it, skipping"
+              continue
+            fi
+            SNAP=$(aws ec2 describe-images --region "${{ env.AWS_REGION }}" \
+              --image-ids "$AMI" --query "Images[0].BlockDeviceMappings[0].Ebs.SnapshotId" --output text)
+            echo "deregistering public $AMI (snapshot $SNAP) to free a public-AMI quota slot"
+            aws ec2 deregister-image --region ${{ env.AWS_REGION }} --image-id "$AMI"
+            if [ "$SNAP" != "None" ]; then
+              aws ec2 modify-snapshot-attribute --region ${{ env.AWS_REGION }} \
+                --snapshot-id "$SNAP" --attribute createVolumePermission \
+                --operation-type remove --group-names all 2>/dev/null || true
+              aws ec2 delete-snapshot --region ${{ env.AWS_REGION }} --snapshot-id "$SNAP"
+            fi
+          done
 
       - name: Build (${{ matrix.flavor }})
         id: build
@@ -289,35 +343,17 @@ jobs:
             echo "public_ami=$PUBLIC_AMI"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Prune old ${{ matrix.flavor }} generations (keep ${{ env.KEEP_GENERATIONS }})
+      - name: Prune old ${{ matrix.flavor }} generations (keep 1 public / ${{ env.KEEP_GENERATIONS }} total)
         run: |
-          # List golden AMIs for THIS flavor oldest-first; deregister everything
-          # past the KEEP_GENERATIONS newest, then delete their (only) snapshot.
-          IDS=$(aws ec2 describe-images \
-            --region ${{ env.AWS_REGION }} \
-            --owners self \
-            --filters "Name=tag:Purpose,Values=clickhouse-golden-ami" \
-                      "Name=tag:Flavor,Values=${{ matrix.flavor }}" \
-            --query "sort_by(Images,&CreationDate)[].ImageId" \
-            --output text | tr '[:space:]' '\n' | grep '^ami-' || true)
-          TOTAL=$(echo "$IDS" | grep -c '^ami-' || true)
-          echo "golden AMIs (${{ matrix.flavor }}): $TOTAL (keeping newest ${{ env.KEEP_GENERATIONS }})"
-          echo "$IDS" | head -n -${{ env.KEEP_GENERATIONS }} | while read -r AMI; do
-            [ -z "$AMI" ] && continue
-            # Never prune an AMI the repo still references (e.g. a tfvars
-            # golden_ami_id that a copy-image was built from). The checked-out
-            # tree is $GITHUB_WORKSPACE — grep it before deregistering.
-            if grep -rF "$AMI" "$GITHUB_WORKSPACE" --exclude-dir=.git --exclude-dir=node_modules -q; then
-              echo "keeping $AMI — referenced in repository, skipping"
-              continue
-            fi
-            IN_USE=$(aws ec2 describe-instances --region "${{ env.AWS_REGION }}" \
-              --filters "Name=image-id,Values=$AMI" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-              --query 'length(Reservations[].Instances[])' --output text)
-            if [ "$IN_USE" != "0" ]; then
-              echo "keeping $AMI — $IN_USE instance(s) still use it, skipping"
-              continue
-            fi
+          set -uo pipefail
+          # Two-tier retention per flavor:
+          #   1. exactly KEEP_PUBLIC_GENERATIONS PUBLIC AMI(s) (the quota is
+          #      hard-capped at 5 public images/region account-wide; the
+          #      published AMI is the one docs and consumers pin), and
+          #   2. at most KEEP_GENERATIONS total generations.
+          retire() {
+            local AMI="$1"
+            local SNAP
             SNAP=$(aws ec2 describe-images --region "${{ env.AWS_REGION }}" \
               --image-ids "$AMI" --query "Images[0].BlockDeviceMappings[0].Ebs.SnapshotId" --output text)
             echo "deregistering $AMI (snapshot $SNAP)"
@@ -328,6 +364,41 @@ jobs:
                 --operation-type remove --group-names all 2>/dev/null || true
               aws ec2 delete-snapshot --region ${{ env.AWS_REGION }} --snapshot-id "$SNAP"
             fi
+          }
+          all_images() {
+            aws ec2 describe-images \
+              --region ${{ env.AWS_REGION }} \
+              --owners self \
+              --filters "Name=tag:Purpose,Values=clickhouse-golden-ami" \
+                        "Name=tag:Flavor,Values=${{ matrix.flavor }}" \
+              --query "$1" \
+              --output text | tr '[:space:]' '\n' | grep '^ami-' || true
+          }
+          referenced() {
+            grep -rF "$1" "$GITHUB_WORKSPACE" --exclude-dir=.git --exclude-dir=node_modules -q
+          }
+          in_use() {
+            [ "$(aws ec2 describe-instances --region "${{ env.AWS_REGION }}" \
+              --filters "Name=image-id,Values=$1" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'length(Reservations[].Instances[])' --output text)" != "0" ]
+          }
+          # Retire public generations beyond the newest KEEP_PUBLIC_GENERATIONS.
+          PUB_IDS=$(all_images "sort_by(Images[?Public==\`true\`],&CreationDate)[].ImageId")
+          echo "public AMIs (${{ matrix.flavor }}): $(echo "$PUB_IDS" | grep -c '^ami-' || true) (keeping newest ${KEEP_PUBLIC_GENERATIONS})"
+          echo "$PUB_IDS" | head -n -${KEEP_PUBLIC_GENERATIONS} | while read -r AMI; do
+            [ -z "$AMI" ] && continue
+            if referenced "$AMI"; then echo "keeping $AMI — referenced in repository, skipping"; continue; fi
+            if in_use "$AMI"; then echo "keeping $AMI — still in use by instances, skipping"; continue; fi
+            retire "$AMI"
+          done
+          # Retire total generations beyond KEEP_GENERATIONS (any visibility).
+          ALL_IDS=$(all_images "sort_by(Images,&CreationDate)[].ImageId")
+          echo "golden AMIs (${{ matrix.flavor }}): $(echo "$ALL_IDS" | grep -c '^ami-' || true) total (keeping newest ${{ env.KEEP_GENERATIONS }})"
+          echo "$ALL_IDS" | head -n -${{ env.KEEP_GENERATIONS }} | while read -r AMI; do
+            [ -z "$AMI" ] && continue
+            if referenced "$AMI"; then echo "keeping $AMI — referenced in repository, skipping"; continue; fi
+            if in_use "$AMI"; then echo "keeping $AMI — $IN_USE instance(s) still use it, skipping"; continue; fi
+            retire "$AMI"
           done
 
       # Packer cleans up its own temporary resources on success AND on
