@@ -91,8 +91,10 @@ spec:
       merge_tree/merge_with_ttl_timeout: "300"
       merge_tree/ttl_only_drop_parts: "1"
       merge_tree/execute_merges_on_single_replica_time_threshold: "0"
-      merge_tree/prefer_fetch_merged_part_time_threshold: "1"
-      merge_tree/prefer_fetch_merged_part_size_threshold: "1"
+      merge_tree/prefer_fetch_merged_part_time_threshold: "180"
+      merge_tree/prefer_fetch_merged_part_size_threshold: "1048576"
+      replicated_merge_tree/min_absolute_delay_to_close: "300"
+      replicated_merge_tree/min_relative_delay_to_close: "120"
       # Query/system log bounds: a log table without a TTL is worse than
       # unbounded — a rotated, readonly log never runs TTL drops.
       query_log/partition_by: "toYYYYMM(event_date)"
@@ -108,8 +110,7 @@ spec:
       global_profiler_cpu_time_period_ns: "${global_profiler_period_ns}"
 %{endif~}
 %{if otel_span_log_ttl_days > 0~}
-      opentelemetry_span_log/partition_by: "toYYYYMM(event_date)"
-      opentelemetry_span_log/ttl: "event_date + INTERVAL ${otel_span_log_ttl_days} DAY DELETE"
+      opentelemetry_span_log/engine: "ENGINE = MergeTree PARTITION BY toYYYYMM(finish_date) ORDER BY (finish_date, finish_time_us) TTL finish_date + INTERVAL ${otel_span_log_ttl_days} DAY DELETE"
 %{endif~}
 %{if trace_log_ttl_days > 0~}
       trace_log/partition_by: "toYYYYMM(event_date)"
