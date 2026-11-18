@@ -1374,13 +1374,20 @@ func (b *Boot) healthGate(ctx context.Context) error {
 	return nil
 }
 
-// retryGate runs the health gate's bounded schema-sync + re-probe loop
-// (shared by the error path and the degraded-report path).
+// retryGate runs the health gate's bounded peer-convergence + schema-sync +
+// re-probe loop (shared by the error path and the degraded-report path).
 func (b *Boot) retryGate(ctx context.Context, firstErr error) error {
 	err := firstErr
 	for attempt := 1; attempt <= healthRetryAttempts && ctx.Err() == nil; attempt++ {
-		logger.GetLogger(ctx).Warn("health gate degraded: retrying schema-sync before the final verdict",
+		logger.GetLogger(ctx).Warn("health gate degraded: converging peers and retrying schema-sync before the final verdict",
 			"attempt", attempt, "attempts", healthRetryAttempts)
+		if herr := b.configurePeerHosts(ctx); herr != nil {
+			logger.GetLogger(ctx).Warn("WARNING: health-gate peer-hosts convergence failed", "err", herr)
+		}
+		DropDNSCache(ctx)
+		if rerr := b.ConvergeRemoteServers(ctx); rerr != nil {
+			logger.GetLogger(ctx).Warn("WARNING: health-gate remote-servers convergence failed", "err", rerr)
+		}
 		if serr := b.gateSchemaSync(ctx); serr != nil {
 			logger.GetLogger(ctx).Warn("WARNING: health-gate schema-sync retry failed", "err", serr)
 		}
@@ -1479,7 +1486,7 @@ func (b *Boot) gateSchemaSync(ctx context.Context) error {
 	// holds no replica registrations worth pruning, but a REPLACEMENT
 	// must drop its predecessor's stale row before the create or the
 	// sync re-attaches the dead registration (Code 253).
-	return svc.SyncSchema(ctx, SchemaRequest{
+	err = svc.SyncSchema(ctx, SchemaRequest{
 		ClusterName:  b.Spec.ClusterName,
 		Credentials:  domain.Credentials{Username: "admin", Password: strings.TrimSpace(string(pw))},
 		NormalizedCR: cr,
@@ -1489,6 +1496,15 @@ func (b *Boot) gateSchemaSync(ctx context.Context) error {
 		Retries:        DefaultSchemaSyncRetries,
 		PruneStaleSelf: true,
 	})
+	if err == nil && b.Spec.Role != model.RoleWriter {
+		// HostCreateTables copies every Atomic-DB table (including writer-only S3Queue);
+		// re-run role-scoped DDL immediately so readers drop it at once instead of
+		// waiting 5 minutes for schema-bootstrap.timer.
+		if _, ddlErr := ApplyBootstrapDDL(ctx, b.Identity.Hostname, string(b.Spec.Role)); ddlErr != nil {
+			logger.GetLogger(ctx).Warn("WARNING: post-schema-sync DDL convergence failed", "err", ddlErr)
+		}
+	}
+	return err
 }
 
 var serverPrometheusPath = func() string { return filepath.Join(ConfigDir, "server-prometheus.xml") }
