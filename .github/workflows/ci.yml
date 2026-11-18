@@ -98,13 +98,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # E2E acceptance on the local Docker Compose cluster: the harness
-  # builds the chinit-node image from the PR's checkout, boots the full
-  # systemd cluster (keeper + writer + reader), and verifies the core
-  # promise — a row written on writer-0 replicates to reader-0 — plus
-  # keeper health, boot convergence, cluster topology, and replica
-  # writability. Runs on every PR (the same gate `go run
-  # ./acceptance_test/e2e.go` runs locally).
+  # E2E acceptance on the local Docker Compose cluster: the ginkgo
+  # suite builds the chinit-node image from the PR's checkout, boots the
+  # full systemd cluster (keeper + writer + reader), and verifies the
+  # core promise — a row written on writer-0 replicates to reader-0 —
+  # plus keeper health, boot convergence, cluster topology, and replica
+  # writability. Runs on every PR (the same gate `go test -tags
+  # acceptance ./acceptance_test/compose/` runs locally); the plain
+  # `go test ./...` unit gate never boots docker (build-tag gated).
   e2e-compose:
     name: e2e (docker compose)
     runs-on: ubuntu-latest
@@ -118,5 +119,5 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Run acceptance test
-        run: go run ./acceptance_test/e2e.go -timeout 25m
+      - name: Run acceptance suite
+        run: go test -tags acceptance ./acceptance_test/compose/ -timeout 25m -v

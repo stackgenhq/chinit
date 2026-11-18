@@ -56,10 +56,10 @@ docker compose exec writer-0 systemctl status clickhouse-server otelcol chinit-e
 The one-command gate for the whole stack — the same check CI runs on every PR:
 
 ```bash
-go run ./acceptance_test/e2e.go
+go test -tags acceptance ./acceptance_test/compose/ -timeout 30m -v
 ```
 
-The harness builds the `chinit-node` image from the **current checkout**, boots the cluster on fresh volumes, and verifies:
+The suite (a Ginkgo suite, gated behind the `acceptance` build tag so a plain `go test ./...` never boots docker) builds the `chinit-node` image from the **current checkout**, boots the cluster on fresh volumes, and verifies:
 
 1. Keeper answers `ruok → imok`
 2. `chinit-boot` finished on writer-0 and reader-0 (marker + live SQL ping)
@@ -67,7 +67,7 @@ The harness builds the `chinit-node` image from the **current checkout**, boots 
 4. **A row written on writer-0 arrives on reader-0** (ReplicatedMergeTree replication — the core promise)
 5. The `events` replica is writable with all replicas active
 
-Flags: `-keep` leaves the cluster up on success, `-reuse` re-checks a running cluster without rebuilding, `-timeout` bounds the run. A failure prints the compose status and the failing node's journals.
+Flags (via `go test -args`): `-args -keep-cluster` leaves the cluster up on success, `-args -reuse-cluster` re-checks a running cluster without rebuilding; a failed run always leaves the cluster up for inspection. A failure prints the compose status and the failing node's journals.
 
 ## Teardown
 

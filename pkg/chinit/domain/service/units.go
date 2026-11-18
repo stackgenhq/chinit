@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/altinity/clickhouse-operator/pkg/model/chi/backupconfig"
+
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 	chinitport "github.com/stackgenhq/chinit/pkg/chinit/domain/port"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/system"
