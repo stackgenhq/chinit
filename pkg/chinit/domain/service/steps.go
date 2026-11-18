@@ -455,20 +455,6 @@ func (b *Boot) restoreIdentity(ctx context.Context) error {
 	return nil
 }
 
-// settleIdentity derives or claims the node identity and registers DNS.
-// Static nodes (keepers/backup — and writers while the static path still
-// exists) map the IP octet; lease nodes (BOTH ASG roles — readers and,
-// since the writer-ASG rollout, writers) claim via the provider's
-// OrdinalClaimer. The capability is probed once, and its absence under
-// lease identity is Fatal (an ASG member without a claimer would boot
-// with the ephemeral ip-* name and break replication identity — the
-// exact production).
-//
-// The claim is role-aware: the claim sweeps ordinals within the ROLE'S
-// ASG max (Prefix/Count come from the spec's role fields — writer-
-// /WriterMax for writers, reader-/ReaderMax for readers), so a
-// scaled-out node claims the first free slot in [0, max) and never
-// exceeds the CR slot ceiling the CHI spec reserved.
 // HydrateIdentityFromState populates b.Identity from the persisted boot
 // state file when present for this instance. Called before the resume
 // engine runs so that if settle_identity is skipped ("already done") on a
@@ -498,6 +484,20 @@ func (b *Boot) HydrateIdentityFromState(statePath string) {
 	}
 }
 
+// settleIdentity derives or claims the node identity and registers DNS.
+// Static nodes (keepers/backup — and writers while the static path still
+// exists) map the IP octet; lease nodes (BOTH ASG roles — readers and,
+// since the writer-ASG rollout, writers) claim via the provider's
+// OrdinalClaimer. The capability is probed once, and its absence under
+// lease identity is Fatal (an ASG member without a claimer would boot
+// with the ephemeral ip-* name and break replication identity — the
+// exact production).
+//
+// The claim is role-aware: the claim sweeps ordinals within the ROLE'S
+// ASG max (Prefix/Count come from the spec's role fields — writer-
+// /WriterMax for writers, reader-/ReaderMax for readers), so a
+// scaled-out node claims the first free slot in [0, max) and never
+// exceeds the CR slot ceiling the CHI spec reserved.
 func (b *Boot) settleIdentity(ctx context.Context) error {
 	// Refresh mode: an in-place refresh of a converged node must keep the
 	// identity the cluster already knows — re-claiming here would renumber
