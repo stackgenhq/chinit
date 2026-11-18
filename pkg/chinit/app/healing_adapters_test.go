@@ -125,15 +125,17 @@ var _ = Describe("cliForceRestoreFlagger", func() {
 })
 
 var _ = Describe("ddlQueueReplicas & cliDDLTaskQueueCleaner", func() {
-	It("selects chi-*, localhost, and dead writer/reader entries (both :port and %3Aport) while sparing live claims and backup-0", func() {
+	It("selects chi-*, localhost, and dead writer/reader entries (both :port, %3Aport, and %2D/%2E escaped) while sparing live claims and backup-0", func() {
 		entries := ddlQueueReplicas{
 			"writer-0.example.internal:9010",
+			"writer%2D0%2Eexample%2Einternal:9440",
 			"writer-1.example.internal%3A9010",
+			"writer%2D4%2Eexample%2Einternal:9440",
 			"reader-0:9440",
-			"reader-1.example.internal:9010",
+			"reader%2D1%2Eexample%2Einternal:9010",
 			"localhost:9000",
 			"chi-demo-demo-01-2:9000",
-			"backup-0.example.internal:9010",
+			"backup%2D0%2Eexample%2Einternal:9010",
 		}
 		live := map[string]bool{
 			"writer-0": true,
@@ -142,6 +144,7 @@ var _ = Describe("ddlQueueReplicas & cliDDLTaskQueueCleaner", func() {
 		stale := entries.staleEntries(live, "writer-", "reader-")
 		Expect([]string(stale)).To(Equal([]string{
 			"writer-1.example.internal%3A9010",
+			"writer%2D4%2Eexample%2Einternal:9440",
 			"reader-0:9440",
 			"localhost:9000",
 			"chi-demo-demo-01-2:9000",
