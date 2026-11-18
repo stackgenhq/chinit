@@ -7,6 +7,7 @@ FROM --platform=$BUILDPLATFORM golang:1.27 AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH
+ARG CHINIT_VERSION=compose-dev
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -15,7 +16,7 @@ COPY cmd ./cmd
 COPY pkg ./pkg
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/chinit ./cmd/chinit
+    go build -trimpath -ldflags="-s -w -X github.com/stackgenhq/chinit/pkg/chinit/app.Version=${CHINIT_VERSION}" -o /out/chinit ./cmd/chinit
 
 FROM clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
 
@@ -67,6 +68,16 @@ RUN curl -fsSL --retry 3 --retry-delay 3 \
 
 COPY --from=builder /out/chinit /usr/local/bin/chinit
 RUN chmod 0755 /usr/local/bin/chinit
+
+# Bake default local Compose bundle, secrets, and per-role specs into the image
+# so a standalone copy-pasted compose.yaml works with zero extra local files,
+# while still allowing bind-mounts to override any of these paths.
+COPY deploy/compose/bundle /etc/chinit/bundle
+COPY deploy/compose/secrets /etc/chinit/secrets
+COPY deploy/compose/specs /etc/chinit/specs
+RUN chmod -R a+rX /etc/chinit/bundle /etc/chinit/specs \
+    && chmod 0700 /etc/chinit/secrets \
+    && chmod 0600 /etc/chinit/secrets/*
 
 COPY deploy/compose/entrypoint.sh /usr/local/bin/compose-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/compose-entrypoint.sh

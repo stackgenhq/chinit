@@ -36,11 +36,204 @@ sequenceDiagram
     VM->>VM: Install systemd maintenance timers & shutdown drain
 ```
 
-> **Want a full multi-node cluster out of the box?** The repository's [Terraform modules](https://github.com/stackgenhq/chinit/tree/main/terraform) automate every cloud resource in this guide — buckets, lease tables, Private DNS zones, KMS/Key Vault secrets, IAM/RBAC roles, and Auto Scaling Groups — for both [AWS](https://github.com/stackgenhq/chinit/tree/main/terraform/aws) and [Azure](https://github.com/stackgenhq/chinit/tree/main/terraform/azure).
+> **Want a full multi-node cluster out of the box?** Jump straight to [Try It Locally with Docker Compose](#try-it-locally-with-docker-compose-copy--paste) below to run a 3-node cluster on your laptop with a single copy-pasted `compose.yaml`, or use the repository's [Terraform modules](https://github.com/stackgenhq/chinit/tree/main/terraform) to provision every cloud resource automatically on [AWS](https://github.com/stackgenhq/chinit/tree/main/terraform/aws) and [Azure](https://github.com/stackgenhq/chinit/tree/main/terraform/azure).
 
 ---
 
-## Step 1: Install the Binary (or Launch the Golden AMI)
+## Try It Locally with Docker Compose (Copy & Paste)
+
+You can evaluate `chinit`'s full `systemd` boot pipeline, ordinal lease claiming (`writer-0`, `reader-0`), ClickHouse Keeper ensemble (`keeper-0`), OpenTelemetry log/metric/span shipping, and `ReplicatedMergeTree` replication locally using Docker Compose — **with zero cloud accounts and without cloning the repository**.
+
+GitHub Actions builds and publishes a multi-arch (`linux/amd64`, `linux/arm64`) node image to `ghcr.io/stackgenhq/chinit-node:latest` containing ClickHouse, `systemd`, `otelcol`, `/usr/local/bin/chinit`, and a pre-baked local configuration bundle, secrets, and per-role specs.
+
+### 1. Save this `compose.yaml` in any empty directory
+
+```yaml
+x-chinit-node: &chinit-node
+  image: ghcr.io/stackgenhq/chinit-node:latest
+  privileged: true
+  cgroup: host
+  stop_signal: SIGRTMIN+3
+  stop_grace_period: 30s
+  tmpfs:
+    - /run
+    - /run/lock
+  ulimits:
+    nofile:
+      soft: 262144
+      hard: 262144
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.118.0
+    command:
+      - |
+        --config=yaml:
+        receivers:
+          otlp:
+            protocols:
+              http:
+                endpoint: 0.0.0.0:4318
+        processors:
+          batch: {}
+        exporters:
+          debug:
+            verbosity: detailed
+        service:
+          pipelines:
+            logs:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
+            metrics:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
+            traces:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [debug]
+    ports:
+      - "4318:4318"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.5
+
+  keeper-0:
+    <<: *chinit-node
+    hostname: keeper-0
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_ROLE: keeper
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.20
+      CHINIT_INSTANCE_ID: compose-keeper-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ch-leases:/var/lib/chinit-cluster
+      - keeper-0-data:/var/lib/clickhouse-keeper
+      - keeper-0-ch:/var/lib/clickhouse
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.20
+        aliases:
+          - keeper-0
+          - keeper-0.ch.local
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && systemctl is-active --quiet clickhouse-keeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  writer-0:
+    <<: *chinit-node
+    hostname: writer-node-0
+    depends_on:
+      otel-collector:
+        condition: service_started
+      keeper-0:
+        condition: service_healthy
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_ROLE: writer
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.10
+      CHINIT_INSTANCE_ID: compose-writer-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ch-leases:/var/lib/chinit-cluster
+      - writer-0-data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "9150:9150"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && curl -sf http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  reader-0:
+    <<: *chinit-node
+    hostname: reader-node-0
+    depends_on:
+      otel-collector:
+        condition: service_started
+      keeper-0:
+        condition: service_healthy
+    environment:
+      CHINIT_CLOUD: compose
+      CHINIT_ROLE: reader
+      CHINIT_REGION: local
+      CHINIT_PRIVATE_IP: 10.142.0.30
+      CHINIT_INSTANCE_ID: compose-reader-0
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ch-leases:/var/lib/chinit-cluster
+      - reader-0-data:/var/lib/clickhouse
+    ports:
+      - "18123:8123"
+      - "19150:9150"
+    networks:
+      chnet:
+        ipv4_address: 10.142.0.30
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/cloud/instance/boot-finished && curl -sf http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+networks:
+  chnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.142.0.0/24
+
+volumes:
+  ch-leases:
+  keeper-0-data:
+  keeper-0-ch:
+  writer-0-data:
+  reader-0-data:
+```
+
+### 2. Boot the cluster and test replication
+
+```bash
+# Start all services and wait for chinit-boot healthchecks to turn green
+docker compose up -d --wait
+
+# Inspect chinit-boot journal, active systemd maintenance timers, and fleet status
+docker compose exec writer-0 journalctl -u chinit-boot.service --no-pager
+docker compose exec writer-0 systemctl list-timers --all --no-pager
+docker compose exec writer-0 chinit fleet-status
+
+# Insert a row on writer-0 and verify ReplicatedMergeTree replication on reader-0
+docker compose exec writer-0 clickhouse-client --user admin --password compose-admin-pass \
+  --query "INSERT INTO default.events (source, message) VALUES ('compose', 'hello chinit')"
+
+docker compose exec reader-0 clickhouse-client --user admin --password compose-admin-pass \
+  --query "SELECT * FROM default.events"
+
+# Query Prometheus metrics exposed by chinit-exporter (:9150 on writer-0, :19150 on reader-0)
+curl -s http://localhost:9150/metrics | head -n 30
+
+# Tear down the cluster and volumes when finished
+docker compose down -v
+```
+
+> **Customizing local specs or building from source:** If you clone the repository, [`deploy/compose/docker-compose.yaml`](https://github.com/stackgenhq/chinit/blob/main/deploy/compose/docker-compose.yaml) bind-mounts `./specs`, `./bundle`, and `./secrets` so you can iterate on `chi.yaml` or `chinit.yaml` live and run `docker compose up --build -d`.
+
+---
+
+## Step 1: Install the Binary on a Cloud VM (or Launch the Golden AMI)
 
 If you are on AWS in `us-west-2`, you can skip straight to Step 2 by launching our public golden AMI (`ami-0eaa398497899f070`), which already has ClickHouse `26.8.36.3` and `chinit` baked in.
 
