@@ -10,7 +10,7 @@
 # ============================================================================
 
 module "chinit" {
-  source = "../modules/chinit/azure"
+  source = "./modules/chinit"
 
   cluster_name  = var.cluster_name
   region        = var.location

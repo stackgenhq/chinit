@@ -37,12 +37,12 @@ only, no load balancers, no public exposure, no static credentials. See
 | AWS | [`aws/`](./aws) | A golden AMI (built from [`images/aws`](../images/aws), or auto-resolved from the public AMI in us-west-2) + an ACME provider block in your root |
 | Azure | [`azure/`](./azure) | A golden Compute Gallery image (built from [`images/azure`](../images/azure)) and an Azure Resource Group |
 
-## Contract Modules (`modules/chinit/`)
+## Contract Modules (`<cloud>/modules/chinit`)
 
 The interface between Terraform and `chinit` lives in two contract modules:
 
 ```
-modules/chinit/aws      modules/chinit/azure
+aws/modules/chinit      azure/modules/chinit
 ```
 
 Each contract module renders the per-role `chinit-<role>.yaml` specs, computes the SHA-256 bundle digest, uploads the configuration bundle to object storage, and renders the per-role user-data wrappers. **It creates no cloud infrastructure itself** — the caller owns the storage buckets/containers, lease table, DNS zone, secrets, IAM/RBAC, and compute resources, and passes their identifiers into the contract module.
@@ -50,7 +50,7 @@ Each contract module renders the per-role `chinit-<role>.yaml` specs, computes t
 You can use these modules in two ways:
 
 1. **All-in-one cluster modules** (`aws/` and `azure/`): Call the contract module and provision the surrounding cluster infrastructure for a quick, self-contained setup.
-2. **Custom infrastructure stacks**: Call `modules/chinit/<cloud>` directly from your own Terraform root and customize it using three extension hooks:
+2. **Custom infrastructure stacks**: Call `<cloud>/modules/chinit` directly from your own Terraform root and customize it using three extension hooks:
 
    | Hook | Description |
    |---|---|
@@ -71,40 +71,65 @@ facade is the on-ramp, not the ceiling).
 
 ## Directory Layout
 
+One modules directory per cloud — an ecosystem module and its cloud
+siblings live side by side, mirroring the contract layout:
+
 ```
-modules/chinit/          Contract modules (spec, bundle, and user-data renderers)
-  aws/                   Consumed by aws/ and custom AWS stacks
-  azure/                 Consumed by azure/ and custom Azure stacks
-aws/                     Self-contained AWS cluster module
-  examples/cluster/      Minimal AWS example
-azure/                   Self-contained Azure cluster module
-  examples/cluster/      Minimal Azure example
+aws/                            Self-contained AWS cluster module
+  examples/cluster/             Minimal AWS example
+  modules/                      AWS modules (contract + ecosystem)
+    chinit/                     Contract: spec/bundle/user-data renderer
+    clickhouse/ compute/ dns_tls/ monitoring/
+    network/ secrets/ security/ storage/
+azure/                          Self-contained Azure cluster module
+  examples/cluster/             Minimal Azure example
+  modules/                      Azure modules (contract + ecosystem)
+    chinit/                     Contract: spec/bundle/user-data renderer
+    acme/ clickhouse/ dns/ image_gallery/
+    keyvault/ monitoring/ security/ storage/ vmss/
 ```
 
-### Ecosystem Modules (`modules/<name>/`)
+### Ecosystem Modules
 
 Opinionated, production-hardened modules extracted from real cluster
 deployments. They pair with the contract module for stacks that want more
 of the surrounding infrastructure managed:
 
+**AWS** (`aws/modules/`):
+
 | Module | Purpose |
 |---|---|
-| [`modules/clickhouse`](./modules/clickhouse) | Multi-tenant S3/CAS tiered storage (`storage.xml`, CHI/CHK specs) fed into the contract module's `config_files`/`chi_spec` hooks |
-| [`modules/compute`](./modules/compute) | EC2 nodes, writers/readers ASGs (Spot-diversified readers, on-demand writers), NLBs, node-claims identity |
-| [`modules/network`](./modules/network) | VPC (aws-ia/vpc pinned), per-role security groups, S3 gateway endpoint, flow logs |
-| [`modules/storage`](./modules/storage) | Data/backup buckets, lifecycle tiering, per-tenant IAM policy documents |
-| [`modules/secrets`](./modules/secrets) | Secrets Manager passwords + custom rotation Lambda |
-| [`modules/dns_tls`](./modules/dns_tls) | Route53 zones/records, ACM or ACME (Let's Encrypt) certs |
-| [`modules/monitoring`](./modules/monitoring) | CloudWatch alarms, scaling guidance, budgets |
-| [`modules/security`](./modules/security) | GuardDuty + Security Hub + findings delivery |
+| [`clickhouse`](./aws/modules/clickhouse) | Multi-tenant S3/CAS tiered storage (`storage.xml`, CHI/CHK specs) fed into the contract module's `config_files`/`chi_spec` hooks |
+| [`compute`](./aws/modules/compute) | EC2 nodes, writers/readers ASGs (Spot-diversified readers, on-demand writers), NLBs, node-claims identity |
+| [`network`](./aws/modules/network) | VPC (aws-ia/vpc pinned), per-role security groups, S3 gateway endpoint, flow logs |
+| [`storage`](./aws/modules/storage) | Data/backup buckets, lifecycle tiering, per-tenant IAM policy documents |
+| [`secrets`](./aws/modules/secrets) | Secrets Manager passwords + custom rotation Lambda |
+| [`dns_tls`](./aws/modules/dns_tls) | Route53 zones/records, ACM or ACME (Let's Encrypt) certs |
+| [`monitoring`](./aws/modules/monitoring) | CloudWatch alarms, scaling guidance, budgets |
+| [`security`](./aws/modules/security) | GuardDuty + Security Hub + findings delivery |
 
-Each validates standalone: `cd modules/<name> && tofu init -backend=false && tofu validate`.
+**Azure** (`azure/modules/`):
+
+| Module | Purpose |
+|---|---|
+| [`clickhouse`](./azure/modules/clickhouse) | Blob-tiered `storage.xml` + tuned CHI/CHK specs + the SRE troubleshooting scripts, fed into the contract module's hooks |
+| [`vmss`](./azure/modules/vmss) | VMSS writers/readers (Spot-eviction-aware), keepers, backup replica, bastion, network interfaces |
+| [`dns`](./azure/modules/dns) | Private DNS zone + node records |
+| [`storage`](./azure/modules/storage) | Storage account: bundle/data/backup containers, lifecycle management |
+| [`keyvault`](./azure/modules/keyvault) | Key Vault secrets + the fleet re-render automation |
+| [`acme`](./azure/modules/acme) | Let's Encrypt (DNS-01) cert issuance + renewal automation |
+| [`monitoring`](./azure/modules/monitoring) | Azure Monitor: log analytics, alert rules, action groups, budgets, maintenance windows |
+| [`security`](./azure/modules/security) | Defender + diagnostic settings on the data surfaces |
+| [`image_gallery`](./azure/modules/image_gallery) | Compute Gallery image definitions + versions for the golden image |
+
+Each validates standalone: `cd <cloud>/modules/<name> && tofu init -backend=false && tofu validate`.
 
 All modules can be validated offline with OpenTofu or Terraform:
 
 ```bash
-cd modules/chinit/aws && tofu init -backend=false && tofu validate
-cd ../../aws          && tofu init -backend=false && tofu validate
+cd aws/modules/chinit  && tofu init -backend=false && tofu validate
+cd ../../..           && tofu init -backend=false && tofu validate
+cd ../azure           && tofu init -backend=false && tofu validate   # azure azurerm provider needed
 ```
 
 ## Bundle SHA-256 Verification Contract

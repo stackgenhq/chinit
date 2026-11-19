@@ -10,7 +10,7 @@
 # ============================================================================
 
 module "monitoring" {
-  source = "../modules/monitoring"
+  source = "./modules/monitoring"
 
   cluster_name = var.cluster_name
   enabled      = true
@@ -44,7 +44,7 @@ module "monitoring" {
 }
 
 module "security" {
-  source = "../modules/security"
+  source = "./modules/security"
 
   cluster_name = var.cluster_name
   aws_region   = var.region

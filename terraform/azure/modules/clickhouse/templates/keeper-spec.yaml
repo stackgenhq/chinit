@@ -1,0 +1,77 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CHK spec rendered by Terraform (modules/clickhouse) — the chinit-loaded source
+# of truth for Keeper configuration (parity with the AWS keeper-spec.yaml:
+# cloud-free subset — topology, ports, coordination settings, JSON logging,
+# the localhost Prometheus endpoint). Raft server entries get their cloud DNS
+# names at render time; -single-file merges everything into ONE
+# keeper_config.xml (keeper runs with an explicit --config, which disables
+# config.d auto-include).
+# Identity is cloud state: server_id derives from the hostname ordinal
+# with myid-disk persistence and feeds the render's server-id, so it
+# deliberately does NOT live in this spec.
+apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: ${cluster_name}
+spec:
+  replicas: ${keeper_count}
+  configuration:
+    settings:
+      keeper_server/tcp_port: "9181"
+      keeper_server/raft_configuration/server/port: "9234"
+      keeper_server/log_storage_path: /var/lib/clickhouse-keeper/log
+      keeper_server/snapshot_storage_path: /var/lib/clickhouse-keeper/snapshots
+      keeper_server/coordination_settings/operation_timeout_ms: "10000"
+      keeper_server/coordination_settings/session_timeout_ms: "30000"
+      keeper_server/coordination_settings/raft_logs_level: "information"
+      keeper_server/hostname_checks_enabled: "true"
+    files:
+      # listen_host is a ROOT-level setting (it scopes every listener:
+      # client 9181, raft 9234); keeper_server/listen_host is IGNORED —
+      # a dedicated file keeps it at the root (the AWS-side live
+      # finding, identical here).
+      keeper-listen.xml: |
+        <clickhouse>
+            <listen_host>0.0.0.0</listen_host>
+        </clickhouse>
+      # Keeper's own Prometheus endpoint (localhost, local agents scrape
+      # it): a top-level file section, NOT keeper_server settings.
+      keeper-prometheus.xml: |
+        <clickhouse>
+            <prometheus>
+                <endpoint>/metrics</endpoint>
+                <port>9363</port>
+                <host>127.0.0.1</host>
+                <metrics>true</metrics>
+                <events>true</events>
+                <asynchronous_metrics>true</asynchronous_metrics>
+                <status_info>true</status_info>
+            </prometheus>
+        </clickhouse>
+      # File logging (JSON, parity with the server logger.xml): keeper
+      # emits to journald only by default, which no log agent can tail.
+      keeper-logging.xml: |
+        <clickhouse>
+            <logger>
+                <level>information</level>
+                <log>/var/log/clickhouse-keeper/clickhouse-keeper.log</log>
+                <errorlog>/var/log/clickhouse-keeper/clickhouse-keeper.err.log</errorlog>
+                <size>500M</size>
+                <count>5</count>
+                <formatting>
+                    <type>json</type>
+                    <names>
+                        <date_time>timestamp</date_time>
+                        <thread_name>thread</thread_name>
+                        <thread_id>thread_id</thread_id>
+                        <level>severity</level>
+                        <logger_name>logger</logger_name>
+                        <message>message</message>
+                        <source_file>source_file</source_file>
+                        <source_line>source_line</source_line>
+                    </names>
+                </formatting>
+            </logger>
+        </clickhouse>

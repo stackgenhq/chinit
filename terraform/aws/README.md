@@ -7,10 +7,10 @@
 
 Deploy a secure, production-shaped ClickHouse fleet on AWS with one module
 call. The module composes the hardened ecosystem modules
-([network](../modules/network), [storage](../modules/storage),
-[secrets](../modules/secrets), [clickhouse](../modules/clickhouse),
-[compute](../modules/compute), [dns_tls](../modules/dns_tls),
-[monitoring](../modules/monitoring), [security](../modules/security))
+([network](./modules/network), [storage](./modules/storage),
+[secrets](./modules/secrets), [clickhouse](./modules/clickhouse),
+[compute](./modules/compute), [dns_tls](./modules/dns_tls),
+[monitoring](./modules/monitoring), [security](./modules/security))
 around the [chinit](https://github.com/stackgenhq/chinit) contract — the
 same modules a large-scale fleet runs on.
 
@@ -63,7 +63,7 @@ tofu output connect_writer     # ready-to-run client command
   (`tenants` variable), never a disk-resizing project. Merged parts TTL-move
   to S3 after `cold_move_ttl_days`; lifecycle transitions to Standard-IA.
 - **Client entry**: private DNS only by default (`writer-0.<zone>` inside the
-  VPC). The ecosystem [compute](../modules/compute) module can add NLBs
+  VPC). The ecosystem [compute](./modules/compute) module can add NLBs
   later; compose it directly when you need them.
 
 ## Opt-in extras (one variable each)

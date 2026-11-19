@@ -12,7 +12,7 @@
 # ============================================================================
 
 module "compute" {
-  source = "../modules/compute"
+  source = "./modules/compute"
 
   cluster_name = var.cluster_name
   aws_region   = var.region
@@ -83,7 +83,7 @@ module "compute" {
 }
 
 module "dns_tls" {
-  source = "../modules/dns_tls"
+  source = "./modules/dns_tls"
 
   cluster_name      = var.cluster_name
   aws_region        = var.region

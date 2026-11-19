@@ -14,7 +14,7 @@
 # ============================================================================
 
 module "network" {
-  source = "../modules/network"
+  source = "./modules/network"
 
   aws_region   = var.region
   cluster_name = var.cluster_name
@@ -35,7 +35,7 @@ module "network" {
 }
 
 module "storage" {
-  source = "../modules/storage"
+  source = "./modules/storage"
 
   cluster_name = var.cluster_name
 
@@ -60,7 +60,7 @@ module "storage" {
 }
 
 module "secrets" {
-  source = "../modules/secrets"
+  source = "./modules/secrets"
 
   cluster_name = var.cluster_name
 
@@ -80,7 +80,7 @@ module "secrets" {
 }
 
 module "clickhouse" {
-  source = "../modules/clickhouse"
+  source = "./modules/clickhouse"
 
   cluster_name  = var.cluster_name
   timezone      = "UTC"

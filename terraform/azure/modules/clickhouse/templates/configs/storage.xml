@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse Azure Blob Storage Configuration
+  
+  Uses separate cache disk pattern (v22.8+) for:
+  - Better observability (cache hits/misses in system.filesystem_cache)
+  - More flexible cache management
+  
+  Reference: https://clickhouse.com/docs/en/operations/storing-data#azure-blob-storage
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Default Local Disk (Hot Tier) -->
+            <!-- Add keep_free_space_bytes to prevent OS disk usage from causing crashes -->
+            <default>
+                <keep_free_space_bytes>10737418240</keep_free_space_bytes>
+            </default>
+
+            <!-- Raw Azure Blob Storage disk (no caching) -->
+            <azure_blob>
+                <type>azure_blob_storage</type>
+                <!-- storage_account_url is the base endpoint WITHOUT container name -->
+                <!-- e.g., https://mystorageaccount.blob.core.windows.net -->
+                <storage_account_url from_env="AZURE_STORAGE_ACCOUNT_URL" />
+                <!-- container_name must be specified separately -->
+                <container_name from_env="AZURE_STORAGE_CONTAINER_NAME" />
+                <account_name from_env="AZURE_STORAGE_ACCOUNT_NAME" />
+                <account_key from_env="AZURE_STORAGE_ACCOUNT_KEY" />
+                <!-- container_already_exists: don't try to create it -->
+                <container_already_exists>true</container_already_exists>
+            </azure_blob>
+
+            <!-- Cached wrapper disk - use this in policies for best performance -->
+            <azure_blob_cache>
+                <type>cache</type>
+                <disk>azure_blob</disk>
+                <path>/var/lib/clickhouse/disks/azure_blob_cache/</path>
+                <max_size>50Gi</max_size>
+            </azure_blob_cache>
+        </disks>
+
+        <policies>
+            <!-- Tiered policy: Hot data on local SSD, Cold data on Azure -->
+            <tiered>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                        <prefer_not_to_merge>false</prefer_not_to_merge>
+                    </hot>
+                    <cold>
+                        <disk>azure_blob_cache</disk>
+                        <prefer_not_to_merge>true</prefer_not_to_merge>
+                    </cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </tiered>
+        </policies>
+    </storage_configuration>
+</clickhouse>

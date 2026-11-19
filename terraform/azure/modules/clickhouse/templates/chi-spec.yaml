@@ -1,0 +1,176 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CHI spec rendered by Terraform (modules/clickhouse) — the chinit-loaded source
+# of truth for config rendering, schema sync and replica drop.
+# Cloud-free subset (parity with the AWS chi-spec.yaml): topology, the
+# fixed-shard invariant, profiles, settings, query logging, the JSON
+# logger and the Prometheus endpoint; TLS, storage disks and networking
+# stay in the XML templates (hybrid strategy — storage-config.xml carries
+# the Terraform-computed Azure blob disk layout, ssl.xml/network.xml
+# carry cloud TLS/CIDR state).
+#
+# The ClickHouse cluster is named ${cluster_name}: the loader's cluster key,
+# the rendered remote_servers and the systemd units all use this name.
+# Writers + readers are replicas of ONE shard (all tables are
+# ReplicatedMergeTree; the generator emits internal_replication=true) —
+# replicasCount is the full writer+reader fleet ceiling, driven by
+# Terraform. The shard is NAMED "01": the macros <shard> renders the shard
+# NAME, and every ReplicatedMergeTree keeper path embeds
+# /clickhouse/tables/{shard}/... — an anonymous shardsCount layout would
+# render the operator's 0-based shard INDEX and silently re-key every
+# table's keeper path (the AWS-side live finding, identical here). CR
+# host names become "01-0", "01-1", ... — the inventory maps them to
+# private-zone DNS.
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: ${cluster_name}
+spec:
+  configuration:
+    clusters:
+      - name: ${cluster_name}
+        # secure: distributed/interserver connections use the TLS port.
+        # Per-replica distributed-query credentials are injected at
+        # render time, never in this spec.
+        secure: "yes"
+        layout:
+          shards:
+            - name: "01"
+              replicasCount: ${replica_count}
+    # Keeper ensemble: coordination is ClickHouse-domain data; the DNS
+    # names are the stack's private zone.
+    zookeeper:
+      nodes:
+%{for keeper in keepers~}
+        - host: ${keeper}
+          port: 9181
+%{endfor~}
+    profiles:
+      default/async_insert: "1"
+      # Async Inserts: buffers small inserts into fewer, larger parts;
+      # protects merge/part counts on the blob-backed layout.
+      default/async_insert_max_data_size: "104857600"
+      default/async_insert_busy_timeout_ms: "10000"
+      default/async_insert_stale_timeout_ms: "5000"
+      default/wait_for_async_insert: "1"
+      # External aggregation: prevent OOM on large GROUP BY/SORT
+      default/max_bytes_before_external_group_by: "21474836480"
+      default/max_bytes_before_external_sort: "10737418240"
+      # NO-DATA-LOSS ingestion profile (carried by the writer user):
+      # synchronous replication — INSERT returns only after quorum
+      # replicas hold the part. insert_quorum_timeout is MILLISECONDS
+      # despite the name.
+      ingest/insert_quorum: "auto"
+      ingest/insert_quorum_timeout: "180000"
+      ingest/select_sequential_consistency: "1"
+    settings:
+      # Interserver TLS port (ssl.xml serves interserver TLS on 9010):
+      # this setting flows into every host's TLSPort so `secure: yes`
+      # renders the port the secure interserver listener answers on.
+      tcp_port_secure: "9010"
+      max_concurrent_queries: "150"
+      max_server_memory_usage_to_ram_ratio: "0.9"
+      timezone: UTC
+      mark_cache_size: "5368709120"
+      uncompressed_cache_size: "1073741824"
+      asynchronous_metrics_update_period_s: "1"
+      background_pool_size: "16"
+      background_move_pool_size: "8"
+      background_schedule_pool_size: "16"
+      format_schema_path: /var/lib/clickhouse/format_schemas
+      # MergeTree engine defaults. <storage_policy> is NOT valid here
+      # (unknown element); tables set their policy via SETTINGS. Zero-copy
+      # replication of blob parts is deprecated upstream — every replica
+      # MUST write its own blob path (see the {replica} macro in
+      # storage-config.xml). Do NOT enable
+      # allow_remote_fs_zero_copy_replication.
+      merge_tree/max_bytes_to_merge_at_max_space_in_pool: "161061273600"
+      merge_tree/max_bytes_to_merge_at_min_space_in_pool: "161061273600"
+      merge_tree/vertical_merge_algorithm_min_rows_to_activate: "1000000"
+      merge_tree/max_parts_to_merge_at_once: "20"
+      # Prevent "Too many parts" errors during write bursts (default 300)
+      merge_tree/parts_to_throw_insert: "3000"
+      merge_tree/ttl_only_drop_parts: "1"
+      compression/case/method: lz4
+      # Query logs: partition/TTL policy that keeps the log tables
+      # bounded (every configured log carries a TTL — a log without one
+      # freezes readonly on rotation and never reclaims).
+      query_log/database: system
+      query_log/table: query_log
+      query_log/flush_interval_milliseconds: "7500"
+      query_log/max_size_rows: "1048576"
+      query_log/reserved_size_rows: "8192"
+      query_log/buffer_size_rows: "65536"
+      query_log/flush_on_crash: "false"
+      query_log/partition_by: "toYYYYMM(event_date)"
+      query_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      query_thread_log/database: system
+      query_thread_log/table: query_thread_log
+      query_thread_log/flush_interval_milliseconds: "7500"
+      query_thread_log/max_size_rows: "1048576"
+      query_thread_log/reserved_size_rows: "8192"
+      query_thread_log/buffer_size_rows: "65536"
+      query_thread_log/partition_by: "toYYYYMM(event_date)"
+      query_thread_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      part_log/partition_by: "toYYYYMM(event_date)"
+      part_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      metric_log/partition_by: "toYYYYMM(event_date)"
+      metric_log/ttl: "event_date + INTERVAL 30 DAY DELETE"
+      query_views_log/partition_by: "toYYYYMM(event_date)"
+      query_views_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+    files:
+      # Server JSON logging (OTEL semantic conventions) for the OTEL
+      # collector ingestion.
+      server-logger.xml: |
+        <clickhouse>
+            <logger>
+                <level>information</level>
+                <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+                <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+                <size>1000M</size>
+                <count>10</count>
+                <formatting>
+                    <type>json</type>
+                    <names>
+                        <date_time>timestamp</date_time>
+                        <thread_name>thread</thread_name>
+                        <thread_id>thread_id</thread_id>
+                        <level>severity</level>
+                        <query_id>query_id</query_id>
+                        <logger_name>logger</logger_name>
+                        <message>message</message>
+                        <source_file>source_file</source_file>
+                        <source_line>source_line</source_line>
+                    </names>
+                </formatting>
+            </logger>
+        </clickhouse>
+      # Server Prometheus metrics endpoint (localhost, local agents
+      # scrape it). SECURITY: bound to 127.0.0.1.
+      server-prometheus.xml: |
+        <clickhouse>
+            <prometheus>
+                <endpoint>/metrics</endpoint>
+                <port>9363</port>
+                <host>127.0.0.1</host>
+                <metrics>true</metrics>
+                <events>true</events>
+                <asynchronous_metrics>true</asynchronous_metrics>
+                <status_info>true</status_info>
+            </prometheus>
+        </clickhouse>
+    users:
+      # Passwords NEVER live here — passwordFrom references the cloud
+      # secret store (Key Vault secret name passed from Terraform); the
+      # users render resolves + SHA256-hashes at boot. Profiles:
+      # default is read-only (queries), admin manages, writer carries
+      # the no-data-loss ingest profile.
+      default/passwordFrom: "${default_password_secret_name}"
+      default/profile: readonly
+      default/quota: default
+      admin/passwordFrom: "${admin_password_secret_name}"
+      admin/profile: default
+      admin/access_management: "1"
+      writer/passwordFrom: "${writer_password_secret_name}"
+      writer/profile: ingest

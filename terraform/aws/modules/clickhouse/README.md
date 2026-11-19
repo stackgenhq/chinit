@@ -8,7 +8,7 @@
 This module does not render the chinit node specs, the SHA-gated
 bundle, or the user-data wrappers itself. It consumes the
 **open-source contract module**
-([`modules/chinit/aws`](../chinit/aws))
+([`aws/modules/chinit`](../chinit))
 and extends it with a multi-tenant storage tier:
 
 | Owned here (the extension) | Owned by the contract module |
@@ -29,7 +29,7 @@ output names so the root wiring is unchanged).
 
 ```hcl
 module "chinit" {
-  source = "./../chinit/aws"
+  source = "../chinit"
 
   # ... the cluster identity, ceilings, resource ids, secret names ...
 

@@ -14,7 +14,7 @@ module "chinit" {
   # Co-located in this repo — local path, mirroring the all-in-one
   # modules in terraform/aws + terraform/azure. The ?ref=main pin is
   # gone: this module ships in the same commit as the contract module.
-  source = "../chinit/aws"
+  source = "../chinit"
 
   cluster_name  = var.cluster_name
   region        = var.aws_region
