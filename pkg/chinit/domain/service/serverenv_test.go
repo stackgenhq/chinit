@@ -167,13 +167,13 @@ var _ = Describe("configureServerEnv cloud gate", func() {
 			"a stateful node's uuid IS the live CAS anchor match — rewriting it would Code 246 on the next start")
 	})
 
-	It("emits CH_CAS_SERVER_ROOT_ID for the storage.xml from_env contract", func() {
+	It("emits CH_CAS_SERVER_ROOT_ID for the storage.xml from_env contract even when CasEnabled is unset", func() {
 		b := &Boot{
 			Spec: &model.BootSpec{
 				ClusterName:  "ch-int-dev",
 				Role:         model.RoleWriter,
 				S3DataBucket: "data-bucket",
-				CasEnabled:   true,
+				CasEnabled:   false,
 			},
 			Identity: model.NodeIdentity{Hostname: "writer-0"},
 			Provider: &stubProvider{name: "aws"},

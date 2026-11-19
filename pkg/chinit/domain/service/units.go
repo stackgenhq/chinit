@@ -220,7 +220,7 @@ WantedBy=multi-user.target
 		if b.Spec.IdentityMode == model.IdentityLease {
 			units = append(units,
 				b.chinitUnit("lease-renew.service", "Node ordinal lease renewal", "lease-renew"),
-				chinitTimer("lease-renew.timer", "Renew the ordinal lease every 5 minutes", "*-*-* *:00/5:00"),
+				chinitTimer("lease-renew.timer", "Renew the ordinal lease and converge peers every minute", "*-*-* *:*:00"),
 			)
 		}
 		if b.Spec.Role == model.RoleWriter {
@@ -320,7 +320,7 @@ WantedBy=multi-user.target
 			// entries, and every bare-name part fetch died on
 			// DNS_ERROR for hours).
 			b.chinitUnit("lease-renew.service", "Static peer convergence (/etc/hosts + DNS + remote_servers)", "lease-renew"),
-			chinitTimer("lease-renew.timer", "Converge static-node peers every 5 minutes", "*-*-* *:00/5:00"),
+			chinitTimer("lease-renew.timer", "Converge static-node peers every minute", "*-*-* *:*:00"),
 		)
 	}
 	return units

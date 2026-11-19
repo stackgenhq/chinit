@@ -377,14 +377,41 @@ type CacheDiskSizing struct {
 	// storage.xml (e.g. ["s3_cache"] or ["s3_cache", "cas_cache"]).
 	// Defaults to ["s3_cache"] when empty.
 	DiskNames []string
+	// NvmeHot indicates that storage.xml declares a local <nvme_hot> disk
+	// under /var/lib/clickhouse/disks/hot/ and this node is an active
+	// writer eligible to carve 50% of a large (>=400 GiB) NVMe mount for
+	// hot MergeTree inserts/merges while reserving 40% for cache wrappers.
+	NvmeHot bool
 }
+
+// writerNvmeHotMinBytes is the minimum /var/lib/clickhouse/disks capacity
+// (400 GiB, satisfied by 8-16+ vCPU *gd NVMe writers such as m8gd.2xlarge
+// 474 GB and m8gd.4xlarge 950 GB) required before carving 50% of the NVMe
+// mount for <nvme_hot>. Smaller mounts (e.g. 217 GiB reader NVMe or 64 GiB
+// gp3) dedicate 90% to cache wrappers and keep <nvme_hot> at its 10 TiB
+// keep_free_space_bytes guard (0 unreserved bytes).
+const writerNvmeHotMinBytes = 400 << 30
 
 // CacheDiskSizings is a domain collection of CacheDiskSizing entries.
 type CacheDiskSizings []CacheDiskSizing
 
+func (c CacheDiskSizing) activatesNvmeHot() bool {
+	return c.NvmeHot && c.MountBytes >= writerNvmeHotMinBytes
+}
+
+// NvmeHotKeepFreeBytes returns the <keep_free_space_bytes> override for
+// <nvme_hot> when activated (50% of MountBytes, leaving the upper 50% for
+// hot parts and protecting the 40% cache wrapper budget + 10% OS margin).
+func (c CacheDiskSizing) NvmeHotKeepFreeBytes() uint64 {
+	if !c.activatesNvmeHot() {
+		return 0
+	}
+	return c.MountBytes * 50 / 100
+}
+
 // CacheMaxSizeBytes computes the per-wrapper <max_size> in bytes (90% of
 // the mounted cache volume divided evenly across the active cache disk
-// wrappers sharing the mountpoint).
+// wrappers, or 40% when 50% is carved for <nvme_hot> on large *gd writers).
 func (c CacheDiskSizing) CacheMaxSizeBytes() uint64 {
 	if c.MountBytes == 0 {
 		return 0
@@ -393,7 +420,11 @@ func (c CacheDiskSizing) CacheMaxSizeBytes() uint64 {
 	if count == 0 {
 		count = 1
 	}
-	return (c.MountBytes * 90 / 100) / count
+	pct := uint64(90)
+	if c.activatesNvmeHot() {
+		pct = 40
+	}
+	return (c.MountBytes * pct / 100) / count
 }
 
 func (sizings CacheDiskSizings) renderCacheStorageOverlay() string {
@@ -411,6 +442,9 @@ func (sizings CacheDiskSizings) renderCacheStorageOverlay() string {
 	}
 	var b strings.Builder
 	b.WriteString("\n    <storage_configuration>\n        <disks>\n")
+	if keepFree := s.NvmeHotKeepFreeBytes(); keepFree > 0 {
+		fmt.Fprintf(&b, "            <nvme_hot>\n                <keep_free_space_bytes>%d</keep_free_space_bytes>\n            </nvme_hot>\n", keepFree)
+	}
 	for _, name := range names {
 		if name == "" {
 			continue
@@ -444,6 +478,31 @@ func (root *xmlNode) cacheDiskNames() []string {
 		}
 	}
 	return names
+}
+
+// hasNvmeHotDisk reports whether storage.xml declares a <nvme_hot> disk under
+// <storage_configuration><disks>.
+func hasNvmeHotDisk(storageXML []byte) bool {
+	var root xmlNode
+	if err := xml.Unmarshal(storageXML, &root); err != nil {
+		return false
+	}
+	for _, child := range root.Children {
+		if child.XMLName.Local != "storage_configuration" {
+			continue
+		}
+		for _, sc := range child.Children {
+			if sc.XMLName.Local != "disks" {
+				continue
+			}
+			for _, disk := range sc.Children {
+				if disk.XMLName.Local == "nvme_hot" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // detectCacheDiskNames inspects storage.xml bytes for <type>cache</type>
@@ -665,6 +724,7 @@ func (i *StaticConfigInstaller) Install(ctx context.Context, bundleDir string) e
 			cacheSizing = CacheDiskSizing{
 				MountBytes: mountBytes,
 				DiskNames:  detectCacheDiskNames(storageBytes),
+				NvmeHot:    i.Role == model.RoleWriter && hasNvmeHotDisk(storageBytes),
 			}
 		}
 		hwXML := []byte(HardwareSizingOverlayXML(vcpus, memBytes, cacheSizing))

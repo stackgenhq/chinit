@@ -344,3 +344,82 @@ func (c *cliDDLTaskQueueCleaner) PruneStaleDDLReplicas(liveClaims activeClaims) 
 	}
 	return pruned
 }
+
+// casMountEntry represents one (disk, server_root_id) row from system.cas_mounts.
+type casMountEntry struct {
+	Disk         string
+	ServerRootID string
+}
+
+// isRetiredEphemeralCasRoot reports whether server_root_id is a retired
+// ephemeral instance/pod identifier (i-* or chi-*) absent from liveInstanceIDs.
+// Deterministic ordinal UUIDs and static role names (backup-0) are reusable
+// across scale-in/scale-out cycles and are deliberately preserved.
+func isRetiredEphemeralCasRoot(srid string, liveInstanceIDs map[string]bool) bool {
+	if srid == "" || liveInstanceIDs[srid] {
+		return false
+	}
+	if strings.ContainsAny(srid, "'\"\\\n\r\t ") {
+		return false
+	}
+	return strings.HasPrefix(srid, "i-") || strings.HasPrefix(srid, "chi-")
+}
+
+// cliCasMountCleaner decommissions retired ephemeral (i-* / chi-*) mount slots
+// in terminal fenced/terminated states from Altinity Antalya CAS pools via
+// SYSTEM CAS DROP POOL MEMBER '<srid>' FROM DISK '<disk>'. No-ops cleanly on
+// upstream ClickHouse builds where system.cas_mounts does not exist.
+type cliCasMountCleaner struct {
+	queryContext   context.Context
+	selfInstanceID string
+}
+
+func newCasMountCleaner(ctx context.Context, st *nodeState) *cliCasMountCleaner {
+	if st == nil {
+		return nil
+	}
+	return &cliCasMountCleaner{
+		queryContext:   ctx,
+		selfInstanceID: st.Identity.InstanceID,
+	}
+}
+
+const retiredCasMountsQuery = "SELECT DISTINCT disk, server_root_id FROM system.cas_mounts WHERE state IN ('fenced', 'terminated') AND disk NOT LIKE '%cache%' FORMAT TSV"
+
+// PruneRetiredCasMounts drops retired ephemeral CAS mount slots absent from
+// liveClaims. Returns "<disk>:<srid>" pairs successfully decommissioned.
+func (c *cliCasMountCleaner) PruneRetiredCasMounts(liveClaims activeClaims) []string {
+	if c == nil {
+		return nil
+	}
+	liveIDs := make(map[string]bool, len(liveClaims)+1)
+	if c.selfInstanceID != "" {
+		liveIDs[c.selfInstanceID] = true
+	}
+	for _, cl := range liveClaims {
+		if cl.InstanceID != "" {
+			liveIDs[cl.InstanceID] = true
+		}
+	}
+	out, err := runCommandWithEnv(c.queryContext, clickhouseClientEnv(), "clickhouse-client",
+		"--query", retiredCasMountsQuery)
+	if err != nil {
+		return nil
+	}
+	var pruned []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) != 2 {
+			continue
+		}
+		entry := casMountEntry{Disk: fields[0], ServerRootID: fields[1]}
+		if strings.ContainsAny(entry.Disk, "'\"\\\n\r\t ") || !isRetiredEphemeralCasRoot(entry.ServerRootID, liveIDs) {
+			continue
+		}
+		stmt := fmt.Sprintf("SYSTEM CAS DROP POOL MEMBER '%s' FROM DISK '%s'", entry.ServerRootID, entry.Disk)
+		if _, derr := runCommandWithEnv(c.queryContext, clickhouseClientEnv(), "clickhouse-client", "--query", stmt); derr == nil {
+			pruned = append(pruned, entry.Disk+":"+entry.ServerRootID)
+		}
+	}
+	return pruned
+}

@@ -464,6 +464,13 @@ func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnam
 	} else {
 		_, _ = d.runner.Run(ctx, "mkdir", "-p", "/var/lib/clickhouse/disks")
 	}
+	// Ensure the NVMe hot-tier directory exists under /var/lib/clickhouse/disks
+	// on every node so storage.xml policies referencing <nvme_hot> always find
+	// a valid directory (on >=400 GiB *gd NVMe writers z_hardware-sizing.xml
+	// activates it; on smaller/backup nodes keep_free_space_bytes leaves it idle).
+	if spec.Role != model.RoleKeeper {
+		_, _ = d.runner.Run(ctx, "mkdir", "-p", "/var/lib/clickhouse/disks/hot")
+	}
 
 	// Keeper: keepers only, dedicated disk for fsync latency isolation.
 	if spec.Role == model.RoleKeeper && spec.Disks.KeeperLabel != "" {
@@ -505,7 +512,7 @@ func (d *DiskManager) WithPlatform(platform string) *DiskManager {
 // mountComposeDirs prepares container-mounted directories (Docker volumes
 // or bind mounts) without touching block devices or /etc/fstab.
 func (d *DiskManager) mountComposeDirs(ctx context.Context, spec model.BootSpec) ([]MountedDisk, error) {
-	dirs := []string{"/var/lib/clickhouse", "/var/lib/clickhouse/disks"}
+	dirs := []string{"/var/lib/clickhouse", "/var/lib/clickhouse/disks", "/var/lib/clickhouse/disks/hot"}
 	mounted := []MountedDisk{
 		{Label: spec.Disks.MetadataLabel, Device: "compose-volume", Mount: "/var/lib/clickhouse"},
 	}

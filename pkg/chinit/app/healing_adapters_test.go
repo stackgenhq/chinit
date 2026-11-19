@@ -191,3 +191,39 @@ var _ = Describe("ddlQueueReplicas & cliDDLTaskQueueCleaner", func() {
 		}))
 	})
 })
+
+var _ = Describe("cliCasMountCleaner", func() {
+	It("drops retired ephemeral i-* and chi-* fenced mounts while preserving live claims, deterministic UUIDs, and backup-0", func() {
+		var queries []string
+		origRunEnv := runCommandWithEnv
+		runCommandWithEnv = func(_ context.Context, _ []string, _ string, args ...string) ([]byte, error) {
+			q := strings.Join(args, " ")
+			queries = append(queries, q)
+			if strings.Contains(q, "FROM system.cas_mounts") {
+				return []byte(strings.Join([]string{
+					"cas\ti-0livewriter",
+					"cas\ti-0deadreader",
+					"cas_default\tchi-old-pod-0",
+					"cas\tbackup-0",
+					"cas\t550e8400-e29b-51d4-a716-446655440000",
+				}, "\n")), nil
+			}
+			return []byte("ok"), nil
+		}
+		DeferCleanup(func() { runCommandWithEnv = origRunEnv })
+
+		st := &nodeState{Identity: model.NodeIdentity{
+			Role:       model.RoleWriter,
+			Hostname:   "writer-0",
+			InstanceID: "i-0self",
+		}}
+		cleaner := newCasMountCleaner(context.Background(), st)
+		dropped := cleaner.PruneRetiredCasMounts(activeClaims{{Hostname: "writer-1", InstanceID: "i-0livewriter"}})
+		Expect(dropped).To(Equal([]string{
+			"cas:i-0deadreader",
+			"cas_default:chi-old-pod-0",
+		}))
+		Expect(strings.Join(queries, "\n")).To(ContainSubstring("SYSTEM CAS DROP POOL MEMBER 'i-0deadreader' FROM DISK 'cas'"))
+		Expect(strings.Join(queries, "\n")).To(ContainSubstring("SYSTEM CAS DROP POOL MEMBER 'chi-old-pod-0' FROM DISK 'cas_default'"))
+	})
+})
