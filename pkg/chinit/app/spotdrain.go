@@ -510,6 +510,22 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 	return nil
 }
 
+// dropOnPeerRetryDelay paces retries when Keeper has not yet torn down the
+// dying node's ephemeral session immediately after SYSTEM SHUTDOWN (Code 305:
+// "Can't drop replica ... because it's active"). Package var so unit tests can
+// set zero delay.
+var dropOnPeerRetryDelay = 500 * time.Millisecond
+
+const dropOnPeerMaxAttempts = 10
+
+func isActiveReplicaDropError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Code: 305") || strings.Contains(msg, "because it's active")
+}
+
 // dropOnPeer removes this node's replica registration via one live
 // peer (the operator's HostDropReplica form): the peer executes the
 // SYSTEM DROP REPLICA that reaches both the table and the DATABASE
@@ -528,11 +544,26 @@ func dropOnPeer(ctx context.Context, st *nodeState, spec *inventorySpec, peer *p
 			hosts = append(hosts, clusterops.Host{Name: fmt.Sprintf("01-%d", slot), Address: peerFQDN})
 		}
 	}
-	return clusterOps.DropReplica(ctx, clusterops.DropReplicaRequest{
+	req := clusterops.DropReplicaRequest{
 		Cluster:  clusterRequestWithHosts(st, hosts),
 		HostName: st.Identity.Hostname,
 		RunOn:    peerFQDN,
-	})
+	}
+	var lastErr error
+	for attempt := 1; attempt <= dropOnPeerMaxAttempts; attempt++ {
+		lastErr = clusterOps.DropReplica(ctx, req)
+		if lastErr == nil || !isActiveReplicaDropError(lastErr) {
+			return lastErr
+		}
+		if attempt < dropOnPeerMaxAttempts {
+			select {
+			case <-ctx.Done():
+				return lastErr
+			case <-time.After(dropOnPeerRetryDelay):
+			}
+		}
+	}
+	return lastErr
 }
 
 // drainHookSpecs loads the spec's hooks section (the drain reads the

@@ -270,4 +270,22 @@ var _ = Describe("HardwareSizingOverlayXML & HardwareProfilesOverlayXML", func()
 		Expect(hwXML).To(ContainSubstring("<s3_cache>\n                " + expectedPerCache + "\n            </s3_cache>"))
 		Expect(hwXML).To(ContainSubstring("<cas_cache>\n                " + expectedPerCache + "\n            </cas_cache>"))
 	})
+
+	It("carves 50% nvme_hot and 40% across cache wrappers on >=400 GiB writer NVMe when NvmeHot is active", func() {
+		nvmeBytes := uint64(885) << 30 // m8gd.4xlarge usable NVMe
+		hwXML := HardwareSizingOverlayXML(16, 64<<30, CacheDiskSizing{
+			MountBytes: nvmeBytes,
+			DiskNames:  []string{"s3_cache", "cache_default", "cas_cache", "cas_cache_default"},
+			NvmeHot:    true,
+		})
+		dir := GinkgoT().TempDir()
+		hwPath := filepath.Join(dir, "z_hardware-sizing.xml")
+		Expect(os.WriteFile(hwPath, []byte(hwXML), 0644)).To(Succeed())
+		Expect(ValidateXML(hwPath)).To(Succeed())
+
+		expectedKeepFree := fmt.Sprintf("<keep_free_space_bytes>%d</keep_free_space_bytes>", nvmeBytes*50/100)
+		expectedPerCache := fmt.Sprintf("<max_size>%d</max_size>", (nvmeBytes*40/100)/4)
+		Expect(hwXML).To(ContainSubstring("<nvme_hot>\n                " + expectedKeepFree + "\n            </nvme_hot>"))
+		Expect(hwXML).To(ContainSubstring("<cas_cache>\n                " + expectedPerCache + "\n            </cas_cache>"))
+	})
 })

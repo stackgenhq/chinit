@@ -103,6 +103,11 @@ func runDeadReplicaGc(args []string) error {
 			logger.GetLogger(ctx).Info("dead-replica-gc: pruned stale DDL task_queue replicas", "count", len(pruned), "paths", pruned)
 		}
 	}
+	if casCleaner := newCasMountCleaner(ctx, st); casCleaner != nil && len(claims) > 0 {
+		if dropped := casCleaner.PruneRetiredCasMounts(activeClaims(claims)); len(dropped) > 0 {
+			logger.GetLogger(ctx).Info("dead-replica-gc: dropped retired ephemeral CAS pool members", "count", len(dropped), "members", dropped)
+		}
+	}
 	sweepCoordinatorCeilingDNS(ctx, st, cached)
 	convergeCoordinatorRemoteServers(ctx, st, cached)
 	return nil

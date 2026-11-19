@@ -895,10 +895,13 @@ func (b *Boot) serverEnvContent(ctx context.Context) (string, error) {
 	if cacheMax := probeCacheDiskMaxBytes(ctx); cacheMax > 0 {
 		fmt.Fprintf(&sb, "CH_CACHE_MAX_SIZE_BYTES=\"%d\"\n", cacheMax)
 	}
-	if b.Spec.CasEnabled && b.Identity.Hostname != "" {
-		// The identity rides WITH the endpoint: storage.xml's
-		// cas_server_root_id from_env resolves the SAME deterministic
-		// server-root across fresh-EBS ASG replacement (never per-boot).
+	if (b.Spec.CasEnabled || b.Spec.S3DataBucket != "") && b.Identity.Hostname != "" {
+		// Always export CH_CAS_SERVER_ROOT_ID whenever the node has an S3 data
+		// bucket or CAS enabled: non-CAS storage.xml ignores unused env vars,
+		// while CAS storage.xml (<cas_server_root_id from_env="CH_CAS_SERVER_ROOT_ID" />)
+		// is guaranteed to receive the deterministic UUID even if cas_enabled
+		// was omitted from the role's chinit.yaml (preventing per-boot i-*
+		// mount-slot leaks in system.cas_mounts).
 		fmt.Fprintf(&sb, "CH_CAS_SERVER_ROOT_ID=\"%s\"\n", b.serverRootID())
 	}
 	return sb.String(), nil

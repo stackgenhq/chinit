@@ -216,7 +216,8 @@ var _ = Describe("chinitUnits", func() {
 					Expect(u.Content).To(ContainSubstring("Description=Node ordinal lease renewal"))
 				}
 				if u.Name == "lease-renew.timer" {
-					Expect(u.Content).To(ContainSubstring("Renew the ordinal lease every 5 minutes"))
+					Expect(u.Content).To(ContainSubstring("Renew the ordinal lease and converge peers every minute"))
+					Expect(u.Content).To(ContainSubstring("OnCalendar=*-*-* *:*:00"))
 					Expect(u.Content).NotTo(ContainSubstring("reader ordinal lease"))
 				}
 			}
@@ -285,7 +286,7 @@ var _ = Describe("chinitUnits", func() {
 					Expect(u.Content).To(ContainSubstring("*-*-* *:00/5:00"))
 				}
 				if u.Name == "lease-renew.timer" {
-					Expect(u.Content).To(ContainSubstring("*-*-* *:00/5:00"))
+					Expect(u.Content).To(ContainSubstring("*-*-* *:*:00"))
 				}
 			}
 		})
