@@ -69,6 +69,12 @@ variable "public_subnet_id" {
   default     = null
 }
 
+variable "enable_nlbs" {
+  description = "Create the writers/readers Network Load Balancers (client entry path). false = private-DNS-only access (nodes resolve writer-N/reader-N.<zone> inside the VPC); enable later without churn — the NLBs are additive."
+  type        = bool
+  default     = true
+}
+
 variable "nlb_scheme" {
   description = "NLB scheme: 'internet-facing' (default, current behavior) or 'internal' (VPC-internal NLB for private client access, e.g. from an EKS cluster). Internal NLBs are placed in nlb_subnet_ids."
   type        = string

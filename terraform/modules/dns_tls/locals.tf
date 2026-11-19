@@ -11,6 +11,11 @@
 locals {
   is_passthrough = var.nlb_tls_mode == "passthrough"
 
+  # ACME only makes sense with a public zone to DNS-01 into AND a contact
+  # email. Clusters running private-DNS-only (no public records) never
+  # render the ACME leg — the provider config is not even required then.
+  acme_enabled = local.is_passthrough && var.public_zone_name != null && var.acme_email != null
+
   # Why: The ACME provider's server_url lives on the provider block in the
   #      ROOT module (it is provider-wide). This local only documents the
   #      mapping so the root passes the right URL per acme_environment:

@@ -111,7 +111,7 @@ locals {
 }
 
 resource "aws_route53_record" "writers_lb" {
-  count   = local.public_lb_zone_id != null && var.create_public_records ? 1 : 0
+  count   = local.public_lb_zone_id != null && var.create_public_records && var.writers_lb_dns_name != null ? 1 : 0
   zone_id = local.public_lb_zone_id
   # Configurable record label (must be a single label - the ACM wildcard
   # *.example.io covers exactly one level under the zone).
@@ -127,7 +127,7 @@ resource "aws_route53_record" "writers_lb" {
 }
 
 resource "aws_route53_record" "readers_lb" {
-  count   = local.public_lb_zone_id != null && var.create_public_records ? 1 : 0
+  count   = local.public_lb_zone_id != null && var.create_public_records && var.readers_lb_dns_name != null ? 1 : 0
   zone_id = local.public_lb_zone_id
   name    = var.readers_record_name
   type    = "A"
@@ -157,21 +157,21 @@ resource "aws_route53_record" "readers_lb" {
 #      to change-record-set on the single public zone is the dedicated
 #      least-privilege ACME identity.
 resource "aws_iam_user" "acme_dns" {
-  count = local.is_passthrough ? 1 : 0
+  count = local.acme_enabled ? 1 : 0
   name  = "${var.cluster_name}-acme-dns"
 
   tags = var.tags
 }
 
 resource "aws_iam_access_key" "acme_dns" {
-  count      = local.is_passthrough ? 1 : 0
+  count      = local.acme_enabled ? 1 : 0
   user       = aws_iam_user.acme_dns[0].name
   depends_on = [aws_iam_user.acme_dns]
 }
 
 # only.
 data "aws_iam_policy_document" "acme_dns" {
-  count = local.is_passthrough ? 1 : 0
+  count = local.acme_enabled ? 1 : 0
 
   statement {
     sid    = "AllowAcmeChallengeRecords"
@@ -201,20 +201,20 @@ data "aws_iam_policy_document" "acme_dns" {
 }
 
 resource "aws_iam_user_policy" "acme_dns" {
-  count  = local.is_passthrough ? 1 : 0
+  count  = local.acme_enabled ? 1 : 0
   name   = "${var.cluster_name}-acme-dns-challenge"
   user   = aws_iam_user.acme_dns[0].name
   policy = data.aws_iam_policy_document.acme_dns[0].json
 }
 
 resource "tls_private_key" "acme_account" {
-  count     = local.is_passthrough ? 1 : 0
+  count     = local.acme_enabled ? 1 : 0
   algorithm = "RSA"
   rsa_bits  = 4096
 }
 
 resource "acme_registration" "main" {
-  count           = local.is_passthrough ? 1 : 0
+  count           = local.acme_enabled ? 1 : 0
   account_key_pem = tls_private_key.acme_account[0].private_key_pem
   email_address   = var.acme_email
 }
@@ -222,7 +222,7 @@ resource "acme_registration" "main" {
 # Why: Wildcard *.cluster.domain covers every node hostname with one cert so
 #      writers/readers/keepers share the same material.
 resource "acme_certificate" "cluster" {
-  count           = local.is_passthrough ? 1 : 0
+  count           = local.acme_enabled ? 1 : 0
   account_key_pem = acme_registration.main[0].account_key_pem
 
   common_name = "*.${var.cluster_name}.${var.public_zone_name}"
@@ -254,7 +254,7 @@ resource "acme_certificate" "cluster" {
 # ClickHouse nodes fetch cert/key/CA from Secrets Manager at boot via their instance role.
 # ----------------------------------------------------------------------------
 resource "aws_secretsmanager_secret" "tls_certificate" {
-  count                   = local.is_passthrough ? 1 : 0
+  count                   = local.acme_enabled ? 1 : 0
   name                    = "${var.tls_secret_prefix}-tls-certificate"
   description             = "Let's Encrypt wildcard certificate (chain) for ClickHouse ${var.cluster_name}"
   recovery_window_in_days = 7
@@ -263,13 +263,13 @@ resource "aws_secretsmanager_secret" "tls_certificate" {
 }
 
 resource "aws_secretsmanager_secret_version" "tls_certificate" {
-  count         = local.is_passthrough ? 1 : 0
+  count         = local.acme_enabled ? 1 : 0
   secret_id     = aws_secretsmanager_secret.tls_certificate[0].id
   secret_string = "${acme_certificate.cluster[0].certificate_pem}${acme_certificate.cluster[0].issuer_pem}"
 }
 
 resource "aws_secretsmanager_secret" "tls_private_key" {
-  count                   = local.is_passthrough ? 1 : 0
+  count                   = local.acme_enabled ? 1 : 0
   name                    = "${var.tls_secret_prefix}-tls-private-key"
   description             = "Let's Encrypt private key for ClickHouse ${var.cluster_name}"
   recovery_window_in_days = 7
@@ -278,13 +278,13 @@ resource "aws_secretsmanager_secret" "tls_private_key" {
 }
 
 resource "aws_secretsmanager_secret_version" "tls_private_key" {
-  count         = local.is_passthrough ? 1 : 0
+  count         = local.acme_enabled ? 1 : 0
   secret_id     = aws_secretsmanager_secret.tls_private_key[0].id
   secret_string = acme_certificate.cluster[0].private_key_pem
 }
 
 resource "aws_secretsmanager_secret" "tls_ca_certificate" {
-  count                   = local.is_passthrough ? 1 : 0
+  count                   = local.acme_enabled ? 1 : 0
   name                    = "${var.tls_secret_prefix}-tls-ca-certificate"
   description             = "Let's Encrypt issuer CA for ClickHouse ${var.cluster_name}"
   recovery_window_in_days = 7
@@ -293,7 +293,7 @@ resource "aws_secretsmanager_secret" "tls_ca_certificate" {
 }
 
 resource "aws_secretsmanager_secret_version" "tls_ca_certificate" {
-  count         = local.is_passthrough ? 1 : 0
+  count         = local.acme_enabled ? 1 : 0
   secret_id     = aws_secretsmanager_secret.tls_ca_certificate[0].id
   secret_string = acme_certificate.cluster[0].issuer_pem
 }
@@ -301,7 +301,7 @@ resource "aws_secretsmanager_secret_version" "tls_ca_certificate" {
 # Why: Instance roles must be able to pull the TLS secrets at bootstrap.
 #      Scoped GetSecretValue to exactly the three TLS secret ARNs.
 resource "aws_secretsmanager_secret_policy" "tls" {
-  count = local.is_passthrough ? 1 : 0
+  count = local.acme_enabled ? 1 : 0
 
   secret_arn = aws_secretsmanager_secret.tls_certificate[0].arn
 

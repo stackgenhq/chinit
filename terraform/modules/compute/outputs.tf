@@ -17,32 +17,32 @@ output "backup_ip" {
 
 output "writers_lb_dns_name" {
   description = "Writers NLB DNS name"
-  value       = aws_lb.writers.dns_name
+  value       = var.enable_nlbs ? aws_lb.writers[0].dns_name : null
 }
 
 output "writers_lb_zone_id" {
   description = "Writers NLB hosted zone id"
-  value       = aws_lb.writers.zone_id
+  value       = var.enable_nlbs ? aws_lb.writers[0].zone_id : null
 }
 
 output "readers_lb_dns_name" {
   description = "Readers NLB DNS name"
-  value       = aws_lb.readers.dns_name
+  value       = var.enable_nlbs ? aws_lb.readers[0].dns_name : null
 }
 
 output "readers_lb_zone_id" {
   description = "Readers NLB hosted zone id"
-  value       = aws_lb.readers.zone_id
+  value       = var.enable_nlbs ? aws_lb.readers[0].zone_id : null
 }
 
 output "writers_lb_arn" {
   description = "Writers NLB ARN (for monitoring)"
-  value       = aws_lb.writers.arn
+  value       = var.enable_nlbs ? aws_lb.writers[0].arn : null
 }
 
 output "readers_lb_arn" {
   description = "Readers NLB ARN (for monitoring)"
-  value       = aws_lb.readers.arn
+  value       = var.enable_nlbs ? aws_lb.readers[0].arn : null
 }
 
 # Target-group ARN suffixes ("targetgroup/<name>/<id>") for the
@@ -53,12 +53,12 @@ output "readers_lb_arn" {
 # alarms blind since creation for exactly this reason).
 output "writers_http_tg_arn_suffix" {
   description = "Writers HTTP target-group ARN suffix (for monitoring)"
-  value       = split("targetgroup/", aws_lb_target_group.writers_http.arn)[1]
+  value       = var.enable_nlbs ? split("targetgroup/", aws_lb_target_group.writers_http[0].arn)[1] : null
 }
 
 output "readers_http_tg_arn_suffix" {
   description = "Readers HTTP target-group ARN suffix (for monitoring)"
-  value       = split("targetgroup/", aws_lb_target_group.readers_http.arn)[1]
+  value       = var.enable_nlbs ? split("targetgroup/", aws_lb_target_group.readers_http[0].arn)[1] : null
 }
 
 output "readers_asg_name" {

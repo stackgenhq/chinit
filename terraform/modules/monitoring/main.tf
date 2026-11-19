@@ -297,7 +297,7 @@ resource "aws_cloudwatch_metric_alarm" "writer_disk" {
 # NLB health alarms
 # ----------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "writers_lb_unhealthy" {
-  count = var.enabled ? 1 : 0
+  count = var.enabled && var.writers_lb_arn_suffix != null ? 1 : 0
 
   alarm_name          = "${local.alarm_prefix}-writers-lb-unhealthy-hosts"
   namespace           = "AWS/NetworkELB"
@@ -324,7 +324,7 @@ resource "aws_cloudwatch_metric_alarm" "writers_lb_unhealthy" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "readers_lb_unhealthy" {
-  count = var.enabled ? 1 : 0
+  count = var.enabled && var.readers_lb_arn_suffix != null ? 1 : 0
 
   alarm_name          = "${local.alarm_prefix}-readers-lb-unhealthy-hosts"
   namespace           = "AWS/NetworkELB"
@@ -350,7 +350,7 @@ resource "aws_cloudwatch_metric_alarm" "readers_lb_unhealthy" {
 # NLB p99 latency — insert-pathology signal for the writers fleet (guidance;
 # the writers ASG step policies act on CPU/backpressure, not on NLB latency)
 resource "aws_cloudwatch_metric_alarm" "writers_lb_latency" {
-  count = var.enabled && var.enable_vertical_guidance ? 1 : 0
+  count = var.enabled && var.enable_vertical_guidance && var.writers_lb_arn_suffix != null ? 1 : 0
 
   alarm_name          = "${local.alarm_prefix}-writers-lb-p99-latency"
   namespace           = "AWS/NetworkELB"

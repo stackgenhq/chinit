@@ -53,6 +53,7 @@ resource "aws_placement_group" "cluster" {
 # NLB fronts writers and readers with static IPs and health checks.
 # ----------------------------------------------------------------------------
 resource "aws_lb" "writers" {
+  count = var.enable_nlbs ? 1 : 0
   # Name keys on the VPC id hash: a VPC-swap replacement must create the new
   # LB before destroying the old one, and ELB names are region-unique - a
   # static name would fail the create with "already exists" (same collision
@@ -83,6 +84,7 @@ resource "aws_lb" "writers" {
 }
 
 resource "aws_lb" "readers" {
+  count = var.enable_nlbs ? 1 : 0
   # Same VPC-keyed naming + forced replacement as aws_lb.writers (see note).
   name               = substr("${var.cluster_name}-r-nlb-${substr(sha256(local.nlb_name_key), 0, 6)}", 0, 32)
   internal           = var.nlb_scheme == "internal"
@@ -104,6 +106,7 @@ resource "aws_lb" "readers" {
 
 # a booting writer is served the moment ClickHouse accepts the health-check TCP connection, no manual registration to race.
 resource "aws_lb_target_group" "writers_http" {
+  count       = var.enable_nlbs ? 1 : 0
   name        = substr("${var.cluster_name}-w-http-${substr(sha256("${var.vpc_id}instance"), 0, 6)}", 0, 32)
   port        = local.target_port_http
   protocol    = "TCP"
@@ -139,6 +142,7 @@ resource "aws_lb_target_group" "writers_http" {
 # name keying as writers_http above (see its comment for the
 # ip→instance flip collision the type key prevents).
 resource "aws_lb_target_group" "writers_native" {
+  count       = var.enable_nlbs ? 1 : 0
   name        = substr("${var.cluster_name}-w-native-${substr(sha256("${var.vpc_id}instance"), 0, 6)}", 0, 32)
   port        = local.target_port_native
   protocol    = "TCP"
@@ -169,6 +173,7 @@ resource "aws_lb_target_group" "writers_native" {
 
 # Readers TG registers via the ASG (target_group_arns) -> instance type.
 resource "aws_lb_target_group" "readers_http" {
+  count       = var.enable_nlbs ? 1 : 0
   name        = substr("${var.cluster_name}-r-http-${substr(sha256(var.vpc_id), 0, 6)}", 0, 32)
   port        = local.target_port_http
   protocol    = "TCP"
@@ -199,6 +204,7 @@ resource "aws_lb_target_group" "readers_http" {
 }
 
 resource "aws_lb_target_group" "readers_native" {
+  count       = var.enable_nlbs ? 1 : 0
   name        = substr("${var.cluster_name}-r-native-${substr(sha256(var.vpc_id), 0, 6)}", 0, 32)
   port        = local.target_port_native
   protocol    = "TCP"
@@ -224,7 +230,8 @@ resource "aws_lb_target_group" "readers_native" {
 }
 
 resource "aws_lb_listener" "writers_http" {
-  load_balancer_arn = aws_lb.writers.arn
+  count             = var.enable_nlbs ? 1 : 0
+  load_balancer_arn = aws_lb.writers[0].arn
   port              = local.listener_port_http
   protocol          = local.listener_protocol
 
@@ -233,12 +240,13 @@ resource "aws_lb_listener" "writers_http" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.writers_http.arn
+    target_group_arn = aws_lb_target_group.writers_http[0].arn
   }
 }
 
 resource "aws_lb_listener" "writers_native" {
-  load_balancer_arn = aws_lb.writers.arn
+  count             = var.enable_nlbs ? 1 : 0
+  load_balancer_arn = aws_lb.writers[0].arn
   port              = local.listener_port_native
   protocol          = local.listener_protocol
 
@@ -246,12 +254,13 @@ resource "aws_lb_listener" "writers_native" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.writers_native.arn
+    target_group_arn = aws_lb_target_group.writers_native[0].arn
   }
 }
 
 resource "aws_lb_listener" "readers_http" {
-  load_balancer_arn = aws_lb.readers.arn
+  count             = var.enable_nlbs ? 1 : 0
+  load_balancer_arn = aws_lb.readers[0].arn
   port              = local.listener_port_http
   protocol          = local.listener_protocol
 
@@ -259,12 +268,13 @@ resource "aws_lb_listener" "readers_http" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.readers_http.arn
+    target_group_arn = aws_lb_target_group.readers_http[0].arn
   }
 }
 
 resource "aws_lb_listener" "readers_native" {
-  load_balancer_arn = aws_lb.readers.arn
+  count             = var.enable_nlbs ? 1 : 0
+  load_balancer_arn = aws_lb.readers[0].arn
   port              = local.listener_port_native
   protocol          = local.listener_protocol
 
@@ -272,7 +282,7 @@ resource "aws_lb_listener" "readers_native" {
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.readers_native.arn
+    target_group_arn = aws_lb_target_group.readers_native[0].arn
   }
 }
 
@@ -561,10 +571,10 @@ resource "aws_autoscaling_group" "readers" {
     }
   }
 
-  target_group_arns = [
-    aws_lb_target_group.readers_http.arn,
-    aws_lb_target_group.readers_native.arn,
-  ]
+  target_group_arns = var.enable_nlbs ? [
+    aws_lb_target_group.readers_http[0].arn,
+    aws_lb_target_group.readers_native[0].arn,
+  ] : []
 
   health_check_grace_period = 300
   health_check_type         = "EC2"
@@ -645,10 +655,10 @@ resource "aws_autoscaling_group" "writers" {
   # full mixed policy instead (see modules/compute/locals.tf writer_refresh_config).
   # ASG-side refresh preferences are still configured via writers_ami_roll's --preferences.
 
-  target_group_arns = [
-    aws_lb_target_group.writers_http.arn,
-    aws_lb_target_group.writers_native.arn,
-  ]
+  target_group_arns = var.enable_nlbs ? [
+    aws_lb_target_group.writers_http[0].arn,
+    aws_lb_target_group.writers_native[0].arn,
+  ] : []
 
   health_check_grace_period = 300
   health_check_type         = "EC2"

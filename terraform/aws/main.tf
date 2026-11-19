@@ -2,112 +2,205 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ============================================================================
-# chinit cluster module (AWS) — one self-contained root module
+# chinit cluster module (AWS) — the ecosystem-composed all-in-one
 # ============================================================================
-# Provisions exactly what a chinit-bootstrapped ClickHouse fleet needs:
-# the private DNS zone, the node-claims lease table, the secrets, the
-# bundle + data + backup buckets, one instance role, the spec/bundle
-# uploads, and the four node roles (writers/readers as lease-identity
-# ASGs, keepers/backup as fixed-identity EC2s). Everything else — load
-# balancers, autoscaling policies, rotation lambdas — is deliberately
-# out of scope; the module is the on-ramp, not the kitchen sink.
+# One small facade that composes the production-hardened ecosystem modules
+# (network, storage, secrets, clickhouse, compute, dns_tls, monitoring,
+# security) around the chinit contract. Every input has a secure default;
+# private-DNS-only by default (no load balancers, no public exposure) —
+# flip enable_nlbs-style paths later or compose the ecosystem modules
+# directly when the facade runs out of room. The facade is the on-ramp,
+# not the ceiling.
 # ============================================================================
 
-# ----------------------------------------------------------------------------
-# Network (optional — bring-your-own via vpc_id/subnet_id)
-# ----------------------------------------------------------------------------
-# A single private subnet, one NAT-less route (S3 and DynamoDB ride the
-# free gateway endpoints; nodes need no other egress to boot: the golden
-# AMI carries every binary, and chinit talks to AWS APIs over IMDS +
-# regional endpoints).
-resource "aws_vpc" "this" {
-  count = var.create_network ? 1 : 0
+module "network" {
+  source = "../modules/network"
 
-  cidr_block           = var.subnet_cidr
-  enable_dns_hostnames = true # required for private-zone discovery
-  enable_dns_support   = true
+  aws_region   = var.region
+  cluster_name = var.cluster_name
 
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-vpc" })
-}
+  # Fresh VPC + private subnet + free S3/DynamoDB gateway endpoints; the
+  # bring-your-own path lives on the network module directly (facade keeps
+  # the simple create/attach choice).
+  vpc_cidr                         = var.subnet_cidr
+  subnet_cidr                      = var.subnet_cidr
+  enable_nat_gateway               = false
+  create_s3_gateway_endpoint       = true
+  create_dynamodb_gateway_endpoint = true
 
-resource "aws_subnet" "nodes" {
-  count = var.create_network ? 1 : 0
-
-  vpc_id                  = aws_vpc.this[0].id
-  cidr_block              = var.subnet_cidr
-  map_public_ip_on_launch = false
-  availability_zone       = data.aws_availability_zones.available.names[0]
-
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-nodes" })
-}
-
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-resource "aws_route_table" "nodes" {
-  count = var.create_network ? 1 : 0
-
-  vpc_id = aws_vpc.this[0].id
-
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-rt" })
-}
-
-resource "aws_route_table_association" "nodes" {
-  count = var.create_network ? 1 : 0
-
-  subnet_id      = aws_subnet.nodes[0].id
-  route_table_id = aws_route_table.nodes[0].id
-}
-
-# Gateway endpoints: free, and the only S3/DynamoDB paths nodes need.
-resource "aws_vpc_endpoint" "s3" {
-  count = var.create_network ? 1 : 0
-
-  vpc_id            = aws_vpc.this[0].id
-  service_name      = "com.amazonaws.${var.region}.s3"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids   = [aws_route_table.nodes[0].id]
+  # Client ingress reaches the per-role SGs from exactly these CIDRs.
+  allowed_source_ips = var.client_cidrs
 
   tags = local.common_tags
 }
 
-resource "aws_vpc_endpoint" "dynamodb" {
-  count = var.create_network ? 1 : 0
+module "storage" {
+  source = "../modules/storage"
 
-  vpc_id            = aws_vpc.this[0].id
-  service_name      = "com.amazonaws.${var.region}.dynamodb"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids   = [aws_route_table.nodes[0].id]
+  cluster_name = var.cluster_name
+
+  data_bucket_name      = local.data_bucket_name
+  backup_bucket_name    = local.backup_bucket_name
+  tenants               = var.tenants
+  data_prefix           = var.s3_data_prefix
+  backup_prefix         = "backups"
+  bootstrap_prefix      = "bootstrap"
+  lifecycle_days_to_ia  = var.lifecycle_days_to_ia
+  cas_prefix            = var.cas_enabled ? var.cas_prefix : ""
+  backup_retention_days = var.backup_retention_days
+
+  # SSE-S3 (free): at ClickHouse part-merge rates, SSE-KMS per-part API
+  # charges dominate the storage bill. Public access blocked + TLS-only
+  # transport are enforced inside the module.
+  vpc_id              = module.network.vpc_id
+  subnet_id           = module.network.subnet_id
+  flow_log_bucket_arn = module.network.flow_log_bucket_arn
 
   tags = local.common_tags
 }
 
-# ----------------------------------------------------------------------------
-# Private DNS zone — node discovery
-# ----------------------------------------------------------------------------
-# chinit self-registers every node's A record (writer-N at claim time,
-# keepers/backup at identity settle). The zone lookup + upsert need the
-# grants in the instance policy below.
-resource "aws_route53_zone" "private" {
-  name = var.dns_zone_name
+module "secrets" {
+  source = "../modules/secrets"
 
-  vpc {
-    vpc_id = local.vpc_id
+  cluster_name = var.cluster_name
+
+  allowed_role_arns = [
+    module.storage.writer_role_arn,
+    module.storage.reader_role_arn,
+    module.storage.keeper_role_arn,
+    module.storage.backup_role_arn,
+  ]
+
+  rotation = {
+    enabled       = local.rotation_enabled
+    rotation_days = var.rotation_days
   }
 
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-private-zone" })
+  tags = local.common_tags
+}
+
+module "clickhouse" {
+  source = "../modules/clickhouse"
+
+  cluster_name  = var.cluster_name
+  timezone      = "UTC"
+  aws_region    = var.region
+  dns_zone_name = var.dns_zone_name
+
+  writer_hostnames       = local.writer_hostnames
+  keeper_hostnames       = local.keeper_hostnames
+  reader_count           = var.reader_max
+  backup_replica_enabled = var.enable_backup
+
+  tenants = var.tenants
+
+  s3_data_bucket     = module.storage.data_bucket_name
+  clickhouse_version = var.cas_enabled ? "26.8.34.20001.altinityantalya" : "26.8.36.3"
+  s3_data_prefix     = var.s3_data_prefix
+  s3_backup_bucket   = module.storage.backup_bucket_name
+  s3_backup_prefix   = "backups"
+
+  bootstrap_bucket = module.storage.data_bucket_name
+  bootstrap_prefix = "bootstrap"
+
+  default_password_secret_name = module.secrets.default_password_secret_name
+  admin_password_secret_name   = module.secrets.admin_password_secret_name
+  writer_password_secret_name  = module.secrets.writer_password_secret_name
+
+  tls_certificate_secret_name    = ""
+  tls_private_key_secret_name    = ""
+  tls_ca_certificate_secret_name = ""
+
+  subnet_cidr        = module.network.subnet_cidr_block
+  nlb_subnet_cidr    = module.network.subnet_cidr_block
+  cache_disk_size_gb = var.cache_disk_size_gb
+
+  admin_allowed_networks        = join(",", distinct(concat(var.client_cidrs, [module.network.subnet_cidr_block])))
+  writer_allowed_networks       = join(",", distinct(concat(var.client_cidrs, [module.network.subnet_cidr_block])))
+  default_user_allowed_networks = join(",", distinct(concat(var.client_cidrs, [module.network.subnet_cidr_block])))
+
+  claimer_table_name = aws_dynamodb_table.node_claims.name
+
+  remote_agent     = coalesce(var.log_shipping.agent, "otel")
+  remote_endpoint  = coalesce(var.log_shipping.endpoint, "")
+  logs_endpoint    = coalesce(var.log_shipping.logs_endpoint, "")
+  metrics_endpoint = coalesce(var.log_shipping.metrics_endpoint, "")
+  traces_endpoint  = coalesce(var.log_shipping.traces_endpoint, "")
+  remote_headers   = coalesce(var.log_shipping.headers, "")
+  metrics_headers  = coalesce(var.log_shipping.metrics_headers, "")
+  traces_headers   = coalesce(var.log_shipping.traces_headers, "")
+  scrape_interval  = coalesce(var.log_shipping.scrape_interval, "15s")
+  fluentbit_output = coalesce(var.log_shipping.fluentbit_output, "otlp")
+
+  otel_trace_probability        = coalesce(var.tracing_config.otel_trace_probability, 0)
+  otel_keeper_trace_probability = coalesce(var.tracing_config.otel_keeper_trace_probability, "auto")
+  otel_trace_processors         = coalesce(var.tracing_config.otel_trace_processors, false)
+  otel_trace_cpu_scheduling     = coalesce(var.tracing_config.otel_trace_cpu_scheduling, false)
+  otel_span_log_ttl_days        = coalesce(var.tracing_config.otel_span_log_ttl_days, 3)
+  trace_log_ttl_days            = coalesce(var.tracing_config.trace_log_ttl_days, 7)
+  global_profiler_period_ns     = coalesce(var.tracing_config.global_profiler_period_ns, 0)
+  log_query_threads             = coalesce(var.tracing_config.log_query_threads, false)
+
+  backup_retention_days     = var.backup_retention_days
+  backup_compression_format = "tar"
+  backup_schedule           = "0 2 * * *"
+  backup_on_demand          = false
+
+
+  cas_enabled              = var.cas_enabled
+  cas_prefix               = var.cas_prefix
+  cas_cache_max_size_bytes = 0
+  cold_move_ttl_days       = var.cas_enabled ? 1 : 7
+  nvme_hot_enabled         = false
+
+  autoscaling_enabled = false
+  writers_asg_name    = "${var.cluster_name}-writers"
+
+  tags = local.common_tags
+
+  depends_on = [module.storage, module.secrets]
+}
+
+data "aws_ami" "public_golden" {
+  count            = var.golden_ami_id == null ? 1 : 0
+  most_recent      = true
+  executable_users = ["all"]
+
+  filter {
+    name   = "name"
+    values = [var.cas_enabled ? "clickhouse-golden-*altinityantalya-*" : "clickhouse-golden-*"]
+  }
+
+  filter {
+    name   = "description"
+    values = [var.cas_enabled ? "*(antalya)*https://github.com/stackgenhq/chinit*" : "*(upstream)*https://github.com/stackgenhq/chinit*"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+
+  filter {
+    name   = "is-public"
+    values = ["true"]
+  }
+
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+}
+
+locals {
+  golden_ami_id = var.golden_ami_id != null ? var.golden_ami_id : data.aws_ami.public_golden[0].id
 }
 
 # ----------------------------------------------------------------------------
-# Node-claims lease table — ordinal identity for the ASG roles
+# Node ordinal claims table (the lease identity store)
 # ----------------------------------------------------------------------------
-# One table serves both roles (writer-N and reader-N hash keys never
-# collide). lease_until carries the TTL: a dead node's claim expires and
-# its ordinal is released for the next replacement — the identity source
-# that makes spot churn safe.
 resource "aws_dynamodb_table" "node_claims" {
-  name         = "${local.name_prefix}-node-claims"
+  name         = "${var.cluster_name}-node-claims"
   billing_mode = "PAY_PER_REQUEST"
 
   hash_key = "hostname"
@@ -122,231 +215,5 @@ resource "aws_dynamodb_table" "node_claims" {
     enabled        = true
   }
 
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-node-claims" })
-}
-
-# ----------------------------------------------------------------------------
-# Password secrets — NAMES reach the nodes; values never do
-# ----------------------------------------------------------------------------
-# random_password + secret version: the plaintext exists only in
-# Terraform state (mark it sensitive where you keep it) and Secrets
-# Manager; the chinit spec carries the NAME and nodes resolve values over
-# the instance role. Access is the resource policy below, so revoking it
-# cuts fleet access in one edit.
-resource "random_password" "default_password" {
-  length  = 24
-  special = false
-}
-
-resource "random_password" "admin_password" {
-  length  = 24
-  special = false
-}
-
-resource "random_password" "writer_password" {
-  length  = 24
-  special = false
-}
-
-resource "aws_secretsmanager_secret" "default_password" {
-  name                    = "${local.name_prefix}-clickhouse-default-password"
-  recovery_window_in_days = 7
-
-  tags = local.common_tags
-}
-
-resource "aws_secretsmanager_secret" "admin_password" {
-  name                    = "${local.name_prefix}-clickhouse-admin-password"
-  recovery_window_in_days = 7
-
-  tags = local.common_tags
-}
-
-resource "aws_secretsmanager_secret" "writer_password" {
-  name                    = "${local.name_prefix}-clickhouse-writer-password"
-  recovery_window_in_days = 7
-
-  tags = local.common_tags
-}
-
-resource "aws_secretsmanager_secret_version" "default_password" {
-  secret_id     = aws_secretsmanager_secret.default_password.id
-  secret_string = random_password.default_password.result
-}
-
-resource "aws_secretsmanager_secret_version" "admin_password" {
-  secret_id     = aws_secretsmanager_secret.admin_password.id
-  secret_string = random_password.admin_password.result
-}
-
-resource "aws_secretsmanager_secret_version" "writer_password" {
-  secret_id     = aws_secretsmanager_secret.writer_password.id
-  secret_string = random_password.writer_password.result
-}
-
-# ----------------------------------------------------------------------------
-# Buckets: the config bundle, the data (cold tier), backups
-# ----------------------------------------------------------------------------
-resource "aws_s3_bucket" "bootstrap" {
-  bucket = "${local.name_prefix}-clickhouse-bootstrap"
-
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-clickhouse-bootstrap" })
-}
-
-resource "aws_s3_bucket" "data" {
-  bucket = "${local.name_prefix}-clickhouse-data"
-
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-clickhouse-data" })
-}
-
-resource "aws_s3_bucket" "backup" {
-  bucket = "${local.name_prefix}-clickhouse-backup"
-
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-clickhouse-backup" })
-}
-
-resource "aws_s3_bucket_public_access_block" "bootstrap" {
-  bucket = aws_s3_bucket.bootstrap.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_public_access_block" "data" {
-  bucket = aws_s3_bucket.data.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_public_access_block" "backup" {
-  bucket = aws_s3_bucket.backup.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "data" {
-  bucket = aws_s3_bucket.data.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "aws:kms"
-    }
-  }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "backup" {
-  bucket = aws_s3_bucket.backup.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "aws:kms"
-    }
-  }
-}
-
-# ----------------------------------------------------------------------------
-# Security groups
-# ----------------------------------------------------------------------------
-# One SG per role: client ports to var.client_cidrs only (empty = no
-# client ingress), interserver 9010 + keeper 9181/9234 between the fleet's
-# SGs, egress open (S3 rides the gateway endpoint; no NAT is provisioned).
-resource "aws_security_group" "nodes" {
-  for_each = toset(["writers", "readers", "keepers", "backup"])
-
-  name        = "${local.name_prefix}-${each.key}-sg"
-  description = "ClickHouse ${each.key} — client ports from var.client_cidrs, interserver/keeper from the fleet"
-  vpc_id      = local.vpc_id
-
-  egress {
-    description = "All outbound (S3/DynamoDB ride the gateway endpoints)"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = merge(local.common_tags, { Name = "${local.name_prefix}-${each.key}-sg" })
-}
-
-# Client ports (HTTP 8123/8443, native 9000/9440) on writers + readers,
-# from var.client_cidrs only (empty list = no client ingress).
-# Client ports (HTTP 8123/8443, native 9000/9440) on writers + readers,
-# from var.client_cidrs only. Rendered ONLY when the list is non-empty:
-# an empty list means "no client ingress yet" — never an open rule.
-resource "aws_security_group_rule" "writers_client" {
-  for_each = length(var.client_cidrs) > 0 ? { for p in [8123, 8443, 9000, 9440] : tostring(p) => p } : {}
-
-  type              = "ingress"
-  security_group_id = aws_security_group.nodes["writers"].id
-  from_port         = each.value
-  to_port           = each.value
-  protocol          = "tcp"
-  cidr_blocks       = var.client_cidrs
-  description       = "ClickHouse client port ${each.value}"
-}
-
-resource "aws_security_group_rule" "readers_client" {
-  for_each = length(var.client_cidrs) > 0 ? { for p in [8123, 8443, 9000, 9440] : tostring(p) => p } : {}
-
-  type              = "ingress"
-  security_group_id = aws_security_group.nodes["readers"].id
-  from_port         = each.value
-  to_port           = each.value
-  protocol          = "tcp"
-  cidr_blocks       = var.client_cidrs
-  description       = "ClickHouse client port ${each.value}"
-}
-
-# Interserver TLS (9010): every server role talks to every other.
-resource "aws_security_group_rule" "interserver" {
-  for_each = { for pair in [
-    { from = "writers", to = "readers" },
-    { from = "writers", to = "writers" },
-    { from = "writers", to = "backup" },
-    { from = "readers", to = "writers" },
-    { from = "readers", to = "readers" },
-    { from = "readers", to = "backup" },
-    { from = "backup", to = "writers" },
-    { from = "backup", to = "readers" },
-  ] : "${pair.from}-to-${pair.to}" => pair }
-
-  type                     = "ingress"
-  security_group_id        = aws_security_group.nodes[each.value.to].id
-  from_port                = 9010
-  to_port                  = 9010
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.nodes[each.value.from].id
-  description              = "Interserver TLS from ${each.value.from}"
-}
-
-# Keeper client port (9181) from every server role + keeper raft (9234)
-# between keepers.
-resource "aws_security_group_rule" "keeper_client" {
-  for_each = { for from in ["writers", "readers", "backup", "keepers"] : from => from }
-
-  type                     = "ingress"
-  security_group_id        = aws_security_group.nodes["keepers"].id
-  from_port                = 9181
-  to_port                  = 9181
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.nodes[each.value].id
-  description              = "Keeper coordination from ${each.value}"
-}
-
-resource "aws_security_group_rule" "keeper_raft" {
-  type                     = "ingress"
-  security_group_id        = aws_security_group.nodes["keepers"].id
-  from_port                = 9234
-  to_port                  = 9234
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.nodes["keepers"].id
-  description              = "Keeper Raft consensus (keepers only)"
+  tags = merge(local.common_tags, { Name = "${var.cluster_name}-node-claims" })
 }

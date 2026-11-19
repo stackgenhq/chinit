@@ -5,11 +5,36 @@
 
 # Terraform Modules for `chinit` Clusters
 
-These root-callable Terraform modules deploy a `chinit`-bootstrapped ClickHouse cluster on cloud VMs.
+Deploy a `chinit`-bootstrapped ClickHouse cluster on cloud VMs.
+
+## Install (AWS)
+
+```hcl
+module "clickhouse" {
+  source = "github.com/stackgenhq/chinit//terraform/aws?ref=<release-tag>"
+
+  cluster_name = "demo"
+  region       = "us-west-2"
+  alert_emails = ["ops@example.com"] # where alarms + security findings go
+}
+```
+
+```bash
+tofu init
+tofu apply
+tofu output node_endpoints   # private DNS names to connect to
+```
+
+That single call provisions a secure, HA-shaped fleet: on-demand writers
+ASG, Spot-diversified readers ASG, 3 keepers, a backup replica, S3-backed
+tiered storage, Secrets Manager passwords with rotation, GuardDuty +
+Security Hub, and CloudWatch alarms with scaling guidance — private-DNS
+only, no load balancers, no public exposure, no static credentials. See
+[`aws/README.md`](./aws/README.md) for every default and knob.
 
 | Cloud | Module | Prerequisites |
 |---|---|---|
-| AWS | [`aws/`](./aws) | A golden AMI (built from [`images/aws`](../images/aws) or copied from the public AMI) |
+| AWS | [`aws/`](./aws) | A golden AMI (built from [`images/aws`](../images/aws), or auto-resolved from the public AMI in us-west-2) + an ACME provider block in your root |
 | Azure | [`azure/`](./azure) | A golden Compute Gallery image (built from [`images/azure`](../images/azure)) and an Azure Resource Group |
 
 ## Contract Modules (`modules/chinit/`)
@@ -35,7 +60,14 @@ You can use these modules in two ways:
 
 ## Design Philosophy
 
-These modules focus on the core resources required to run a `chinit`-managed ClickHouse cluster: storage, identity leases, private DNS, secrets, IAM/RBAC, and compute instances. Surrounding infrastructure such as external load balancers, custom autoscaling policies, and organization-specific monitoring stacks remain in your own root module.
+The all-in-one modules compose the ecosystem modules — nothing is
+duplicated. They focus on the core resources required to run a
+`chinit`-managed ClickHouse cluster: storage, identity leases, private
+DNS, secrets, IAM/RBAC, compute instances, monitoring, and threat
+detection. Surrounding infrastructure such as existing VPCs, NLBs, public
+DNS, mixed instance pools, and organization-specific stacks belong in
+your own root module — compose the ecosystem modules directly (the
+facade is the on-ramp, not the ceiling).
 
 ## Directory Layout
 

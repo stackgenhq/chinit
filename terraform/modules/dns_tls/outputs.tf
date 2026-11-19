@@ -40,7 +40,7 @@ output "tls_ca_certificate_secret_name" {
 
 output "cert_expiration_date" {
   description = "Certificate expiry (feeds the cert-expiry alarm)"
-  value       = local.is_passthrough ? acme_certificate.cluster[0].certificate_not_after : null
+  value       = local.acme_enabled ? acme_certificate.cluster[0].certificate_not_after : null
 }
 
 # Public records

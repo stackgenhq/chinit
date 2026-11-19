@@ -69,21 +69,25 @@ variable "public_zone_name" {
 }
 
 variable "writers_lb_dns_name" {
-  description = "Writers NLB DNS name for the public A record"
+  description = "Writers NLB DNS name for the public A record (null when the cluster runs without NLBs — private-DNS-only access)"
   type        = string
+  default     = null
 }
 
 variable "writers_lb_zone_id" {
+  default     = null
   description = "Writers NLB hosted zone id (alias target)"
   type        = string
 }
 
 variable "readers_lb_dns_name" {
-  description = "Readers NLB DNS name for the public A record"
+  description = "Readers NLB DNS name for the public A record (null when the cluster runs without NLBs — private-DNS-only access)"
   type        = string
+  default     = null
 }
 
 variable "readers_lb_zone_id" {
+  default     = null
   description = "Readers NLB hosted zone id (alias target)"
   type        = string
 }

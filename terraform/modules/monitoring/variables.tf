@@ -188,11 +188,13 @@ variable "disk_percent_threshold" {
 variable "writers_lb_arn_suffix" {
   description = "Writers NLB ARN suffix (load balancer dimension)"
   type        = string
+  default     = null
 }
 
 variable "readers_lb_arn_suffix" {
   description = "Readers NLB ARN suffix (load balancer dimension)"
   type        = string
+  default     = null
 }
 
 # Target-group suffixes: NetworkELB publishes UnHealthyHostCount and
@@ -202,11 +204,13 @@ variable "readers_lb_arn_suffix" {
 variable "writers_http_tg_arn_suffix" {
   description = "Writers HTTP target-group ARN suffix (target group dimension)"
   type        = string
+  default     = null
 }
 
 variable "readers_http_tg_arn_suffix" {
   description = "Readers HTTP target-group ARN suffix (target group dimension)"
   type        = string
+  default     = null
 }
 
 # ClickHouse-level alarms (scraped from the nodes' :9363/metrics endpoint)

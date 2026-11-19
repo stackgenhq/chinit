@@ -1,13 +1,24 @@
 # Copyright (C) 2026 StackGen, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Example — a minimal chinit cluster on AWS
+# Example — a minimal chinit cluster on AWS.
 #
-# Prereq: a golden AMI built from images/aws (packer build …); pass its
-# id as golden_ami_id (or -var / a tfvars file).
+# Copy this directory as your root, set the two required variables, and:
+#   tofu init && tofu apply
+#
+# Prereq: a golden AMI built from images/aws (packer build …); pass its id
+# as golden_ami_id, or leave null in us-west-2 to auto-resolve the public
+# stackgenhq/chinit golden AMI.
 
 provider "aws" {
   region = "us-west-2"
+}
+
+# The dns_tls module can issue Let's Encrypt certs via DNS-01. Configure
+# the ACME provider once at the ROOT (the provider schema demands
+# server_url at config time even when the ACME path is unused).
+provider "acme" {
+  server_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
 }
 
 module "clickhouse" {
@@ -15,29 +26,23 @@ module "clickhouse" {
 
   cluster_name  = "demo"
   region        = "us-west-2"
-  golden_ami_id = "ami-04292dd0d9281579e" # Public Altinity Antalya 26.8 golden AMI (or omit in us-west-2 to auto-resolve)
+  golden_ami_id = null # auto-resolve the public golden AMI (us-west-2)
 
-  # Identity ceilings (ASG maxima — never live counts)
+  # Fleet shape (defaults shown; every value has a secure default)
   writer_max     = 2
   writer_desired = 2
   reader_max     = 6
   reader_desired = 2
+  reader_spot    = 0.5 # half the reader slots above the base on Spot
   keeper_count   = 3
   enable_backup  = true
 
-  # Network: a fresh VPC in 10.42.0.0/24 (set create_network = false and
-  # pass vpc_id/subnet_id to plug into an existing one)
-  create_network = true
-  subnet_cidr    = "10.42.0.0/24"
-  client_cidrs   = ["10.42.0.0/24"] # your clients' CIDRs
+  # Client ingress: none until you name CIDRs (never an open rule)
+  client_cidrs = ["10.0.0.0/16"]
 
-  dns_zone_name = "clickhouse.internal"
-}
+  alert_emails = ["ops@example.com"]
 
-output "writer_0" {
-  value = "writer-0.${module.clickhouse.dns_zone_name}"
-}
-
-output "admin_password_secret" {
-  value = module.clickhouse.secrets.admin_password # fetch with aws secretsmanager
+  tags = {
+    project = "demo"
+  }
 }
