@@ -16,4 +16,4 @@ images/**/*.pkrvars.hcl
 images/**/chinit-artifacts/
 images/**/packer-role-temp.json
 # Terraform archive-provider build artifacts (rotation Lambda zip)
-terraform/modules/secrets/rotation_lambda.zip
+terraform/aws/modules/secrets/rotation_lambda.zip
