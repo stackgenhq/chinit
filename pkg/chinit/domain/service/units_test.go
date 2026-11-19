@@ -331,3 +331,26 @@ var _ = Describe("shutdownDrainUnit", func() {
 		Expect(u.Content).To(ContainSubstring("TimeoutStopSec=170"))
 	})
 })
+
+var _ = Describe("spotWatchEligible", func() {
+	// The 2026-11-19 writer-5/writer-7 finding: dev runs writer-1..N
+	// 100% Spot (writer_spot_ratio = 1.0 above the on-demand base), and
+	// the retired Spot writers left ghost replica registrations that
+	// wedged the fleet's replication queues — the spot-watch daemon
+	// (the notice-driven full drain) was reader-only. The gate now
+	// covers every role whose departure must release a registration +
+	// lease + DNS inside the 2-minute ITN window.
+
+	It("includes writers and readers — the ASG roles with a registration to release", func() {
+		Expect(spotWatchEligible(model.RoleWriter)).To(BeTrue())
+		Expect(spotWatchEligible(model.RoleReader)).To(BeTrue())
+	})
+
+	It("excludes keepers and the backup replica", func() {
+		// Keepers hold no lease and run no server; backup-0 is static
+		// (never spot) and its identity must survive a notice.
+		Expect(spotWatchEligible(model.RoleKeeper)).To(BeFalse())
+		Expect(spotWatchEligible(model.RoleBackup)).To(BeFalse())
+		Expect(spotWatchEligible(model.Role(""))).To(BeFalse())
+	})
+})

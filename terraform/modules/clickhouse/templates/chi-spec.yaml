@@ -1,0 +1,432 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CHI spec rendered by Terraform (modules/clickhouse) — the chinit-loaded source
+# of truth for schema sync, replica drop and config rendering.
+# Cloud-free subset: topology, profiles, settings, query logging, the
+# JSON logger and the Prometheus endpoint all render from here; TLS,
+# storage disks and networking stay in the XML templates (hybrid
+# strategy — storage.xml carries the Terraform-computed S3 disk layout,
+# ssl.xml/network.xml carry cloud TLS/CIDR state).
+#
+# The ClickHouse cluster is named ${cluster_name}: the loader's cluster key,
+# the rendered remote_servers.xml and the systemd units all use this name.
+# Writers + readers are replicas of ONE shard (all tables are
+# ReplicatedMergeTree; the generator emits internal_replication=true) —
+# replicasCount is the full writer+reader fleet size, driven by Terraform.
+# secure: distributed/interserver connections use the TLS port (9440);
+# per-replica distributed-query credentials are injected at render time
+# (-remote-user/-remote-password-file), never in this spec.
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: ${cluster_name}
+spec:
+  configuration:
+    clusters:
+      - name: ${cluster_name}
+        secure: "yes"
+        # The shard is NAMED "01": the macros <shard> renders the shard
+        # NAME, and every ReplicatedMergeTree keeper path embeds
+        # /clickhouse/tables/{shard}/... — the pre-chctl stack used
+        # <shard>01</shard> and the fleet's data is registered under
+        # /clickhouse/tables/01/. An anonymous shardsCount layout would
+        # render the operator's 0-based shard INDEX (0) and silently
+        # re-key every table's keeper path — replicas would re-register
+        # under a fresh empty tree and existing parts would vanish from
+        # view (the live finding). CR host names become "01-0",
+        # "01-1", ... — the inventory maps them to cloud DNS.
+        layout:
+          shards:
+            - name: "01"
+              replicasCount: ${replica_count}
+    # Keeper ensemble (renders per host into chop-generated-zookeeper.xml
+    # together with the distributed_ddl queue path): coordination is
+    # ClickHouse-domain data; the DNS names are the stack's private zone.
+    zookeeper:
+      nodes:
+%{for keeper in keepers~}
+        - host: ${keeper}
+          port: 9181
+%{endfor~}
+    profiles:
+      default/async_insert: "1"
+      # S3Queue runtime S3 access: 26.8 refuses server-credential use
+      # from user queries by default ("S3 access from user queries is
+      # not allowed to use the server's own credentials"); the queue's
+      # background workers inherit this profile. The queue table's
+      # CREATE (schema-sync/migrations) carries the setting per-query;
+      # this profile setting is the RUNTIME path (a hand-written users.d
+      # fix per writer applies only until the next convergence, never
+      # durably). Omitted on Antalya 26.6.x
+      # (where the setting does not exist and server creds work by default).
+      ${s3_allow_server_credentials_line}
+      # Async Inserts: buffers small inserts into fewer, larger parts.
+      # With the hot/cold layout, inserts land on the LOCAL default
+      # disk, so async-insert primarily protects merge/part counts
+      # (too many small parts starve merges); S3 write latency now
+      # sits on the TTL-move path, not the insert path.
+      default/async_insert_max_data_size: "104857600"
+      default/async_insert_busy_timeout_ms: "10000"
+      default/async_insert_stale_timeout_ms: "5000"
+      default/wait_for_async_insert: "1"
+      # External aggregation: prevent OOM on large GROUP BY/SORT.
+      # (Values sized in the reader-memory-guard block below. They must fit the SMALLEST
+      # node the profile renders on, the 16 GiB t4g.xlarge readers.)
+      # Hedged requests: resilience against S3 latency spikes.
+      # NOTE: hedged_connections_limit, asynchronous_read_pull_pool_size,
+      # background_read_pool_size and remote_read_max_threads (carried by
+      # the retired static settings.xml) do NOT exist as settings in 26.8
+      # (not in system.settings nor system.server_settings — names from an
+      # older release). They were silently ignored while profiles rode in
+      # config.d; in a users.d profile they would fail the load with
+      # UNKNOWN_SETTING (Code 115) and crash the server, so they are
+      # deliberately absent here.
+      default/use_hedged_requests: "1"
+      # Thread pools tuned for S3 reads
+      default/max_download_threads: "32"
+      default/min_bytes_to_use_direct_io: "1048576"
+      # Reader-side memory guard (load-test finding:
+      # a reader's backfill merge or query exceeded an 8-16 GiB node's
+      # server limit — Code: 241 — when external-sort/spill thresholds and
+      # mark_cache_size were sized for 64 GiB writers. The profile renders
+      # on every node, so thresholds must fit the 8 GiB minimum RAM floor
+      # (~7.2 GiB server limit at max_server_memory_usage_to_ram_ratio=0.9):
+      # 3 GiB group-by / 2 GiB sort forces external spilling well before
+      # exhausting RAM needed by background merges.)
+      default/max_bytes_before_external_group_by: "3221225472"
+      default/max_bytes_before_external_sort: "2147483648"
+      # Write-through filesystem cache: pairs with cache_on_write_operations
+      # on the cache disks in storage.xml. BOTH flags are required — the
+      # disk-level flag enables the cache's write path, this query-level
+      # setting (default false) is the global on-switch carried by every
+      # write's WriteSettings. With both set, TTL-moved parts written to S3
+      # through s3_cache / cache_<tenant> wrappers are locally readable
+      # without a re-download on the first query after the move.
+      default/enable_filesystem_cache_on_write_operations: "1"
+%{if otel_trace_probability > 0~}
+      default/opentelemetry_start_trace_probability: "${otel_trace_probability}"
+      default/opentelemetry_start_keeper_trace_probability: "${otel_keeper_trace_prob}"
+      default/opentelemetry_trace_processors: "${otel_trace_processors}"
+      default/opentelemetry_trace_cpu_scheduling: "${otel_trace_cpu_scheduling}"
+%{endif~}
+%{if log_query_threads == "1"~}
+      default/log_query_threads: "1"
+%{endif~}
+      # NO-DATA-LOSS ingestion profile (carried by the writer user):
+      # synchronous replication - INSERT returns only after quorum
+      # replicas hold the part; retry dedup prevents duplicate rows.
+      # insert_quorum is ENVIRONMENT-DERIVED (the guaranteed-alive
+      # floor's majority, rendered by Terraform from the ASG minimums
+      # — see the module's insert_quorum variable): a small fleet's
+      # scale-out ceiling must not demand prod-grade ack
+      # counts its ASG minimums cannot answer. The floor-majority
+      # keeps synchronous durability against the fleet that is ALWAYS
+      # there. Currently floor = writer_min(1) + min_readers(1) +
+      # backup(1) = 3 -> quorum 2; dropping writer_min to 1 (a Spot dev
+      # experiment) takes the fleet from quorum 3 to 2.
+      # insert_quorum_timeout is MILLISECONDS despite the name (the _ms
+      # suffix variant does NOT exist in 26.8 - UNKNOWN_SETTING at load).
+      # insert_deduplicate (real 26.8 setting) stays at its default ON;
+      # insert_deduplicate_sync_processing does NOT exist in 26.8
+      # (UNKNOWN_SETTING at load — the live writer-0 finding) and must
+      # never ride in the spec.
+      ingest/insert_quorum: "${insert_quorum}"
+      ingest/insert_quorum_timeout: "180000"
+      ingest/select_sequential_consistency: "1"
+%{if otel_trace_probability > 0~}
+      ingest/opentelemetry_start_trace_probability: "${otel_trace_probability}"
+      ingest/opentelemetry_start_keeper_trace_probability: "${otel_keeper_trace_prob}"
+      ingest/opentelemetry_trace_processors: "${otel_trace_processors}"
+      ingest/opentelemetry_trace_cpu_scheduling: "${otel_trace_cpu_scheduling}"
+%{endif~}
+%{if log_query_threads == "1"~}
+      ingest/log_query_threads: "1"
+%{endif~}
+    settings:
+      # Server-level settings (26.8 LTS validated — ClickHouse 26.x
+      # STRICTLY validates server-level settings; unknown elements fail
+      # startup with Code: 137 UNKNOWN_ELEMENT_IN_CONFIG, e.g. <log_level>
+      # which belongs in the logger section, or <storage_policy> inside
+      # merge_tree).
+      #
+      # tcp_port_secure: ssl.xml binds Native TCP TLS on 9440 and
+      # Interserver HTTPS part-exchange on 9010 (ssl.xml loads after
+      # chop-generated-settings.xml alphabetically). Setting 9440 here
+      # makes `secure: yes` render <port>9440</port> into remote_servers
+      # so distributed / clusterAllReplicas() queries connect to the
+      # Native TCP TLS listener on 9440 instead of the HTTPS
+      # InterserverIOHTTPHandler on 9010 (which fails with Code 102
+      # UNEXPECTED_PACKET_FROM_SERVER).
+      tcp_port_secure: "9440"
+      max_concurrent_queries: "150"
+      max_server_memory_usage_to_ram_ratio: "0.9"
+      # Timezone: UTC for consistency across distributed systems
+      timezone: UTC
+      # Cache sizes: mark cache for S3-backed parts is critical, but must
+      # fit inside the 8 GiB minimum server RAM floor (~7.2 GiB at 0.9
+      # ratio) alongside background merges (5 GiB mark + 1 GiB uncompressed
+      # left only ~1.2 GiB for merges on an 8 GiB node, causing Code 241
+      # OOM during backfill merges). 2 GiB mark + 512 MiB uncompressed
+      # leaves >4.5 GiB of headroom on 8 GiB nodes.
+      mark_cache_size: "2147483648"
+      # uncompressed_cache_size: small by design. This cache only pays
+      # off when the same blocks are decompressed repeatedly (wide scans
+      # of hot columns); the 8GB it previously reserved competes with the
+      # OS page cache that already serves hot local parts and cache-disk
+      # reads. With per-column codecs in the table DDL (QUICK_START.md -
+      # ZSTD/DoubleDelta), per-block decompression is cheap enough that
+      # 512MB covers the reuse window. RAM saved here is better spent as
+      # page cache.
+      uncompressed_cache_size: "536870912"
+      # Monitoring: high-resolution metrics for throttling detection
+      asynchronous_metrics_update_period_s: "1"
+      # Background pools: merges, part moves (S3 <-> local cache),
+      # scheduled tasks
+      background_pool_size: "16"
+      background_move_pool_size: "8"
+      background_schedule_pool_size: "16"
+      # Replication part-fetch pool (load-test finding):
+      # default 16 fetch threads starves a fresh node's backfill during
+      # scale-out — writer queues of ~1,300 GET_PART entries drained at
+      # ~2/min with DNS retries eating cycles, and readers took 30+ min
+      # to converge after boot. The fetch pool is IO-bound (S3-backed
+      # parts land via the cache disks; interserver fetches are TCP
+      # waits), not CPU-bound, so doubling the threads costs RAM only.
+      # 32 gives a scale-out node parity with its S3Queue processing
+      # threads (8) x 4 file streams while steady-state traffic holds
+      # a fraction of it.
+      background_fetches_pool_size: "32"
+      # Merge debt headroom (the same test's parts finding): parts
+      # climbed to ~2,400/writer during the 2-hour soak while merges
+      # ran — debt, not a stall (cap is parts_to_throw_insert=3000,
+      # MergeTreeSettings.cpp:1230), but the margin was thin. Doubling
+      # the merge concurrency ratio on the S3-backed tier lets the
+      # merge executor suspend/resume more large merges in flight
+      # (round_robin scheduler already interleaves them; the ratio is
+      # the scheduler's own lever, Context.cpp:9985).
+      background_merges_mutations_concurrency_ratio: "4"
+      # Format schema path (Cap'n Proto etc.) — cloud-init still mkdir's it
+      format_schema_path: /var/lib/clickhouse/format_schemas
+
+      # MergeTree engine defaults. <storage_policy> is NOT valid here in
+      # 26.x (unknown element); tables set their policy via SETTINGS
+      # storage_policy = 'tiered'. Zero-copy replication of S3 parts is
+      # DEPRECATED upstream (PR #82250 removed its tests in 2025; broken
+      # garbage collection was the root cause). Without it,
+      # ReplicatedMergeTree replicas physically copy parts - so every
+      # replica MUST write its own S3 path (see the {replica} macro in
+      # storage.xml/tenant-disk.xml). Do NOT enable
+      # allow_remote_fs_zero_copy_replication. The CAS cold tier
+      # (var.cas_config.enabled) replaces the per-replica
+      # layout for tables on the cas_* policies instead, at the disk layer.
+      # execute_merges_on_single_replica_time_threshold: gated on CAS
+      # (single_replica_merge_threshold = 3600 when cas_enabled, 0 otherwise).
+      # On non-CAS per-replica storage, setting this >0 forces N-1 writers to
+      # postpone local hot-disk merges ("waiting for writer-X to execute merge")
+      # and wait to fetch merged parts over interserver :9010 — starving merges
+      # during replica churn and driving active parts past parts_to_throw_insert.
+      merge_tree/execute_merges_on_single_replica_time_threshold: "${single_replica_merge_threshold}"
+      merge_tree/remote_fs_execute_merges_on_single_replica_time_threshold: "${single_replica_merge_threshold}"
+      merge_tree/prefer_fetch_merged_part_time_threshold: "180"
+      merge_tree/prefer_fetch_merged_part_size_threshold: "1048576"
+      replicated_merge_tree/min_absolute_delay_to_close: "300"
+      replicated_merge_tree/min_relative_delay_to_close: "120"
+      merge_tree/max_bytes_to_merge_at_max_space_in_pool: "161061273600"
+      merge_tree/max_bytes_to_merge_at_min_space_in_pool: "161061273600"
+      merge_tree/number_of_free_entries_in_pool_to_lower_max_size_of_merge: "12"
+      merge_tree/max_replicated_merges_in_queue: "10000"
+      merge_tree/max_merge_selecting_sleep_ms: "5000"
+      merge_tree/vertical_merge_algorithm_min_rows_to_activate: "1000000"
+      # max_parts_to_merge_at_once: WAS 20 — a self-imposed cap far
+      # below the upstream DEFAULT of 100 (MergeTreeSettings.cpp:813:
+      # "The selector never considers merge candidates wider than
+      # this"). A sustained soak measured the cost: 2,357 events
+      # parts on a writer with only 14 in-flight merges — the
+      # selector was collapsing debt 20 parts per round while the
+      # fleet churned (each churn wave re-adds backfill parts faster
+      # than 20-wide rounds retire them). 100 restores the upstream
+      # default: each round can absorb a full hour of 60TB/day-class
+      # inserts (measured ~3.4 parts/s/node) in a single wide merge,
+      # cutting the post-churn debt-clearing rounds by ~5x. The
+      # selector still self-limits by size via the max_bytes_to_merge
+      # pair (150 GiB) — width 100 with that ceiling is the same
+      # shape ClickHouse ships.
+      merge_tree/max_parts_to_merge_at_once: "100"
+      # Larger merges (the max_bytes_to_merge_* pair above) reduce S3
+      # API transaction costs.
+      # Prevent "Too many parts" errors during write bursts and post-roll
+      # backfill across events AND summary MV target tables.
+      merge_tree/parts_to_delay_insert: "8000"
+      merge_tree/parts_to_throw_insert: "15000"
+      # TTL-move throttle: minimum seconds between merges carrying a TTL
+      # expression (row TTL / TO VOLUME moves). The hot/cold policies
+      # generate continuous small TTL-movable parts at steady insert
+      # rate; without a throttle every merge cycle wants a move and the
+      # background pool saturates with S3 uploads. 300s keeps decay pace
+      # well behind ingest while still honoring move_factor disk-pressure
+      # (which bypasses this throttle).
+      merge_tree/merge_with_ttl_timeout: "300"
+      # Whole-part TTL drops: when a part is fully expired (per
+      # PARTITION BY + row TTL), drop the part object instead of
+      # rewriting rows out of it. With toDate(timestamp) partitions and
+      # day-bounded retention this makes expiry nearly free on S3 - one
+      # DELETE per fully-expired part vs a rewrite + re-upload. Parts
+      # containing any live rows still rewrite normally.
+      merge_tree/ttl_only_drop_parts: "1"
+      # Compact-part floor: OSS default
+      # min_bytes_for_wide_part = 10 MiB writes 1 S3 object per
+      # column/mark (~35 S3 objects/part); ClickHouse Cloud overrides
+      # this to 1 GiB so parts <1 GiB stay in compact format (~11
+      # objects/part), cutting Tier-1 S3 PUT requests by ~3.2x.
+      merge_tree/min_bytes_for_wide_part: "1073741824"
+
+      # Compression: LZ4 is the fallback for columns WITHOUT an explicit
+      # CODEC clause. The real lever is per-column CODEC in table DDL
+      # (QUICK_START.md: ZSTD(3) for log text, DoubleDelta+ZSTD for
+      # timestamps, LowCardinality for enumerated strings) - codecs land
+      # 2-4x over LZ4 on log-shaped data and directly shrink S3 at-rest
+      # + cache footprint. Measure before/after with
+      # tune via system.parts_columns ratios.
+      compression/case/method: lz4
+
+      # Query logs: system.query_log/query_thread_log parameters plus
+      # the partition/TTL policy that keeps the log tables bounded.
+      # TTL for EVERY configured log: system log tables have NO default
+      # TTL in 26.8 (base getDefaultTTL returns "" —
+      # src/Common/SystemLogBase.h), and a log without a TTL is worse
+      # than just unbounded: when max_size_rows triggers rotation, the
+      # rotated table is frozen readonly as an optimization
+      # (src/Interpreters/SystemLog.cpp) and readonly tables never run
+      # TTL drops — only logs configured WITH a TTL stay writable and
+      # get reclaimed. query_thread_log is the fastest grower (one row
+      # per thread per query); part_log is the hot->cold move diagnostic
+      # for the S3 tiering; metric_log is high-resolution by design
+      # (asynchronous_metrics_update_period_s=1).
+      query_log/database: system
+      query_log/table: query_log
+      query_log/flush_interval_milliseconds: "7500"
+      query_log/max_size_rows: "1048576"
+      query_log/reserved_size_rows: "8192"
+      query_log/buffer_size_rows: "65536"
+      query_log/flush_on_crash: "false"
+      query_log/partition_by: "toYYYYMM(event_date)"
+      query_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      query_thread_log/database: system
+      query_thread_log/table: query_thread_log
+      query_thread_log/flush_interval_milliseconds: "7500"
+      query_thread_log/max_size_rows: "1048576"
+      query_thread_log/reserved_size_rows: "8192"
+      query_thread_log/buffer_size_rows: "65536"
+      query_thread_log/partition_by: "toYYYYMM(event_date)"
+      query_thread_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      part_log/partition_by: "toYYYYMM(event_date)"
+      part_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+      metric_log/partition_by: "toYYYYMM(event_date)"
+      metric_log/ttl: "event_date + INTERVAL 30 DAY DELETE"
+      query_views_log/partition_by: "toYYYYMM(event_date)"
+      query_views_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+%{if global_profiler_period_ns > 0~}
+      global_profiler_real_time_period_ns: "${global_profiler_period_ns}"
+      global_profiler_cpu_time_period_ns: "${global_profiler_period_ns}"
+%{endif~}
+%{if otel_span_log_ttl_days > 0~}
+      opentelemetry_span_log/engine: "ENGINE = MergeTree PARTITION BY toYYYYMM(finish_date) ORDER BY (finish_date, finish_time_us) TTL finish_date + INTERVAL ${otel_span_log_ttl_days} DAY DELETE"
+%{endif~}
+%{if trace_log_ttl_days > 0~}
+      trace_log/partition_by: "toYYYYMM(event_date)"
+      trace_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+      processors_profile_log/partition_by: "toYYYYMM(event_date)"
+      processors_profile_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+      s3queue_log/partition_by: "toYYYYMM(event_date)"
+      s3queue_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+      blob_storage_log/partition_by: "toYYYYMM(event_date)"
+      blob_storage_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+      background_schedule_pool_log/partition_by: "toYYYYMM(event_date)"
+      background_schedule_pool_log/ttl: "event_date + INTERVAL ${trace_log_ttl_days} DAY DELETE"
+%{endif~}
+    files:
+      # Server JSON logging (OTEL semantic conventions: field names map
+      # to OTEL-friendly names — timestamp, severity, etc.) for OTEL
+      # collector ingestion. A dedicated file, not settings keys, so
+      # the <formatting><names> block renders as nested elements with
+      # the clickhouse root, exactly like keeper-logging.xml.
+      server-logger.xml: |
+        <clickhouse>
+            <logger>
+                <level>${log_level}</level>
+                <errorlog_level>error</errorlog_level>
+                <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+                <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+                <size>1000M</size>
+                <count>10</count>
+                <levels>
+                    <MergeMutateSelectedEntry>error</MergeMutateSelectedEntry>
+                    <CurrentlyMergingPartsTagger>error</CurrentlyMergingPartsTagger>
+                </levels>
+                <formatting>
+                    <type>json</type>
+                    <names>
+                        <date_time>timestamp</date_time>
+                        <thread_name>thread</thread_name>
+                        <thread_id>thread_id</thread_id>
+                        <level>severity</level>
+                        <query_id>query_id</query_id>
+                        <logger_name>logger</logger_name>
+                        <message>message</message>
+                        <source_file>source_file</source_file>
+                        <source_line>source_line</source_line>
+                    </names>
+                </formatting>
+            </logger>
+        </clickhouse>
+      # system.text_log: the per-GB CloudWatch
+      # pipe carries only <log_level>; every verbose line stays in the
+      # cluster ZSTD table, TTL-dropped. Source: Loggers.cpp raises the
+      # root logger to max(external sinks, text_log.level) so no sink is
+      # starved; SystemLog.cpp reads partition_by/ttl/flush from the
+      # config node.
+      server-text-log.xml: |
+        <clickhouse>
+            <text_log>
+                <level>${text_log_level}</level>
+                <database>system</database>
+                <table>text_log</table>
+                <partition_by>toYYYYMM(event_date)</partition_by>
+                ${text_log_ttl_line}
+                <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+                <max_size_rows>1048576</max_size_rows>
+            </text_log>
+        </clickhouse>
+      # Server Prometheus metrics endpoint (localhost, CW agent scrapes
+      # it). SECURITY: bound to 127.0.0.1 only to prevent unauthorized
+      # network access; metrics collection is done by local agents
+      # (CloudWatch agent, OTEL collector) on the same host.
+      server-prometheus.xml: |
+        <clickhouse>
+            <prometheus>
+                <endpoint>/metrics</endpoint>
+                <port>9363</port>
+                <host>127.0.0.1</host>
+                <metrics>true</metrics>
+                <events>true</events>
+                <asynchronous_metrics>true</asynchronous_metrics>
+                <status_info>true</status_info>
+                <export_metrics_histogram>true</export_metrics_histogram>
+                <export_metrics_histogram_buckets>0.01,0.05,0.1,0.5,1,5,10,60</export_metrics_histogram_buckets>
+            </prometheus>
+        </clickhouse>
+    users:
+      # Passwords NEVER live here — passwordFrom references the cloud
+      # secret store (Secrets Manager name passed from Terraform); the renderer
+      # users render resolves + SHA256-hashes at boot. Profiles: default
+      # is read-only (queries), admin manages, writer carries the
+      # no-data-loss ingest profile.
+      default/passwordFrom: "${default_password_secret_name}"
+      default/profile: readonly
+      default/quota: default
+      admin/passwordFrom: "${admin_password_secret_name}"
+      admin/profile: default
+      admin/access_management: "1"
+      writer/passwordFrom: "${writer_password_secret_name}"
+      writer/profile: ingest

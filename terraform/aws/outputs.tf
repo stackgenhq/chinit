@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ============================================================================
-# Outputs — chinit cluster module (AWS)
+# Outputs — chinit cluster module (AWS, ecosystem-composed)
 # ============================================================================
 
 output "cluster_name" {
@@ -11,7 +11,7 @@ output "cluster_name" {
 }
 
 output "golden_ami_id" {
-  description = "The effective Golden AMI ID used by writers, readers, keepers, and backup (either explicitly pinned via var.golden_ami_id or auto-resolved from the public stackgenhq/chinit Golden AMI matching var.cas_enabled)."
+  description = "The effective Golden AMI ID used by the fleet (pinned via var.golden_ami_id or auto-resolved from the public stackgenhq/chinit golden AMI matching var.cas_enabled)."
   value       = local.golden_ami_id
 }
 
@@ -20,53 +20,53 @@ output "dns_zone_name" {
   value       = var.dns_zone_name
 }
 
+output "private_zone_id" {
+  description = "The private Route53 zone id."
+  value       = module.dns_tls.private_zone_id
+}
+
 output "node_claims_table" {
   description = "The DynamoDB ordinal-lease table name (writer-N/reader-N claims)."
   value       = aws_dynamodb_table.node_claims.name
 }
 
-output "bundle_bucket" {
-  description = "The S3 bucket holding the config bundle (specs + XMLs + chi.yaml)."
-  value       = aws_s3_bucket.bootstrap.id
-}
-
 output "data_bucket" {
-  description = "The S3 data bucket (the ClickHouse cold tier; parts under s3_data_prefix/tiered/<replica>/)."
-  value       = aws_s3_bucket.data.id
+  description = "The S3 data bucket (the durable tier; parts under data/<tenant>/<replica>/)."
+  value       = module.storage.data_bucket_name
 }
 
 output "backup_bucket" {
   description = "The S3 backup bucket (clickhouse-backup on the backup replica)."
-  value       = aws_s3_bucket.backup.id
+  value       = module.storage.backup_bucket_name
 }
 
 output "config_files_hash" {
-  description = "The SHA256 gate over the bundle's hashed members. chinit recomputes this at boot; a mismatch is a fatal error pointing at stale tfvars or an overwritten bucket."
-  value       = module.chinit.config_files_hash
+  description = "The SHA256 gate over the bundle's hashed members. chinit recomputes this at boot; a mismatch aborts the boot (stale bundle / stale tfvars)."
+  value       = module.clickhouse.config_files_hash
 }
 
 output "secrets" {
-  description = "The Secrets Manager secret NAMES the specs carry (values resolve at boot over the instance role — never in state-adjacent files)."
+  description = "The Secrets Manager secret NAMES the specs carry (values resolve at boot over the instance role — never in user-data)."
   value = {
-    default_password = aws_secretsmanager_secret.default_password.name
-    admin_password   = aws_secretsmanager_secret.admin_password.name
-    writer_password  = aws_secretsmanager_secret.writer_password.name
+    default_password = module.secrets.default_password_secret_name
+    admin_password   = module.secrets.admin_password_secret_name
+    writer_password  = module.secrets.writer_password_secret_name
   }
 }
 
 output "writers_asg_name" {
-  description = "The writers ASG name (scale/refresh via the AWS API or console)."
-  value       = aws_autoscaling_group.writers.name
+  description = "The writers ASG name (on-demand only; scale/refresh via the AWS API or console, bounded by writer_max)."
+  value       = module.compute.writers_asg_name
 }
 
 output "readers_asg_name" {
-  description = "The readers ASG name (spot-capable; scale to reader_max at most — it is the ordinal claim ceiling)."
-  value       = aws_autoscaling_group.readers.name
+  description = "The readers ASG name (Spot-capable; bounded by reader_max — the ordinal claim ceiling)."
+  value       = module.compute.readers_asg_name
 }
 
 output "keeper_ips" {
   description = "The static keeper private IPs (the +20 octet offsets)."
-  value       = local.keeper_ips
+  value       = module.compute.keeper_ips
 }
 
 output "keeper_hostnames" {
@@ -75,9 +75,9 @@ output "keeper_hostnames" {
 }
 
 output "node_endpoints" {
-  description = "Client-facing hostnames (resolve inside the VPC): writers and readers by role, keepers, backup."
+  description = "Client-facing hostnames (resolve inside the VPC): writers/readers by role slot, keepers, backup."
   value = {
-    writers = [for i in range(var.writer_max) : "writer-${i}.${var.dns_zone_name}"]
+    writers = [for h in local.writer_hostnames : "${h}.${var.dns_zone_name}"]
     readers = [for i in range(var.reader_max) : "reader-${i}.${var.dns_zone_name}"]
     keepers = [for h in local.keeper_hostnames : "${h}.${var.dns_zone_name}"]
     backup  = var.enable_backup ? ["backup-0.${var.dns_zone_name}"] : []
@@ -92,4 +92,14 @@ output "ssm_targets" {
     keepers = "tag:NodeType=keeper"
     backup  = "tag:NodeType=backup"
   }
+}
+
+output "alert_topic_arn" {
+  description = "The cluster SNS alerts topic (alarms + HIGH/CRITICAL GuardDuty/Security Hub findings land here)."
+  value       = module.monitoring.alert_topic_arn
+}
+
+output "connect_writer" {
+  description = "Ready-to-run clickhouse client command for a writer slot (use: $(tofu output connect_writer --raw))."
+  value       = "clickhouse client --host writer-0.${var.dns_zone_name} --port 9000 --user writer --password $(aws secretsmanager get-secret-value --secret-id ${module.secrets.writer_password_secret_name} --query SecretString --output text)"
 }

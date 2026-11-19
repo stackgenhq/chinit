@@ -1,0 +1,31 @@
+<!-- Per-tenant CAS pool disk (Altinity Antalya `metadata_type = cas`).
+     Rendered only when cas_enabled = true. One pool per tenant under
+     <cas_prefix>/<tenant>/; shared across all replicas of the shard.
+     Never put {replica} in the endpoint_subpath - the pool must be shared
+     for dedup and relink fetches to work. cas_server_root_id stays
+     per-replica (it identifies the mounting server, not the pool). -->
+            <cas_${tenant}>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <cas_server_root_id from_env="CH_CAS_SERVER_ROOT_ID" />
+                <endpoint from_env="CH_S3_ENDPOINT" />
+                <endpoint_subpath>${cas_prefix}/${tenant}/</endpoint_subpath>
+                <use_environment_credentials>true</use_environment_credentials>
+                <skip_bucket_creation>true</skip_bucket_creation>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_gc_interval_sec>300</cas_gc_interval_sec>
+                <cas_mount_lease_ttl_ms>60000</cas_mount_lease_ttl_ms>
+                <cas_mount_renew_period_ms>20000</cas_mount_renew_period_ms>
+                <cas_unsafe_remount_no_delay>true</cas_unsafe_remount_no_delay>
+                <cas_blob_hash>xxh3-128</cas_blob_hash>
+                <cas_blob_hash_allow_new>true</cas_blob_hash_allow_new>
+            </cas_${tenant}>
+            <cas_cache_${tenant}>
+                <type>cache</type>
+                <disk>cas_${tenant}</disk>
+                <path>/var/lib/clickhouse/disks/cas_cache_${tenant}/</path>
+                <max_size>${cas_cache_max_size_bytes}</max_size>
+                <cache_on_write_operations>true</cache_on_write_operations>
+            </cas_cache_${tenant}>

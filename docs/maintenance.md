@@ -60,7 +60,7 @@ Draining a stateful ClickHouse replica on an Auto Scaling Group VM is surprising
 
 `chinit` eliminates all three traps with two complementary mechanisms that invoke the exact same drain logic:
 
-1. **Early Spot Preemption (`chinit spot-watch`)**: On Spot reader nodes, a lightweight daemon polls the cloud metadata preemption endpoint every 2 seconds (AWS IMDS `spot/instance-action` or Azure Scheduled Events `Preempt`), starting the drain the instant the 2-minute cloud warning arrives.
+1. **Early Spot Preemption (`chinit spot-watch`)**: On Spot writer + reader nodes, a lightweight daemon polls the cloud metadata preemption endpoint every 2 seconds (AWS IMDS `spot/instance-action` or Azure Scheduled Events `Preempt`), starting the drain the instant the 2-minute cloud warning arrives.
 2. **Universal OS Shutdown Hook (`chinit-shutdown-drain.service`)**: Installed inside `systemd`'s shutdown transaction with `After=clickhouse-server.service`. Because `systemd` stops units in **reverse** `After=` order, `ExecStop=/usr/local/bin/chinit drain-shutdown` is guaranteed to run *while `clickhouse-server` is still alive and accepting SQL commands*, across scale-ins, Spot kills, and health-check terminations alike.
 
 ```mermaid
@@ -125,7 +125,7 @@ Rolling ClickHouse Keeper nodes carelessly can destroy cluster consensus. When y
 
 | Cadence | Subcommand | Active Roles | What It Protects Against |
 |---|---|---|---|
-| **Every 2 s** | `spot-watch` | `reader` | Catches 2-minute cloud Spot preemption warnings immediately and starts graceful draining. |
+| **Every 2 s** | `spot-watch` | `writer`, `reader` | Catches 2-minute cloud Spot preemption warnings immediately and starts graceful draining. |
 | **Every 1 min** | `keeper-health` | `keeper` | Probes Keeper via `mntr` and emits `chinit_keeper_up` health metrics. |
 | **Every 2 min** | `task-poll` | `writer`, `reader`, `keeper` | Claims and runs rolling refresh/rollout tasks behind the cluster disruption budget. |
 | **Every 5 min** | `lease-renew` | `writer`, `reader` | Extends ordinal lease TTL; heals `/etc/hosts`, Private DNS `A` records, and `remote_servers`; publishes node health status. |

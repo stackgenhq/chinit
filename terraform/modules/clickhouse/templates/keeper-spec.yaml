@@ -1,0 +1,97 @@
+# Copyright (C) 2026 StackGen, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CHK spec rendered by Terraform (modules/clickhouse) — the chinit-loaded source
+# of truth for Keeper configuration. Cloud-free subset: topology (the
+# keeper fleet), ports, coordination settings, JSON logging, the
+# localhost Prometheus endpoint. Raft server entries get their cloud DNS
+# names at render time (-keeper-address); -single-file merges everything
+# into ONE keeper_config.xml (keeper runs with an explicit --config, which
+# disables config.d auto-include).
+# Identity is cloud state: server_id derives from the hostname ordinal
+# with myid-disk persistence and feeds the render's server-id, so it
+# deliberately does NOT live in this spec.
+apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: ${cluster_name}
+spec:
+  # TOPOLOGY: the fleet size rides
+  # as clusters[0].layout.replicasCount with shardsCount 1 — the CHK
+  # spec schema (Altinity v1 ChkSpec) has NO top-level `replicas` field,
+  # and an earlier `spec.replicas:` key YAML-parsed fine but was
+  # silently DROPPED by the typed loader: the loaded CHK carried ZERO
+  # clusters, every WalkHosts returned nothing, and configure_keeper
+  # failed "keeper host \"0-N\" not found in CHK" on the fresh
+  # keeper-1/2 boots while keeper-0 ran its pre-ensemble single-node
+  # config. The normalizer expands this layout into N auto-named
+  # hosts ("0-0".."0-(N-1)") — exactly the names chinit's
+  # configure_keeper looks up (render.go: fmt "0-%d" per KeeperNodes
+  # entry, 1-BASED raft ids assigned in that order).
+  configuration:
+    clusters:
+      - name: "keeper"
+        layout:
+          shardsCount: 1
+          replicasCount: ${keeper_count}
+    settings:
+      keeper_server/tcp_port: "9181"
+      keeper_server/raft_configuration/server/port: "9234"
+      keeper_server/log_storage_path: /var/lib/clickhouse-keeper/log
+      keeper_server/snapshot_storage_path: /var/lib/clickhouse-keeper/snapshots
+      keeper_server/coordination_settings/operation_timeout_ms: "10000"
+      keeper_server/coordination_settings/session_timeout_ms: "30000"
+      keeper_server/coordination_settings/raft_logs_level: "warning"
+      keeper_server/hostname_checks_enabled: "true"
+    files:
+      # listen_host is a ROOT-level setting (it scopes every listener:
+      # client 9181, raft 9234); keeper_server/listen_host is IGNORED —
+      # the keeper stayed on 127.0.0.1 and writer-0's keeper mntr
+      # could not reach it until this moved (the live finding). A
+      # dedicated file keeps it at the root.
+      keeper-listen.xml: |
+        <clickhouse>
+            <listen_host>0.0.0.0</listen_host>
+        </clickhouse>
+      # Keeper's own Prometheus endpoint (localhost, CW agent scrapes it):
+      # a top-level file section, NOT keeper_server settings — keeper's
+      # prometheus element sits at the clickhouse root, and the explicit
+      # --config launch means it must ride in the single file anyway.
+      keeper-prometheus.xml: |
+        <clickhouse>
+            <prometheus>
+                <endpoint>/metrics</endpoint>
+                <port>9363</port>
+                <host>127.0.0.1</host>
+                <metrics>true</metrics>
+                <events>true</events>
+                <asynchronous_metrics>true</asynchronous_metrics>
+                <status_info>true</status_info>
+            </prometheus>
+        </clickhouse>
+      # File logging (JSON, parity with the server logger.xml): keeper
+      # emits to journald only by default, which no log agent can tail.
+      keeper-logging.xml: |
+        <clickhouse>
+            <logger>
+                <level>warning</level>
+                <errorlog_level>error</errorlog_level>
+                <log>/var/log/clickhouse-keeper/clickhouse-keeper.log</log>
+                <errorlog>/var/log/clickhouse-keeper/clickhouse-keeper.err.log</errorlog>
+                <size>500M</size>
+                <count>5</count>
+                <formatting>
+                    <type>json</type>
+                    <names>
+                        <date_time>timestamp</date_time>
+                        <thread_name>thread</thread_name>
+                        <thread_id>thread_id</thread_id>
+                        <level>severity</level>
+                        <logger_name>logger</logger_name>
+                        <message>message</message>
+                        <source_file>source_file</source_file>
+                        <source_line>source_line</source_line>
+                    </names>
+                </formatting>
+            </logger>
+        </clickhouse>

@@ -2,300 +2,375 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ============================================================================
-# Inputs — chinit cluster module (AWS)
+# Variables — chinit cluster module (AWS, ecosystem-composed)
 # ============================================================================
-# The module is intentionally small: every variable below is either a
-# chinit BootSpec field rendered into the node specs, a sizing knob for
-# the four node roles, or a bring-your-own hook (network) for callers
-# that already run a VPC.
+# A deliberately SMALL facade: every input has a secure default, and the
+# module composes the ecosystem modules (network, storage, secrets,
+# clickhouse, compute, dns_tls, monitoring, security). Power users bypass
+# this facade and compose the ecosystem modules directly — the facade is
+# the on-ramp, not the ceiling.
 # ============================================================================
 
+# ----------------------------------------------------------------------------
+# Cluster identity
+# ----------------------------------------------------------------------------
 variable "cluster_name" {
-  description = "ClickHouse cluster name. Renders into the chinit specs (cluster_name), the CHI spec, DNS names and every resource name."
+  description = "Cluster name (carried by every resource, DNS name, spec, and tag)."
   type        = string
-
-  validation {
-    condition     = can(regex("^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$", var.cluster_name))
-    error_message = "cluster_name must be 3-32 chars of [a-z0-9-], no leading/trailing hyphen (it lands in DNS names and S3 keys)."
-  }
 }
 
 variable "region" {
-  description = "AWS region. Pins every SDK client chinit builds (the spec's region field) and the S3 endpoint env."
+  description = "AWS region the cluster runs in."
   type        = string
 }
 
-# ----------------------------------------------------------------------------
-# Identity ceilings (ASG maxima — never live counts)
-# ----------------------------------------------------------------------------
+variable "tags" {
+  description = "Tags applied to every resource this module creates."
+  type        = map(string)
+  default     = {}
+}
 
+# ----------------------------------------------------------------------------
+# Golden AMI
+# ----------------------------------------------------------------------------
+variable "golden_ami_id" {
+  description = "Golden AMI id built from images/aws (packer). null = auto-resolve the latest public stackgenhq/chinit golden AMI for the cas_enabled flavor (us-west-2 carries both public flavors)."
+  type        = string
+  default     = null
+}
+
+# ----------------------------------------------------------------------------
+# Fleet shape
+# ----------------------------------------------------------------------------
 variable "writer_max" {
-  description = "Writers ASG max_size = the writer ordinal claim ceiling. Writers claim writer-N in [0, writer_max) from the claims table at boot; a scale-out must always be able to claim, so pass the MAXIMUM the fleet can reach, not today's count."
+  description = "Writers ASG max_size — the writer ordinal claim CEILING (writer-N slots in [0, max))."
   type        = number
   default     = 2
-
-  validation {
-    condition     = var.writer_max >= 1
-    error_message = "writer_max must be >= 1 (lease identity requires a claim ceiling)."
-  }
 }
 
 variable "writer_desired" {
-  description = "Writers ASG desired capacity at apply time."
+  description = "Writers ASG desired_capacity (>= 1: writer-0 coordinates backup wake + maintenance)."
   type        = number
   default     = 2
 
   validation {
     condition     = var.writer_desired >= 1 && var.writer_desired <= var.writer_max
-    error_message = "writer_desired must be within [1, writer_max]."
+    error_message = "writer_desired must be >= 1 (writer-0 stays alive) and <= writer_max."
   }
 }
 
 variable "reader_max" {
-  description = "Readers ASG max_size = the reader ordinal claim ceiling (the same contract as writer_max)."
+  description = "Readers ASG max_size — the reader ordinal claim CEILING (reader-N slots in [0, max))."
   type        = number
   default     = 6
-
-  validation {
-    condition     = var.reader_max >= 1
-    error_message = "reader_max must be >= 1 (lease identity requires a claim ceiling)."
-  }
 }
 
 variable "reader_desired" {
-  description = "Readers ASG desired capacity at apply time."
+  description = "Readers ASG desired_capacity."
   type        = number
   default     = 2
-
-  validation {
-    condition     = var.reader_desired >= 0 && var.reader_desired <= var.reader_max
-    error_message = "reader_desired must be within [0, reader_max]."
-  }
 }
 
 variable "reader_spot" {
-  description = "Launch readers on Spot (mixed ASG, 100% spot with an on-demand fallback base of 0). chinit's spot-watch drains on the EC2 interruption notice."
-  type        = bool
-  default     = true
+  description = "Fraction of reader slots above the on-demand base on Spot (0.0-1.0). 1.0 = every slot above the base is Spot. Spot readers drain gracefully on the EC2 interruption notice (chinit spot-watch)."
+  type        = number
+  default     = 0.5
+
+  validation {
+    condition     = var.reader_spot >= 0 && var.reader_spot <= 1
+    error_message = "reader_spot must be between 0.0 and 1.0."
+  }
+}
+
+variable "reader_spot_on_demand_base_capacity" {
+  description = "Reader slots kept on-demand regardless of reader_spot (an always-on query floor)."
+  type        = number
+  default     = 1
 }
 
 variable "keeper_count" {
-  description = "Keeper (Raft) fleet size. Must be odd (quorum arithmetic); 3 tolerates one loss, 5 tolerates two. Keepers are fixed instances with static IPs at the +20 octet offsets."
+  description = "Keeper nodes (odd, typically 3 — Raft quorum)."
   type        = number
   default     = 3
 
   validation {
-    condition     = var.keeper_count % 2 == 1 && var.keeper_count >= 1 && var.keeper_count <= 10
-    error_message = "keeper_count must be odd (Raft quorum) and within [1, 10] (the +20..+29 octet band chinit's static map accepts)."
+    condition     = var.keeper_count % 2 == 1 && var.keeper_count >= 1
+    error_message = "keeper_count must be an odd number >= 1 (Raft quorum)."
   }
 }
 
 variable "enable_backup" {
-  description = "Provision the dedicated backup replica: a fixed instance at the +30 octet offset running the clickhouse-backup timer. The backup is a CR member (its slot is the first after the readers' ceiling)."
+  description = "Provision the dedicated backup replica (clickhouse-backup, nightly schedule)."
   type        = bool
   default     = true
 }
 
 # ----------------------------------------------------------------------------
-# Sizing
+# Instance shapes (Graviton defaults; NVMe-capable families can drop the
+# gp3 cache volume via cache_on_nvme_instance_store)
 # ----------------------------------------------------------------------------
-
 variable "instance_type" {
-  description = "Instance type for writers, readers and the backup replica (arm64 recommended: Graviton). Keepers use keeper_instance_type."
-  type        = string
-  default     = "r8g.large"
-
-  validation {
-    condition     = !can(regex("(\\.(nano|micro|small|medium)$|^c[0-9]+[a-z]*\\.large$)", var.instance_type))
-    error_message = "instance_type must provide at least 8 GiB RAM (e.g. t4g.large, m8g.large, r8g.large, c8g.xlarge or larger); <= 4 GiB instances saturate CPU and OOM during ReplicatedMergeTree merges."
-  }
-}
-
-variable "keeper_instance_type" {
-  description = "Instance type for keepers (raft fsync latency favors steady-CPU families)."
+  description = "Writer/reader/backup EC2 instance type (Graviton arm64: m8g/r8gd/c8gd/i4g families; >= 8 GiB RAM recommended)."
   type        = string
   default     = "m8g.large"
 }
 
+variable "keeper_instance_type" {
+  description = "Keeper EC2 instance type (small is fine: keepers hold no table data)."
+  type        = string
+  default     = "t4g.medium"
+}
+
 variable "root_disk_size_gb" {
-  description = "Root volume size (GB) for every node."
+  description = "Root EBS volume size (GiB) on every node."
   type        = number
-  default     = 32
+  default     = 16
 }
 
 variable "metadata_disk_size_gb" {
-  description = "Metadata (hot-tier) EBS volume size (GB) for writers/readers/backup. Mounted at /var/lib/clickhouse, label ch-metadata. This is where ReplicatedMergeTree hot parts live; the disk-autoscale job can grow it online up to 256 GB."
+  description = "Metadata (hot-tier) gp3 volume size (GiB) on writers/readers/backup. Grows online via chinit disk-autoscale."
   type        = number
   default     = 64
 }
 
 variable "metadata_disk_iops" {
-  description = "Provisioned gp3 IOPS for the metadata (hot-tier) volume (/dev/sdb) on writers and readers."
+  description = "Provisioned gp3 IOPS for the metadata disk."
   type        = number
-  default     = 4000
-
-  validation {
-    condition     = var.metadata_disk_iops >= 3000
-    error_message = "metadata_disk_iops must be >= 3000."
-  }
+  default     = 3000
 }
 
 variable "metadata_disk_throughput_mbps" {
-  description = "Provisioned gp3 throughput (MB/s) for the metadata (hot-tier) volume (/dev/sdb). Default 500 MB/s avoids the 125 MB/s gp3 baseline sequential merge iowait stall."
+  description = "Provisioned gp3 throughput (MB/s) for the metadata disk."
   type        = number
-  default     = 500
-
-  validation {
-    condition     = var.metadata_disk_throughput_mbps >= 250
-    error_message = "metadata_disk_throughput_mbps must be >= 250 MB/s to prevent sequential MergeTree merge iowait stalls."
-  }
+  default     = 125
 }
 
 variable "cache_disk_size_gb" {
-  description = "S3 read-cache EBS volume size (GB) for writers/readers. Mounted at /var/lib/clickhouse/disks, label ch-cache. Must fit the storage.xml <max_size> (the template derives it at 0.9x)."
+  description = "S3-read-cache gp3 volume size (GiB) on writers/readers. Set to 0 with cache_on_nvme_instance_store on NVMe instance-store families."
   type        = number
-  default     = 128
+  default     = 64
 }
 
 variable "keeper_disk_size_gb" {
-  description = "Keeper raft-log/snapshot volume size (GB), label ch-keeper (LUN-equivalent /dev/sdf)."
+  description = "Keeper Raft-log gp3 volume size (GiB) — dedicated disk for fsync latency isolation."
   type        = number
   default     = 16
 }
 
-# ----------------------------------------------------------------------------
-# Image + chinit
-# ----------------------------------------------------------------------------
-
-variable "golden_ami_id" {
-  description = "The chinit golden AMI id (see images/aws). Optional in us-west-2: when null, Terraform automatically resolves the latest public stackgenhq/chinit Golden AMI matching cas_enabled (antalya when cas_enabled = true, upstream when false)."
-  type        = string
-  default     = null
-
-  validation {
-    condition     = var.golden_ami_id == null || can(regex("^ami-[0-9a-f]{8,17}$", var.golden_ami_id))
-    error_message = "golden_ami_id must be null (auto-resolve latest public golden AMI) or look like ami-xxxxxxxx."
-  }
+variable "cache_on_nvme_instance_store" {
+  description = "Drop the gp3 cache volume and use the (free) instance-store NVMe as the S3 cache disk. Only safe when every pool/ladder member carries local NVMe (m*g/r*g/c*g/i*g families); the module guards this."
+  type        = bool
+  default     = false
 }
 
 # ----------------------------------------------------------------------------
-# Network (bring-your-own or module-created)
+# Network (fresh VPC by default; bring-your-own via create_network = false)
 # ----------------------------------------------------------------------------
-
 variable "create_network" {
-  description = "Create the network stack (VPC + private subnet + S3/DynamoDB gateway endpoints). Set to false to plug the cluster into an existing VPC via vpc_id/subnet_id."
+  description = "Create a fresh VPC + private subnet + free S3/DynamoDB gateway endpoints. false = plug into vpc_id/subnet_id (the .20+.30 IP offsets must be free)."
   type        = bool
   default     = true
 }
 
 variable "vpc_id" {
-  description = "Existing VPC id (create_network = false). The private DNS zone associates with it."
+  description = "(create_network = false) Existing VPC id."
   type        = string
   default     = null
 }
 
 variable "subnet_id" {
-  description = "Existing private subnet id (create_network = false). Every node launches here; keepers/backup take static IPs at the +20/+30 offsets inside it."
+  description = "(create_network = false) Existing private subnet id for the nodes."
   type        = string
   default     = null
 }
 
 variable "subnet_cidr" {
-  description = "The subnet's IPv4 CIDR (required in BOTH modes: it renders into the chinit spec's network section — the ClickHouse <networks> entries — and allocates the static keeper/backup IPs)."
+  description = "Nodes subnet CIDR — the cluster placement domain AND the source of the keeper (+20..29) / backup (+30) static IPs. /24 or larger."
   type        = string
-
-  validation {
-    condition     = can(cidrnetmask(var.subnet_cidr))
-    error_message = "subnet_cidr must be a valid IPv4 CIDR."
-  }
+  default     = "10.42.0.0/24"
 }
 
 variable "client_cidrs" {
-  description = "CIDRs allowed to reach ClickHouse client ports (8123/9000/8443/9440) on writers and readers. Empty = no client ingress (interserver + keeper traffic still flows)."
+  description = "CIDRs allowed to reach client ports (8123/8443/9000/9440) on writers + readers. Empty = no client ingress (add rules later via the SG ids in the outputs)."
   type        = list(string)
   default     = []
 }
 
+variable "dns_zone_name" {
+  description = "Private DNS zone for node discovery (writer-N/reader-N/keeper-N/backup-0.<zone>)."
+  type        = string
+  default     = "clickhouse.internal"
+}
+
 # ----------------------------------------------------------------------------
-# Object storage (the cold tier + the config bundle)
+# Storage
 # ----------------------------------------------------------------------------
+variable "data_bucket_name" {
+  description = "S3 data bucket name (null = <cluster_name>-clickhouse-data). Table parts land here; the tiered storage.xml TTL-moves merged parts into it."
+  type        = string
+  default     = null
+}
+
+variable "backup_bucket_name" {
+  description = "S3 backup bucket name (null = <cluster_name>-clickhouse-backup)."
+  type        = string
+  default     = null
+}
 
 variable "s3_data_prefix" {
-  description = "Key prefix (inside the data bucket) for ClickHouse table data. Every replica writes its own path under it (zero-copy replication is deprecated upstream)."
+  description = "Key prefix inside the data bucket for table parts (data/<tenant>/<replica>/ renders per tenant)."
   type        = string
   default     = "data"
 }
 
+variable "backup_retention_days" {
+  description = "Days clickhouse-backup keeps backup objects in the backup bucket."
+  type        = number
+  default     = 30
+}
+
+variable "tenants" {
+  description = "Tenant names — each gets its own data/<tenant>/<replica>/ S3 prefix, cache wrapper, and tiered storage policy (a tenant is a prefix + policy, never a disk-resizing project)."
+  type        = list(string)
+  default     = ["default"]
+}
+
+variable "lifecycle_days_to_ia" {
+  description = "Days before data-bucket objects transition to Standard-IA (pairs with ClickHouse move_factor; never Glacier — queries must read)."
+  type        = number
+  default     = 30
+}
+
+# ----------------------------------------------------------------------------
+# CAS cold tier (Altinity Antalya)
+# ----------------------------------------------------------------------------
 variable "cas_enabled" {
-  description = "Enable the Altinity Antalya Content-Addressable Storage (CAS) shared S3 cold tier (`metadata_type = cas`, single copy across replicas). Requires an Antalya golden AMI (e.g. `ami-04292dd0d9281579e`, or auto-resolved when `golden_ami_id = null` in `us-west-2`)."
+  description = "Render the shared content-addressed S3 cold tier (cas disks + tiered_cas policies). Requires an Antalya-built golden AMI and a data bucket WITHOUT versioning/object-lock. Cold parts stored once across replicas instead of per-replica."
   type        = bool
   default     = false
 }
 
 variable "cas_prefix" {
-  description = "Shared S3 key prefix (no `{replica}` segment) for the CAS cold-tier pool when `cas_enabled = true`."
+  description = "Key prefix inside the data bucket for the CAS pool."
   type        = string
   default     = "cas"
 }
 
-variable "backup_retention_days" {
-  description = "clickhouse-backup remote retention (days) on the backup replica."
+# ----------------------------------------------------------------------------
+# Secrets + rotation
+# ----------------------------------------------------------------------------
+variable "enable_secret_rotation" {
+  description = "Deploy the password-rotation Lambda (Secrets Manager 4-step protocol; the fleet re-renders users.d via SSM). The Lambda needs SSM reachability to the fleet."
+  type        = bool
+  default     = true
+}
+
+variable "rotation_days" {
+  description = "Password rotation interval in days (Secrets Manager schedule)."
   type        = number
-  default     = 7
+  default     = 30
 }
 
 # ----------------------------------------------------------------------------
-# DNS
+# Autoscaling + rolling refresh
 # ----------------------------------------------------------------------------
+variable "autoscaling_enabled" {
+  description = "Horizontal autoscaling: readers track CPU (bounded by reader_max); writers get step policies (the alarms act on them; the ceiling stays writer_max)."
+  type        = bool
+  default     = true
+}
 
-variable "dns_zone_name" {
-  description = "Private DNS zone name for node discovery (e.g. clickhouse.internal). Nodes self-register writer-N/reader-N/keeper-N/backup-0 A records; peers resolve each other through it."
-  type        = string
+variable "writer_cpu_target" {
+  description = "Writers target-tracking CPU percent (the scale-OUT signal; scale-in is owned by the idle alarm)."
+  type        = number
+  default     = 65
+}
 
-  validation {
-    condition     = can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]$", var.dns_zone_name))
-    error_message = "dns_zone_name must be a DNS zone name (e.g. clickhouse.internal)."
-  }
+variable "refresh_instance_warmup_seconds" {
+  description = "Instance-refresh warmup (seconds) — a rolled node must finish chinit's Critical boot steps before the next one rolls."
+  type        = number
+  default     = 300
+}
+
+variable "refresh_min_healthy_percentage" {
+  description = "Instance-refresh minimum healthy percentage."
+  type        = number
+  default     = 50
 }
 
 # ----------------------------------------------------------------------------
-# Telemetry (optional, inert when unset)
+# Monitoring + security posture (opt-in extras around the always-on core)
 # ----------------------------------------------------------------------------
+variable "alert_emails" {
+  description = "Email subscribers on the cluster SNS alerts topic (alarms, findings, budget alerts)."
+  type        = list(string)
+  default     = []
+}
 
+variable "enable_guardduty" {
+  description = "Enable GuardDuty (managed threat detection; S3 data-events protection is on — the cluster's biggest data surface)."
+  type        = bool
+  default     = true
+}
+
+variable "enable_s3_protection" {
+  description = "GuardDuty S3 data-events protection (S3 data events billing; ON by default for the data/backup buckets)."
+  type        = bool
+  default     = true
+}
+
+variable "enable_security_hub" {
+  description = "Enable Security Hub with the AWS Foundational Security Best Practices + CIS standards."
+  type        = bool
+  default     = true
+}
+
+variable "findings_to_sns_enabled" {
+  description = "Route HIGH/CRITICAL GuardDuty + Security Hub findings onto the cluster's SNS alerts topic."
+  type        = bool
+  default     = true
+}
+
+variable "budget_monthly_amount" {
+  description = "Monthly USD budget for the cluster's cost tags (0 = budget alerts disabled)."
+  type        = number
+  default     = 0
+}
+
+# ----------------------------------------------------------------------------
+# Telemetry (opt-in; no defaults dial out)
+# ----------------------------------------------------------------------------
 variable "log_shipping" {
-  description = "Remote telemetry shipping (renders into log_shipping in every chinit spec; empty endpoints = disabled). Supports base OTLP endpoint or per-signal VictoriaLogs/VictoriaMetrics/VictoriaTraces URLs."
+  description = "Remote log/metric/trace shipping. Default = local-only (CloudWatch agent + the module's alarms)."
   type = object({
-    agent            = optional(string, "otel")
-    endpoint         = optional(string, "")
-    logs_endpoint    = optional(string, "")
-    metrics_endpoint = optional(string, "")
-    traces_endpoint  = optional(string, "")
-    headers          = optional(string, "")
-    metrics_headers  = optional(string, "")
-    traces_headers   = optional(string, "")
-    scrape_interval  = optional(string, "15s")
+    agent                  = optional(string)
+    endpoint               = optional(string)
+    logs_endpoint          = optional(string)
+    metrics_endpoint       = optional(string)
+    traces_endpoint        = optional(string)
+    headers                = optional(string)
+    metrics_headers        = optional(string)
+    traces_headers         = optional(string)
+    scrape_interval        = optional(string)
+    fluentbit_output       = optional(string)
+    otel_trace_probability = optional(number)
+    span_log_ttl_days      = optional(number)
+    trace_log_ttl_days     = optional(number)
   })
-  default  = {}
-  nullable = false
+  default = {}
 }
 
 variable "tracing_config" {
-  description = "ClickHouse OpenTelemetry span sampling and system profiler configuration."
+  description = "ClickHouse-side tracing knobs (OpenTelemetry span sampling + trace/query-log TTLs)."
   type = object({
-    otel_trace_probability        = optional(number, 0)
-    otel_keeper_trace_probability = optional(string, "auto")
-    otel_trace_processors         = optional(bool, false)
-    otel_span_log_ttl_days        = optional(number, 3)
-    trace_log_ttl_days            = optional(number, 7)
-    global_profiler_period_ns     = optional(number, 0)
-    log_query_threads             = optional(bool, false)
+    otel_trace_probability        = optional(number)
+    otel_keeper_trace_probability = optional(string)
+    otel_trace_processors         = optional(bool)
+    otel_trace_cpu_scheduling     = optional(bool)
+    otel_span_log_ttl_days        = optional(number)
+    trace_log_ttl_days            = optional(number)
+    global_profiler_period_ns     = optional(number)
+    log_query_threads             = optional(bool)
   })
-  default  = {}
-  nullable = false
-}
-
-variable "tags" {
-  description = "Tags applied to every resource the module creates."
-  type        = map(string)
-  default     = {}
+  default = {}
 }

@@ -55,7 +55,7 @@ Steps marked 🔒 are **Critical** (a failure aborts the boot so systemd or the 
 | Phase 2 | `configure_backup` | 🔒 | Configures `clickhouse-backup` and enables the daily backup timer on the backup replica. |
 | Phase 2 | `configure_monitoring` | ⚠️ | Configures OpenTelemetry Collector or Fluent Bit when `log_shipping.endpoint` is set. |
 | Phase 2 | `configure_cloudwatch` | ⚠️ | Configures the CloudWatch agent on AWS nodes. |
-| Phase 2 | `install_spot_watch` | ⚠️ | Installs `chinit-spot-watch.service` on reader nodes to drain on spot interruption notices. |
+| Phase 2 | `install_spot_watch` | ⚠️ | Installs `chinit-spot-watch.service` on writer + reader nodes to drain on spot interruption notices (both ASG roles carry a replica registration, ordinal lease and DNS record the notice window must release). |
 | Phase 2 | `boot_finished` | 🔒 | Writes `/var/lib/cloud/instance/boot-finished` and logs step timing summary. |
 | Post | `hooks_post_boot` | ⚠️ | Runs optional `post_boot` lifecycle hooks. |
 

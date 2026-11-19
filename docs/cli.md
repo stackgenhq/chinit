@@ -99,7 +99,7 @@ chinit boot [-spec /var/lib/clickhouse-bootstrap/chinit.yaml] [-cloud aws|azure]
 |---|---|---|
 | `keeper-health` | Every 1 min | Queries the ClickHouse Keeper 4-letter `mntr` port, validates quorum/leader state, and emits `chinit_keeper_up`. |
 | `exporter` | Daemon (`:9150`) | Exposes Prometheus fleet metrics on `/metrics` and proxies local ClickHouse server metrics (`:9363`) on `/clickhouse-metrics`. |
-| `spot-watch` | Every 2 s | Watches AWS Spot Instance Action / Azure Scheduled Events on `reader` nodes and triggers an immediate graceful drain on preemption notice. |
+| `spot-watch` | Every 2 s | Watches AWS Spot Instance Action / Azure Scheduled Events on `writer` and `reader` nodes and triggers an immediate graceful drain on preemption notice. |
 | `drain` | On demand | Manually drains the node (`-reason`, `-timeout`): stops replication queues and distributed sends, drops replica metadata on a live peer, removes Private DNS, and releases the lease. |
 | `drain-shutdown` | OS Shutdown | Invoked by `chinit-shutdown-drain.service` (`After=clickhouse-server`) during VM termination; automatically skips cleanup on normal OS reboots (`reboot.target`). |
 

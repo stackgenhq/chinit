@@ -241,16 +241,24 @@ func (r *SchemaRunner) SyncSchema(ctx context.Context, request domain.SchemaSync
 // name here, so it is used directly; no guessing between conventions.
 // The DATABASE-replica shard index follows the operator's HostDropReplica
 // (the run-on host's shard index).
+//
+// The dropped name is NOT inventory-gated: a stale registration exists
+// precisely BECAUSE its host left the inventory (a scale-in past the
+// ceiling, a spot reclaim whose ordinal was never re-claimed, an
+// instance-refresh retiree). The 2026-11-19 live finding: writer-5/
+// writer-7 — two ordinals beyond writer_max that spot reclaims retired
+// — failed `host not in inventory` on EVERY GC pass, and the ghosts
+// wedged the fleet's replication queues behind their log entries for
+// hours (absolute_delay pinned at ~10k s, /replicas_status 503, every
+// NLB target unhealthy). Only the RUN-ON peer is resolved through the
+// inventory; the dropped name must merely be a sane hostname token.
 func (r *SchemaRunner) DropReplica(ctx context.Context, request domain.ReplicaDropRequest) error {
-	// hostToDrop validates inventory membership; the drop name is the
-	// request's HostName (the cloud replica name — see the naming note
-	// above).
-	if _, err := r.host(request.HostName); err != nil {
-		return err
-	}
 	hostToRunOn, err := r.host(request.RunOn)
 	if err != nil {
 		return err
+	}
+	if !saneReplicaName(request.HostName) {
+		return fmt.Errorf("drop replica: invalid replica name %q", request.HostName)
 	}
 
 	replicaName := request.HostName
@@ -777,6 +785,26 @@ func (r *SchemaRunner) staleReplicaColumn(ctx context.Context, host *v1.Host) (s
 		return "", fmt.Errorf("system.replicas carries neither replica_name nor host_name (unsupported server)")
 	}
 	return names[0], nil
+}
+
+// saneReplicaName guards the DROP's SQL string interpolation: the
+// dropped name no longer resolves through the inventory (a stale
+// registration is by definition absent from it), so the gate is now
+// lexical — the token set a cloud replica name may carry (letters,
+// digits, dash, dot) and nothing that could escape the single-quoted
+// literal or smuggle a second statement.
+func saneReplicaName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // host resolves a host by CR name (e.g. "0-0") or by the cloud name the
