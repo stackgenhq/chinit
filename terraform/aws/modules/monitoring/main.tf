@@ -307,6 +307,7 @@ resource "aws_cloudwatch_metric_alarm" "writers_lb_unhealthy" {
   evaluation_periods  = 5
   threshold           = 0
   comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
 
   # NetworkELB emits per TargetGroup: without the TG dimension the
   # series never resolves (INSUFFICIENT_DATA forever — the blind-LB
@@ -334,6 +335,7 @@ resource "aws_cloudwatch_metric_alarm" "readers_lb_unhealthy" {
   evaluation_periods  = 5
   threshold           = 0
   comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
 
   dimensions = {
     LoadBalancer = var.readers_lb_arn_suffix
@@ -360,6 +362,7 @@ resource "aws_cloudwatch_metric_alarm" "writers_lb_latency" {
   evaluation_periods  = 6
   threshold           = 1.0
   comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
 
   dimensions = {
     LoadBalancer = var.writers_lb_arn_suffix
@@ -1217,7 +1220,7 @@ data "aws_region" "current" {}
 locals {
   monitoring_account_id = data.aws_caller_identity.current.account_id
   monitoring_partition  = data.aws_partition.current.partition
-  monitoring_region     = data.aws_region.current.name
+  monitoring_region     = data.aws_region.current.region
 }
 
 # CloudTrail → CW Logs delivery target. A trail delivering global service
