@@ -106,7 +106,8 @@ When a provider does not implement an optional capability, `chinit` logs a clear
 | Phase 2 | `install_shutdown_drain` | Critical | `onceFatal` | Installs `chinit-shutdown-drain.service` immediately after identity setup so any termination during or after boot releases the lease. |
 | Phase 2 | `start_clickhouse` | Critical | `onceFatal` | Enables and starts `clickhouse-server` and waits for `/ping` (skipped on `keeper` nodes). |
 | Phase 2 | `detect_storage_loss` | BestEffort | `onceFatal` | Logs when a re-imaged node claims an ordinal that has existing Keeper replica registrations but an empty local data directory. |
-| Phase 2 | `bootstrap_schema` | BestEffort | `apiRetry` | Applies `bootstrap-ddl.sql` idempotently (`CREATE ... IF NOT EXISTS` with `{shard}`/`{replica}` macros). |
+| Phase 2 | `bootstrap_schema` | BestEffort | `apiRetry` | Executes optional `bootstrap-ddl.sql` directly via `clickhouse-client --queries-file` for cold-start seeding. |
+| Phase 2 | `sync_schema` | BestEffort | `onceFatal` | Propagates databases, tables, views, and functions from live cluster peers via `HostCreateTables` (pruning stale self replica registrations on Code 253). |
 | Phase 2 | `health_gate` | BestEffort | `onceFatal` | Probes cluster health across live peers (non-fatal so nodes can still join while a peer is down). |
 | Phase 2 | `prometheus_reload` | BestEffort | `bootWait` | Reloads config and verifies the `:9363/metrics` endpoint. |
 | Phase 2 | `install_units` | Critical | `onceFatal` | Installs and enables systemd services and timers for recurring maintenance subcommands. |

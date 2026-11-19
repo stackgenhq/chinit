@@ -18,14 +18,14 @@ Bootstrapping a stateful, replicated database cluster on auto-scaling cloud VMs 
 | Node configuration varies by instance (identity, IP, role) while needing identical bootstrap logic | `chinit.yaml` is a typed, validated spec fetched from object storage and verified by SHA-256; the binary is identical across roles and clouds |
 | Cloud APIs can fail transiently, while configuration errors should fail fast | Built-in retry engine with `Retryable` vs. `Fatal` error classification, exponential backoff with jitter, per-step deadlines, and `Critical` vs. `BestEffort` step handling |
 | Re-running a partially completed boot from scratch is slow and can re-claim identity mid-flight | Convergent execution: each step inspects real machine state first, records completion in `state.json`, and resumes cleanly; bundle hash changes invalidate and re-render configs |
-| Post-boot tasks (schema sync, replica sync, queue healing, lease renewal, backups, spot draining) must run reliably with the right node identity | Built-in subcommands (`schema-bootstrap`, `schema-sync`, `replica-sync`, `queue-heal`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch`, `drain-shutdown`) wired as one-line systemd units |
+| Post-boot tasks (schema sync, replica sync, queue healing, lease renewal, backups, spot draining) must run reliably with the right node identity | Built-in subcommands (`schema-sync`, `replica-sync`, `queue-heal`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch`, `drain-shutdown`) wired as one-line systemd units |
 | Terminating instances must release their ordinal lease, DNS record, and replica registration even when external lifecycle hooks fail or are skipped | `chinit-shutdown-drain.service` runs `chinit drain-shutdown` inside systemd's shutdown transaction (`After=clickhouse-server`), covering scale-in, spot preemption, and health-check replacements while skipping normal reboots |
 | Terminated nodes can leave stale DNS records, `/etc/hosts` entries, or `remote_servers` entries that stall cluster queries | Every 5-minute `lease-renew` tick reconciles `/etc/hosts`, private DNS `A` records, and rendered `remote_servers` configs against the live claims table |
 | Replication queues can stall on parts belonging to a replaced peer (`NO_REPLICA_HAS_PART`) or lost Keeper sessions | The hourly `queue-heal` timer syncs or restarts stuck replica queues when merges are idle and restores read-only replicas after Keeper session recovery |
 | Cluster-wide maintenance tasks gated on `writer-0` would stop running if `writer-0` is temporarily absent during churn | Vacancy election: if `writer-0` has no active lease, the lowest-ordinal live writer automatically assumes cluster maintenance duties |
 | Rolling refreshes and AMI rollouts across VMs lack a central Kubernetes controller | Epoch-fenced fleet task rows in the claims table, coordinated by `fleet-converge` and executed by `task-poll` on each node |
 | Voluntary rollouts could take down the last healthy writer | Disruption budgets enforce `min_healthy_writers` and `min_healthy_readers` using live status rows published by `lease-renew` |
-| Re-imaged nodes claiming an existing ordinal have empty local disks while Keeper still holds old replica metadata | `detect_storage_loss` identifies the condition at boot, and schema bootstrap + `replica-sync` drop and re-sync the replica cleanly |
+| Re-imaged nodes claiming an existing ordinal have empty local disks while Keeper still holds old replica metadata | `detect_storage_loss` identifies the condition at boot, and `sync_schema` (`HostCreateTables` with `-prune-stale-self`) + `replica-sync` drop the stale registration and re-sync the replica cleanly |
 
 ## Cloud Detection and Adaptation
 
@@ -64,7 +64,7 @@ PHASE 2 (sequential — consumes Phase 1 outputs):
   install_static_configs → configure_peer_hosts → configure_server_env
   → render_node_config → configure_keeper → write_node_env
   → install_shutdown_drain → start_clickhouse → detect_storage_loss
-  → bootstrap_schema → health_gate → prometheus_reload → install_units
+  → bootstrap_schema → sync_schema → health_gate → prometheus_reload → install_units
   → configure_backup → configure_monitoring → configure_cloudwatch
   → install_spot_watch → boot_finished
 

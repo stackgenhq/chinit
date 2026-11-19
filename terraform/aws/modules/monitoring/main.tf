@@ -381,25 +381,53 @@ resource "aws_cloudwatch_metric_alarm" "replication_stalled" {
   count = var.enabled && var.enable_writer_alarms ? 1 : 0
 
   alarm_name          = "${local.alarm_prefix}-replication-stalled"
-  namespace           = "ClickHouse/Server"
-  metric_name         = "ClickHouseAsyncMetrics_ReplicasMaxAbsoluteDelay"
-  statistic           = "Maximum"
-  period              = 300
   evaluation_periods  = 6 # sustained 30 minutes — schema-sync catch-up bursts pass
   threshold           = 300
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"
 
+  # Suppress transient delay spikes while any node is in its initial
+  # join/backfill window (2x min_uptime_seconds). Once all nodes exceed that
+  # uptime threshold, the raw ReplicasMaxAbsoluteDelay metric governs the alarm.
+  metric_query {
+    id          = "delay"
+    expression  = "IF(FILL(m_uptime_min, 0) < ${2 * var.ch_alert_thresholds.min_uptime_seconds}, 0, m_delay)"
+    label       = "Replication max delay, suppressed while any node is in its fresh-joiner attach window"
+    return_data = true
+  }
+
+  metric_query {
+    id = "m_uptime_min"
+    metric {
+      metric_name = "ClickHouseAsyncMetrics_Uptime"
+      namespace   = "ClickHouse/Server"
+      period      = 300
+      stat        = "Minimum"
+      dimensions = {
+        ClusterName = var.cluster_name
+      }
+    }
+  }
+
+  metric_query {
+    id = "m_delay"
+    metric {
+      metric_name = "ClickHouseAsyncMetrics_ReplicasMaxAbsoluteDelay"
+      namespace   = "ClickHouse/Server"
+      period      = 300
+      stat        = "Maximum"
+      dimensions = {
+        ClusterName = var.cluster_name
+      }
+    }
+  }
+
   # The prometheus bridge emits these with the NodeType/ClusterName dims
   # only (append_dimensions with custom keys fails agent validation on
   # EC2 — the node-metric alarms key on the auto-appended InstanceID;
-  # these ride the bridge's own labels).
-  dimensions = {
-    ClusterName = var.cluster_name
-    NodeType    = "writer"
-  }
+  # the sub-queries of the metric-math gate carry the dimensions).
 
-  alarm_description = "A writer's replication queue stopped catching up (ReplicasMaxAbsoluteDelay > 5min for 30 min): a replica is table-less or its fetch path is wedged while the node passes every health check. ACTION: (1) check system.replicas / replication_queue on the writers for a stuck queue; (2) verify the private-zone DNS records match the live lease claims (a stale A record wedges the fetch path — the 0.2.14+ lease-renew convergence heals this; check the chinit version); (3) re-run chinit schema-sync on the laggard node. If one writer persistently diverges, its bootstrap never completed — compare system.tables across writers."
+  alarm_description = "A writer's replication queue stopped catching up (ReplicasMaxAbsoluteDelay > 5min for 30 min while NO node is in its fresh-joiner attach window — a replacement node's initial backfill rides 10k+ seconds of delay legitimately and is suppressed by the uptime gate). A real page means a replica is table-less or its fetch path is wedged while the node passes every health check. ACTION: (1) check system.replicas / replication_queue on the writers for a stuck queue; (2) verify the private-zone DNS records match the live lease claims (a stale A record wedges the fetch path — the 0.2.14+ lease-renew convergence heals this; check the chinit version); (3) re-run chinit schema-sync on the laggard node; (4) if the gate was suppressing, re-check after every node's uptime exceeds ${2 * var.ch_alert_thresholds.min_uptime_seconds}s. If one writer persistently diverges, its bootstrap never completed — compare system.tables across writers."
 
   alarm_actions = local.alert_topic_arns
   ok_actions    = local.alert_topic_arns
@@ -1155,6 +1183,205 @@ resource "aws_cloudwatch_metric_alarm" "orphans_found" {
   treat_missing_data = "notBreaching"
 
   alarm_description = "The daily orphan sweep found unowned resources (unattached untagged volumes past the age threshold; EIPs/snapshots reported only). The sweep already reclaimed the deletables - recurring findings mean some path is leaking resources again. Check the ordinal-0 writer's orphaned-gc journal and grep the modules for new inline ebs_block_device usage (docs/TROUBLESHOOTING.md - Orphaned data disks)."
+
+  alarm_actions = local.alert_topic_arns
+  ok_actions    = local.alert_topic_arns
+
+  tags = var.tags
+}
+
+# ----------------------------------------------------------------------------
+# Private-DNS drift canary
+# ----------------------------------------------------------------------------
+# WHY: Self-registered node records in the private Route53 zone are not
+#   tracked in Terraform state. If records are altered or removed out of band,
+#   nodes remain ASG-healthy while Keeper and ClickHouse name resolution fails
+#   downstream. Route53 emits every record mutation to CloudTrail
+#   (eventSource route53.amazonaws.com, eventName ChangeResourceRecordSets);
+#   a metric filter and alarm on that stream signal mutations as they happen.
+# WITHOUT IT: Unexpected private-zone DNS mutations are only noticed via
+#   downstream Keeper resolution or replication errors after the fact.
+# Note: Instance refreshes and lease re-claims legitimately create or update
+#   records; triage with `make dns-audit` (expected-vs-live diff) before
+#   taking action.
+# ----------------------------------------------------------------------------
+
+# Module-scoped caller identity: the CloudTrail bucket policy pins
+# aws:SourceArn to THIS account's trail (CreateTrail hard-fails with
+# InsufficientS3BucketPolicyException until the service-principal +
+# source-arn grant covers exactly it).
+data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  monitoring_account_id = data.aws_caller_identity.current.account_id
+  monitoring_partition  = data.aws_partition.current.partition
+  monitoring_region     = data.aws_region.current.name
+}
+
+# CloudTrail → CW Logs delivery target. A trail delivering global service
+# events (Route53 is global-plane) must exist in the account for this canary
+# to fire. When dns_canary_create_trail is true (default), the module creates a
+# self-contained single-region trail scoped to management events (which cover
+# ChangeResourceRecordSets) without needing a data event selector.
+resource "aws_cloudtrail" "route53_audit" {
+  count = var.enabled && var.dns_canary_enabled && var.dns_canary_create_trail ? 1 : 0
+
+  name                          = "${var.cluster_name}-route53-audit"
+  s3_bucket_name                = aws_s3_bucket.route53_audit[count.index].bucket
+  cloud_watch_logs_group_arn    = "${aws_cloudwatch_log_group.route53_audit[count.index].arn}:*"
+  cloud_watch_logs_role_arn     = aws_iam_role.route53_audit_delivery[count.index].arn
+  include_global_service_events = true # Route53 is global-plane: required
+
+  event_selector {
+    read_write_type           = "WriteOnly" # management events only
+    include_management_events = true
+  }
+
+  tags = var.tags
+}
+
+resource "aws_s3_bucket" "route53_audit" {
+  count = var.enabled && var.dns_canary_enabled && var.dns_canary_create_trail ? 1 : 0
+
+  bucket        = "${var.cluster_name}-cloudtrail-route53-audit"
+  force_destroy = false # audit logs: never destroy by accident
+
+  tags = var.tags
+}
+
+resource "aws_s3_bucket_public_access_block" "route53_audit" {
+  count = var.enabled && var.dns_canary_enabled && var.dns_canary_create_trail ? 1 : 0
+
+  bucket                  = aws_s3_bucket.route53_audit[count.index].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+data "aws_iam_policy_document" "route53_audit_bucket" {
+  count = var.enabled && var.dns_canary_enabled && var.dns_canary_create_trail ? 1 : 0
+
+  statement {
+    sid       = "DenyInsecureTransport"
+    effect    = "Deny"
+    actions   = ["s3:*"]
+    resources = ["${aws_s3_bucket.route53_audit[count.index].arn}/*", aws_s3_bucket.route53_audit[count.index].arn]
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+
+  # CloudTrail service principal grant — CreateTrail hard-fails with
+  # InsufficientS3BucketPolicyException without it (it validates the
+  # bucket policy BEFORE writing the first log object).
+  statement {
+    sid       = "CloudTrailDeliveryPush"
+    effect    = "Allow"
+    actions   = ["s3:GetBucketAcl", "s3:PutObject"]
+    resources = ["${aws_s3_bucket.route53_audit[count.index].arn}/*", aws_s3_bucket.route53_audit[count.index].arn]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceArn"
+      values = [
+        "arn:${local.monitoring_partition}:cloudtrail:${local.monitoring_region}:${local.monitoring_account_id}:trail/${var.cluster_name}-route53-audit",
+      ]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "route53_audit" {
+  count = var.enabled && var.dns_canary_enabled && var.dns_canary_create_trail ? 1 : 0
+
+  bucket = aws_s3_bucket.route53_audit[count.index].id
+  policy = data.aws_iam_policy_document.route53_audit_bucket[count.index].json
+}
+
+resource "aws_iam_role" "route53_audit_delivery" {
+  count = var.enabled && var.dns_canary_enabled && var.dns_canary_create_trail ? 1 : 0
+
+  name = "${var.cluster_name}-cw-route53-delivery"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "cloudtrail.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy" "route53_audit_delivery" {
+  count = var.enabled && var.dns_canary_enabled && var.dns_canary_create_trail ? 1 : 0
+
+  name = "cw-delivery"
+  role = aws_iam_role.route53_audit_delivery[count.index].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+      Resource = "${aws_cloudwatch_log_group.route53_audit[count.index].arn}:*"
+    }]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "route53_audit" {
+  count = var.enabled && var.dns_canary_enabled ? 1 : 0
+
+  name              = var.route53_audit_log_group_name
+  retention_in_days = var.log_retention_days == 0 ? 0 : max(var.log_retention_days, 90)
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_log_metric_filter" "route53_record_changes" {
+  count = var.enabled && var.dns_canary_enabled ? 1 : 0
+
+  name           = "${var.cluster_name}-route53-record-changes"
+  log_group_name = aws_cloudwatch_log_group.route53_audit[count.index].name
+  pattern        = "{ $.eventName = \"ChangeResourceRecordSets\" && $.eventSource = \"route53.amazonaws.com\" }"
+
+  metric_transformation {
+    name          = "Route53RecordChanges"
+    namespace     = "ClickHouse/LeakGuard"
+    value         = "1"
+    default_value = 0
+  }
+
+  depends_on = [aws_cloudwatch_log_group.route53_audit]
+}
+
+resource "aws_cloudwatch_metric_alarm" "route53_record_changes" {
+  count = var.enabled && var.dns_canary_enabled ? 1 : 0
+
+  alarm_name          = "${local.alarm_prefix}-route53-record-changes"
+  namespace           = "ClickHouse/LeakGuard"
+  metric_name         = "Route53RecordChanges"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+
+  alarm_description = "A Route53 ChangeResourceRecordSets call modified DNS records in the last 5 minutes. Instance refreshes and lease re-claims legitimately update records; verify whether the change was expected. TRIAGE: run `make dns-audit` first to compare the private zone against live fleet state (a clean diff indicates expected churn), and check CloudTrail for the caller identity before reverting changes."
 
   alarm_actions = local.alert_topic_arns
   ok_actions    = local.alert_topic_arns

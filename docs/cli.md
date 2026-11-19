@@ -69,8 +69,7 @@ chinit boot [-spec /var/lib/clickhouse-bootstrap/chinit.yaml] [-cloud aws|azure]
 
 | Subcommand | Default Timer | What It Accomplishes |
 |---|---|---|
-| `schema-bootstrap` | Every 15 min | Re-applies `bootstrap-ddl.sql` idempotently (`CREATE ... IF NOT EXISTS`) so nodes that booted while peers were unreachable still converge. |
-| `schema-sync` | Every 5 min | Pulls DDL definitions from a live peer onto this node (`-retries N`, `-prune-stale-self`). |
+| `schema-sync` | Hourly | Propagates DDL definitions from live peers onto this node via `HostCreateTables` (`-retries N`, `-prune-stale-self`). |
 | `replica-sync` | Every 5 min | Issues `SYSTEM SYNC REPLICA` across local `ReplicatedMergeTree` tables. |
 | `queue-heal` | Hourly | Inspects stuck replication queues while respecting active merges: runs `SYSTEM RESTORE REPLICA` on read-only tables, `SYSTEM SYNC REPLICA` on orphan part references, and `SYSTEM RESTART REPLICA` when merges are idle. |
 | `dead-replica-gc` | Hourly | Sweeps ClickHouse Keeper metadata and drops replica registrations belonging to ordinals that no longer hold an active lease. |

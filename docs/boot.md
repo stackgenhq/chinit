@@ -160,7 +160,8 @@ Furthermore, every step is explicitly classified by **Criticality** and **Failur
 | **Phase 2** | `install_shutdown_drain` | 🔒 Critical | Installs `chinit-shutdown-drain.service` right away so any subsequent shutdown cleanly releases the claimed lease. |
 | **Phase 2** | `start_clickhouse` | 🔒 Critical | Enables and starts `clickhouse-server`, polls `/ping` until ready, and verifies S3 tiered-storage disk access (skipped on `keeper` nodes). |
 | **Phase 2** | `detect_storage_loss` | ⚠️ BestEffort | Detects when a freshly imaged VM claims an ordinal that still has replica metadata in Keeper alongside an empty local data disk. |
-| **Phase 2** | `bootstrap_schema` | ⚠️ BestEffort | Applies `bootstrap-ddl.sql` idempotently (`CREATE ... IF NOT EXISTS`), automatically recovering `REPLICA_ALREADY_EXISTS` after storage loss. |
+| **Phase 2** | `bootstrap_schema` | ⚠️ BestEffort | Executes optional `bootstrap-ddl.sql` directly via `clickhouse-client --queries-file` for cold-start initialization. |
+| **Phase 2** | `sync_schema` | ⚠️ BestEffort | Propagates databases, tables, views, and functions from live cluster peers via `HostCreateTables` (`clickhouse-operator`), pruning stale self replica registrations on Code 253. |
 | **Phase 2** | `health_gate` | ⚠️ BestEffort | Probes cluster health across live peers (non-fatal so nodes can still boot while another peer is undergoing maintenance). |
 | **Phase 2** | `prometheus_reload` | ⚠️ BestEffort | Reloads config and verifies ClickHouse's `:9363/metrics` Prometheus endpoint responds. |
 | **Phase 2** | `install_units` | 🔒 Critical | Installs and enables role-appropriate `systemd` services and timers (`lease-renew`, `schema-sync`, `replica-sync`, `queue-heal`, `disk-autoscale`, …). |

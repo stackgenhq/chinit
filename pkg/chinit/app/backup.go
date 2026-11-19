@@ -65,8 +65,13 @@ func runBackupDaily(args []string) error {
 var preBackupSync = func(ctx context.Context, st *nodeState, spec *inventorySpec) {
 	log := logger.GetLogger(ctx)
 	_ = convergeStaticNodePeers(st)
-	if _, err := service.ApplyBootstrapDDL(ctx, st.Identity.Hostname, string(st.Identity.Role)); err != nil {
-		log.Warn("backup-daily: pre-backup DDL convergence warning", "err", err)
+	if err := clusterOps.SyncSchema(ctx, clusterops.SyncSchemaRequest{
+		Cluster:        clusterRequest(st),
+		HostName:       st.Identity.Hostname,
+		Retries:        service.DefaultSchemaSyncRetries,
+		PruneStaleSelf: true,
+	}); err != nil {
+		log.Warn("backup-daily: pre-backup schema-sync warning", "err", err)
 	}
 	if _, err := clusterOps.QueueHeal(ctx, clusterops.QueueHealRequest{
 		Cluster:        clusterRequest(st),

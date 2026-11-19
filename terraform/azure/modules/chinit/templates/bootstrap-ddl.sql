@@ -13,10 +13,9 @@
 --     "configs/bootstrap-ddl.sql" = file("${path.module}/schema.sql")
 --   }
 --
--- A comment-only file is a safe no-op: chinit's statement splitter
--- finds no CREATE statements and the boot logs "0 statement(s)
--- applied" — your tables arrive via your own DDL (or schema-sync from
--- peers).
+-- A comment-only file is a safe no-op: chinit skips comment-only
+-- bootstrap-ddl.sql files and relies on schema-sync (HostCreateTables)
+-- to propagate existing tables from live peers.
 --
 -- Writing yours: ${shard}/${replica} are CLICKHOUSE macros, substituted
 -- server-side at DDL time from the node's rendered macros config.

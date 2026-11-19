@@ -310,3 +310,21 @@ variable "keeper_cpu_threshold" {
   type        = number
   default     = 80
 }
+
+variable "dns_canary_enabled" {
+  description = "Enable the Route53 ChangeResourceRecordSets CloudTrail canary (log group, metric filter, and alarm) to detect out-of-band private-DNS mutations. Requires a CloudTrail delivering global management events to var.route53_audit_log_group_name (provisioned automatically when dns_canary_create_trail is true)."
+  type        = bool
+  default     = true
+}
+
+variable "route53_audit_log_group_name" {
+  description = "CloudWatch Logs log group where CloudTrail delivers route53.amazonaws.com management events (ChangeResourceRecordSets). Set to an existing CloudTrail log group when reusing an account or organization trail."
+  type        = string
+  default     = "/aws/cloudtrail/route53"
+}
+
+variable "dns_canary_create_trail" {
+  description = "Create a dedicated single-region CloudTrail (with global service events enabled) and audit S3 bucket for the DNS canary. Set false only when an existing account or organization trail already delivers global management events to var.route53_audit_log_group_name."
+  type        = bool
+  default     = true
+}

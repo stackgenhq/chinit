@@ -48,7 +48,8 @@ Steps marked 🔒 are **Critical** (a failure aborts the boot so systemd or the 
 | Phase 2 | `install_shutdown_drain` | 🔒 | Installs `chinit-shutdown-drain.service` immediately after identity settlement so any termination releases the lease. |
 | Phase 2 | `start_clickhouse` | 🔒 | Enables and starts `clickhouse-server`, waits for `/ping`, and checks S3 disk health (skipped on `keeper` nodes). |
 | Phase 2 | `detect_storage_loss` | ⚠️ | Detects when a re-imaged node claims an ordinal that has existing Keeper replica registrations but an empty local data directory. |
-| Phase 2 | `bootstrap_schema` | ⚠️ | Applies `bootstrap-ddl.sql` idempotently (`CREATE ... IF NOT EXISTS`). |
+| Phase 2 | `bootstrap_schema` | ⚠️ | Executes optional `bootstrap-ddl.sql` directly via `clickhouse-client --queries-file` for cold-start seeding. |
+| Phase 2 | `sync_schema` | ⚠️ | Copies databases, tables, views, and functions from live peers via `HostCreateTables` (pruning stale self registrations on Code 253). |
 | Phase 2 | `health_gate` | ⚠️ | Probes cluster health across live peers. Non-fatal so a node booting during peer maintenance still joins. |
 | Phase 2 | `prometheus_reload` | ⚠️ | Reloads config and verifies the `:9363/metrics` endpoint. |
 | Phase 2 | `install_units` | 🔒 | Installs and enables systemd units and timers for recurring maintenance subcommands. |
@@ -85,7 +86,7 @@ launch (fixed instance at .30 subnet offset)
       ├─ Phase 1: derive backup-0 from the IP octet and register DNS
       ├─ Phase 2: install static configs + backup-replica-settings.xml overlay,
       │    render config at CR slot 01-(writer_max + reader_max), start server,
-      │    install replica-sync, schema-bootstrap, and clickhouse-backup-daily timers
+      │    sync schema from peers, install replica-sync, schema-sync, and clickhouse-backup-daily timers
       └─ boot_finished
 ```
 

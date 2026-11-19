@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/service"
 	"github.com/stackgenhq/chinit/pkg/chinit/infra/clusterops"
 	"github.com/stackgenhq/chinit/pkg/chinit/logger"
@@ -41,44 +40,6 @@ func runSchemaSync(args []string) error {
 	}); err != nil {
 		logger.GetLogger(ctx).Error("schema sync failed (retry on timer)", "err", err)
 		return fmt.Errorf("schema sync failed (retry on timer): %w", err)
-	}
-	if st.Identity.Role != model.RoleWriter && st.Identity.Role != model.RoleKeeper {
-		if _, ddlErr := service.ApplyBootstrapDDL(ctx, st.Identity.Hostname, string(st.Identity.Role)); ddlErr != nil {
-			logger.GetLogger(ctx).Warn("post-schema-sync DDL convergence warning", "err", ddlErr)
-		}
-	}
-	return nil
-}
-
-// runSchemaBootstrap is `chinit schema-bootstrap` (the 15-minute
-// convergence unit): one idempotent pass of the bundle DDL — the same
-// ApplyBootstrapDDL the boot's bootstrap_schema step runs. The
-// reader-0 exhausted the boot's retries while the keeper rolled
-// in the same instance refresh, and NOTHING re-ran the DDL afterward
-// the node served reads schemaless for hours. This unit is the
-// after-the-boot heal path; the timer retries it until the pass is clean.
-func runSchemaBootstrap(args []string) error {
-	statePath, err := statePathFlag(args)
-	if err != nil {
-		return err
-	}
-	st, err := loadNodeState(statePath)
-	if err != nil {
-		return err
-	}
-	ctx := context.Background()
-	result, err := service.ApplyBootstrapDDL(ctx, st.Identity.Hostname, string(st.Identity.Role))
-	if err != nil {
-		return fmt.Errorf("schema bootstrap failed (retry on timer): %w", err)
-	}
-	logger.GetLogger(ctx).Info("schema bootstrap: statements applied",
-		"applied", result.Created,
-		"ddl_path", result.DDLPath,
-		"failed", result.Failed)
-	if result.Failed > 0 {
-		// Non-zero exit: the timer unit's OnFailure semantics and the
-		// journal contract surface a failed pass; the next tick retries.
-		return fmt.Errorf("schema bootstrap: %d statement(s) failed (retry on timer)", result.Failed)
 	}
 	return nil
 }

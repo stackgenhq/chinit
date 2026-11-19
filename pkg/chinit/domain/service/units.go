@@ -137,20 +137,6 @@ func (b *Boot) chinitUnits() unitFiles {
 			chinitTimer("config-check.timer", "Check config drift every 15 minutes", "*-*-* *:00/15:00"),
 			b.chinitUnit("schema-sync.service", "ClickHouse schema auto-propagation from cluster peers", "schema-sync -retries 3 -prune-stale-self"),
 			chinitTimer("schema-sync.timer", "Run schema sync periodically", "hourly"),
-			// Self-healing schema convergence: the boot's DDL pass can
-			// lose the keeper race (the keeper rolls in the same
-			// instance refresh) and its retries exhaust — this unit
-			// re-runs the same idempotent bundle DDL until the pass
-			// is clean. FIVE-minute cadence (was 15, the 2026-11-17
-			// 12-hour soak's churn→backlog finding): a fresh writer's
-			// S3Queue surface is the drain pipeline — every churn wave
-			// re-forms claims, and a 15-minute DDL gap per wave is
-			// ~3% of drain time lost per generation at 60TB/day (the
-			// effective drain collapsed to ≈ input across three fleet
-			// generations). The pass is a no-op on a clean node; the
-			// cadence only matters when it isn't.
-			b.chinitUnit("schema-bootstrap.service", "Bundle DDL convergence pass (idempotent re-apply)", "schema-bootstrap"),
-			chinitTimer("schema-bootstrap.timer", "Re-apply the bundle DDL until the pass is clean", "*-*-* *:00/5:00"),
 			// Self-healing disk headroom: effective free below the
 			// floor (the keep_free_space-aware number merges gate on)
 			// grows the node's own volume + filesystem online. Effective
@@ -295,11 +281,10 @@ WantedBy=multi-user.target
 			)
 		}
 	case model.RoleBackup:
-		// The backup replica still carries the DDL convergence pass
-		// it materializes the same replicated tables to serve backups.
+		// The backup replica materializes replicated tables via HostCreateTables.
 		units = append(units,
-			b.chinitUnit("schema-bootstrap.service", "Bundle DDL convergence pass (idempotent re-apply)", "schema-bootstrap"),
-			chinitTimer("schema-bootstrap.timer", "Re-apply the bundle DDL until the pass is clean", "*-*-* *:00/5:00"),
+			b.chinitUnit("schema-sync.service", "ClickHouse schema auto-propagation from cluster peers", "schema-sync -retries 3 -prune-stale-self"),
+			chinitTimer("schema-sync.timer", "Run schema sync periodically", "hourly"),
 			// The backup converges config drift too — its role spec
 			// uploads with every other (enable_backup gates only the
 			// fleet's awareness of the node, never its own converge).

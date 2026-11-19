@@ -205,17 +205,14 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		// timer converges the catch-up).
 		StepFunc("detect_storage_loss", BestEffort, onceFatal, b.detectStorageLoss),
 
-		// 11b. Bootstrap schema (server nodes): execute the bundle's
-		// bootstrap-ddl.sql idempotently — the full-churn
-		// when every peer churns within one refresh, no node
-		// holds the schema for schema-sync to propagate from, and the
-		// fleet stays schemaless until a manual DDL session recovers it
-		// from keeper metadata. The DDL ships WITH the config bundle
-		// (Terraform uploads it next to the XMLs); every CREATE is IF
-		// NOT EXISTS with {shard}/{replica} macros, so a node that
-		// already has its tables is a no-op and a fully-churned fleet
-		// re-materializes its own schema at boot.
+		// 11b. Bootstrap schema (server nodes): execute optional cold-start
+		// bootstrap-ddl.sql directly via clickhouse-client without parsing SQL.
 		StepFunc("bootstrap_schema", BestEffort, apiRetry, b.bootstrapSchema),
+
+		// 11c. Sync schema (server nodes): copy database and table schema
+		// from live peers via HostCreateTables, pruning any stale self replica
+		// registration on Code 253.
+		StepFunc("sync_schema", BestEffort, onceFatal, b.syncSchema),
 
 		// 12. Health gate: NON-FATAL by design — a reader booting while
 		// a peer is down (fleet rolling, spot churn) must still join; a
