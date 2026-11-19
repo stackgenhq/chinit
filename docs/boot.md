@@ -167,7 +167,7 @@ Furthermore, every step is explicitly classified by **Criticality** and **Failur
 | **Phase 2** | `configure_backup` | 🔒 Critical | Configures `clickhouse-backup` and enables the daily backup timer when `backup.bucket` is set on the backup replica. |
 | **Phase 2** | `configure_monitoring` | ⚠️ BestEffort | Configures OpenTelemetry Collector or Fluent Bit when `log_shipping.endpoint` is specified. |
 | **Phase 2** | `configure_cloudwatch` | ⚠️ BestEffort | Configures the CloudWatch agent on AWS nodes. |
-| **Phase 2** | `install_spot_watch` | ⚠️ BestEffort | Starts `chinit-spot-watch.service` on reader nodes to poll 2-second Spot preemption notices and trigger early draining. |
+| **Phase 2** | `install_spot_watch` | ⚠️ BestEffort | Starts `chinit-spot-watch.service` on writer + reader nodes to poll 2-second Spot preemption notices and trigger early draining (both ASG roles hold a replica registration, an ordinal lease and a DNS record to release). |
 | **Phase 2** | `boot_finished` | 🔒 Critical | Writes `/var/lib/cloud/instance/boot-finished` and emits structured per-step timing telemetry. |
 | **Post** | `hooks_post_boot` | ⚠️ BestEffort | Runs optional `post_boot` shell hooks (e.g., cache warming or external service registration). |
 

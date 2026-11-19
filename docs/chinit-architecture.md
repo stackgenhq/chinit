@@ -113,7 +113,7 @@ When a provider does not implement an optional capability, `chinit` logs a clear
 | Phase 2 | `configure_backup` | Critical | `onceFatal` | Configures `clickhouse-backup` and its daily timer when a backup bucket is specified. |
 | Phase 2 | `configure_monitoring` | BestEffort | `onceFatal` | Configures OpenTelemetry Collector or Fluent Bit when `log_shipping.endpoint` is set. |
 | Phase 2 | `configure_cloudwatch` | BestEffort | `onceFatal` | Configures the CloudWatch agent on AWS nodes. |
-| Phase 2 | `install_spot_watch` | BestEffort | `onceFatal` | Installs the spot interruption watcher on reader nodes. |
+| Phase 2 | `install_spot_watch` | BestEffort | `onceFatal` | Installs the spot interruption watcher on writer + reader nodes (the ASG roles whose departure must release a registration, lease and DNS record inside the notice window). |
 | Phase 2 | `boot_finished` | Critical | `onceFatal` | Writes `/var/lib/cloud/instance/boot-finished` and emits step timing metrics. |
 | Post | `hooks_post_boot` | BestEffort | `onceFatal` | Runs optional `post_boot` lifecycle hooks. |
 
