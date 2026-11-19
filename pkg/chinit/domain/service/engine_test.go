@@ -81,6 +81,53 @@ var _ = Describe("Do", func() {
 		Expect(err.Error()).To(ContainSubstring("after 3 attempts"))
 		Expect(calls).To(Equal(3))
 	})
+
+	It("uses the WHOLE deadline window: a deadline-bounded policy retries until the window closes, not just once", func() {
+		calls := 0
+		// ebsAttachWait's shape: many attempts, a real deadline, tiny
+		// sleeps. Before the fix, elapsed() returned the REMAINING
+		// time, so remaining := Deadline - elapsed(ctx) was ~0 and
+		// every deadline-bounded step gave up after attempt 1
+		// ("retry window exhausted after attempt 1") instead of
+		// waiting out e.g. an async EBS attach. The window (10ms)
+		// is sized to close well before the 60 attempts run out.
+		err := Do(context.Background(),
+			Policy{Attempts: 60, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond, Deadline: 10 * time.Millisecond},
+			func(context.Context) error {
+				calls++
+				return errors.New("disk not visible yet")
+			})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("retry window exhausted"), "a deadline-bounded failure ends via the window, not the attempt count")
+		Expect(calls).To(BeNumerically(">", 1), "the window must span multiple attempts (was 1 with the elapsed() bug)")
+	})
+
+	It("lets a slow resource arrive inside the window (deadline retries until success)", func() {
+		calls := 0
+		err := Do(context.Background(),
+			Policy{Attempts: 60, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond, Deadline: 5 * time.Second},
+			func(context.Context) error {
+				calls++
+				if calls < 3 {
+					return errors.New("ebs attach pending")
+				}
+				return nil
+			})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(calls).To(Equal(3), "the second attempt is the regression: it must run")
+	})
+
+	It("fails fast when the deadline has truly closed before the first attempt", func() {
+		calls := 0
+		err := Do(context.Background(),
+			Policy{Attempts: 60, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond, Deadline: time.Nanosecond},
+			func(context.Context) error {
+				calls++
+				return errors.New("late attach")
+			})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("retry deadline exceeded before attempt 1"), "an already-expired deadline aborts before any work")
+	})
 })
 
 var _ = Describe("backoff", func() {

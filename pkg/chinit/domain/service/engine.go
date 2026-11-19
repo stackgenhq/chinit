@@ -80,6 +80,12 @@ func retryable(err error) bool { return err != nil && !IsFatal(err) }
 func Do(ctx context.Context, p Policy, op func(ctx context.Context) error) error {
 	p = p.withDefaults()
 
+	// The deadline window spans ALL attempts (Do re-arms a per-attempt
+	// ctx below, but p.Deadline bounds the whole operation: attempts,
+	// sleeps and all). start is the clock the remaining-window
+	// arithmetic below uses.
+	start := time.Now()
+
 	var lastErr error
 	for attempt := 1; attempt <= p.Attempts; attempt++ {
 		if p.Deadline > 0 {
@@ -106,7 +112,7 @@ func Do(ctx context.Context, p Policy, op func(ctx context.Context) error) error
 
 		delay := backoff(p, attempt)
 		if p.Deadline > 0 {
-			if remaining := p.Deadline - elapsed(ctx); remaining <= delay {
+			if remaining := p.Deadline - time.Since(start); remaining <= delay {
 				// No window left for another attempt: fail now
 				// instead of sleeping past the deadline.
 				return fmt.Errorf("retry window exhausted after attempt %d: %w", attempt, lastErr)
@@ -118,16 +124,6 @@ func Do(ctx context.Context, p Policy, op func(ctx context.Context) error) error
 		lastErr = errors.New("retry policy exhausted")
 	}
 	return fmt.Errorf("after %d attempts: %w", p.Attempts, lastErr)
-}
-
-// elapsed reports how much of the deadline has been consumed. The
-// context's own machinery is the clock — tests inject deadlines the same
-// way production does.
-func elapsed(ctx context.Context) time.Duration {
-	if deadline, ok := ctx.Deadline(); ok {
-		return time.Until(deadline)
-	}
-	return 0
 }
 
 // backoff computes the attempt's delay: BaseDelay * Factor^(attempt-1),
