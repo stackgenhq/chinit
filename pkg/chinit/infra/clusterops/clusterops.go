@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/stackgenhq/chinit/pkg/chinit/domain"
@@ -318,9 +319,36 @@ func (o *ops) DropReplica(ctx context.Context, req DropReplicaRequest) error {
 	})
 }
 
+// prioritizeRunOnHost moves the matching RunOn host to index 0 so
+// detectSoftwareVersion queries the live local coordinator first instead of
+// logging failed HTTP pings against vacant ceiling slots.
+func prioritizeRunOnHost(hosts []Host, runOn string) []Host {
+	if runOn == "" || len(hosts) < 2 {
+		return hosts
+	}
+	idx := -1
+	for i, h := range hosts {
+		shortAddr, _, _ := strings.Cut(h.Address, ".")
+		if h.Name == runOn || h.Address == runOn || shortAddr == runOn {
+			idx = i
+			break
+		}
+	}
+	if idx <= 0 {
+		return hosts
+	}
+	reordered := make([]Host, 0, len(hosts))
+	reordered = append(reordered, hosts[idx])
+	reordered = append(reordered, hosts[:idx]...)
+	reordered = append(reordered, hosts[idx+1:]...)
+	return reordered
+}
+
 // GcReplica implements Ops.
 func (o *ops) GcReplica(ctx context.Context, req GcReplicaRequest) (*GcResult, error) {
-	base, err := o.schemaRequest(ctx, req.Cluster)
+	cluster := req.Cluster
+	cluster.Hosts = prioritizeRunOnHost(cluster.Hosts, req.RunOn)
+	base, err := o.schemaRequest(ctx, cluster)
 	if err != nil {
 		return nil, err
 	}

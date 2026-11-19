@@ -708,6 +708,48 @@ func (b *Boot) retrievePasswords(ctx context.Context) error {
 	return nil
 }
 
+// tlsCertDir and clickhouseClientConfigDir are the seams for TLS setup tests.
+var (
+	tlsCertDir                = func() string { return "/etc/clickhouse-server/ssl" }
+	clickhouseClientConfigDir = func() string { return "/etc/clickhouse-client/config.d" }
+)
+
+func (b *Boot) selfSignedCertCN() string {
+	if b.Identity.Hostname != "" {
+		return b.Identity.Hostname
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+	return "localhost"
+}
+
+// ensureClientCAConfig installs a clickhouse-client config.d drop-in trusting
+// the node's CA alongside system CAs. ClickHouse 26.8+ bare clickhouse-client
+// invocations probe both 9000 and 9440 concurrently; without trusting ca.crt,
+// every local CLI/exporter/timer call logs `tlsv1 alert unknown ca` on 9440.
+func ensureClientCAConfig(ctx context.Context, caCertPath string) error {
+	dir := clickhouseClientConfigDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return Fatal(fmt.Errorf("create %s: %w", dir, err))
+	}
+	cfg := fmt.Sprintf(`<config>
+    <openSSL>
+        <client>
+            <caConfig>%s</caConfig>
+            <loadDefaultCAFile>true</loadDefaultCAFile>
+        </client>
+    </openSSL>
+</config>
+`, caCertPath)
+	dest := filepath.Join(dir, "chinit-ca.xml")
+	if err := os.WriteFile(dest, []byte(cfg), 0o644); err != nil {
+		return Fatal(fmt.Errorf("write %s: %w", dest, err))
+	}
+	logger.GetLogger(ctx).Info("TLS: configured clickhouse-client CA trust drop-in", "path", dest)
+	return nil
+}
+
 // configureTLS writes the interserver TLS material the server's
 // interserver port (9010) requires: server cert/key + CA. With TLS
 // secrets configured, the values come from the cloud secret store;
@@ -718,34 +760,35 @@ func (b *Boot) retrievePasswords(ctx context.Context) error {
 // exist (Code 210 File not found
 // the bash script's configure_tls step had no chinit equivalent).
 func (b *Boot) configureTLS(ctx context.Context) error {
-	sslDir := "/etc/clickhouse-server/ssl"
-	if err := os.MkdirAll(sslDir, 0755); err != nil {
+	sslDir := tlsCertDir()
+	if err := os.MkdirAll(sslDir, 0o755); err != nil {
 		return Fatal(fmt.Errorf("create %s: %w", sslDir, err))
 	}
+	caPath := filepath.Join(sslDir, "ca.crt")
 
 	if b.Spec.Secrets.TLSCertificate == "" {
 		// No TLS secrets configured (acm mode): interserver-only
 		// self-signed, preserved across reboots (idempotent).
 		crt := filepath.Join(sslDir, "server.crt")
 		if _, err := os.Stat(crt); err == nil {
-			return nil
+			return ensureClientCAConfig(ctx, caPath)
 		}
 		out, err := runCommand(ctx, "openssl", "req", "-x509", "-newkey", "rsa:2048",
 			"-nodes", "-days", "3650",
-			"-subj", "/CN="+b.Identity.Hostname,
+			"-subj", "/CN="+b.selfSignedCertCN(),
 			"-keyout", filepath.Join(sslDir, "server.key"),
 			"-out", crt)
 		if err != nil {
 			return Fatal(fmt.Errorf("generate self-signed interserver cert: %w: %s", err, out))
 		}
-		if err := os.WriteFile(filepath.Join(sslDir, "ca.crt"), mustRead(crt), 0644); err != nil {
+		if err := os.WriteFile(caPath, mustRead(crt), 0o644); err != nil {
 			return Fatal(fmt.Errorf("write ca.crt: %w", err))
 		}
 		if _, err := runCommand(ctx, "chown", "-R", "clickhouse:clickhouse", sslDir); err != nil {
 			return Fatal(err)
 		}
 		logger.GetLogger(ctx).Info("TLS: generated self-signed cert for interserver TLS (no TLS secrets configured)")
-		return nil
+		return ensureClientCAConfig(ctx, caPath)
 	}
 
 	material := []struct {
@@ -753,9 +796,9 @@ func (b *Boot) configureTLS(ctx context.Context) error {
 		dest   string
 		mode   os.FileMode
 	}{
-		{b.Spec.Secrets.TLSCertificate, filepath.Join(sslDir, "server.crt"), 0644},
-		{b.Spec.Secrets.TLSPrivateKey, filepath.Join(sslDir, "server.key"), 0600},
-		{b.Spec.Secrets.TLSCACertificate, filepath.Join(sslDir, "ca.crt"), 0644},
+		{b.Spec.Secrets.TLSCertificate, filepath.Join(sslDir, "server.crt"), 0o644},
+		{b.Spec.Secrets.TLSPrivateKey, filepath.Join(sslDir, "server.key"), 0o600},
+		{b.Spec.Secrets.TLSCACertificate, caPath, 0o644},
 	}
 	for _, m := range material {
 		if m.secret == "" {
@@ -773,7 +816,7 @@ func (b *Boot) configureTLS(ctx context.Context) error {
 		return Fatal(err)
 	}
 	logger.GetLogger(ctx).Info("TLS: material installed from the cloud secret store")
-	return nil
+	return ensureClientCAConfig(ctx, caPath)
 }
 
 // mustRead reads a file, panicking on failure (used only on files this
