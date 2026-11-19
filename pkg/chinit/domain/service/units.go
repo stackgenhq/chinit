@@ -830,15 +830,38 @@ func otlpHeadersBlock(headers string) string {
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-// installSpotWatch writes the spot-watch service (readers): a
-// long-running chinit daemon that drains on the interruption notice.
+// spotWatchEligible answers whether the role's departure carries state
+// the notice window must release — the ASG members (writers + readers):
+// a live replica registration, an ordinal lease and a DNS record. The
+// spot watcher's drain is the only path that releases all three inside
+// the 2-minute ITN budget. Keepers hold no lease and no server (drain
+// is meaningless); the backup replica is static (on-demand, never
+// spot) and must never drain its identity on a notice.
+func spotWatchEligible(role model.Role) bool {
+	switch role {
+	case model.RoleWriter, model.RoleReader:
+		return true
+	}
+	return false
+}
+
+// installSpotWatch writes the spot-watch service (writers + readers):
+// a long-running chinit daemon that drains on the interruption notice.
 //
-// Reader-only BY DESIGN: writers are on-demand ASG members with no
-// spot interruption endpoint to watch — their scale-in drain arrives
-// through the ASG termination lifecycle hook (EventBridge → drain
-// Lambda → SSM `chinit drain`), not a 2-minute notice.
+// Writers included SINCE writer_spot_ratio made Spot writers real
+// (dev runs writer-1..N 100% Spot above the on-demand base): a Spot
+// writer's departure is exactly a reader's — a 2-minute ITN window
+// the node must use for the graceful exit (queues stopped, server
+// shut down, replica dropped on a live peer, DNS + lease released).
+// Without the watcher the writer's only drain is the ExecStop
+// shutdown unit, which must skip the peer drop (Code 305 while the
+// local server still runs) — the ghost registrations then wait on
+// the dead-replica GC, and a GC pass that itself fails wedges every
+// peer's replication queue behind log entries a dead ordinal owns
+// (the 2026-11-19 writer-5/writer-7 finding). On-demand writers
+// poll a 404 forever — harmless.
 func (b *Boot) installSpotWatch(ctx context.Context) error {
-	if b.Spec.Role != model.RoleReader {
+	if !spotWatchEligible(b.Spec.Role) {
 		return nil
 	}
 	watcher := chinitport.AsSpotSignals(b.Provider)

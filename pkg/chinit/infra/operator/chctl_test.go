@@ -1409,17 +1409,95 @@ func TestSchemaRunnerHostMissSingleLine(t *testing.T) {
 	require.NotContains(t, err.Error(), "\n")
 }
 
-func TestSchemaRunnerDropReplicaUnknownHost(t *testing.T) {
-	// The AWS stack's GC detects cloud host_name values (reader-9);
-	// DropReplica must refuse a name the inventory does not know before
-	// any SQL runs — the gate that keeps a GC from dropping arbitrary
-	// registrations.
+func TestSchemaRunnerDropReplicaRetiredOrdinal(t *testing.T) {
+	// The 2026-11-19 live finding: dead-replica-gc detected writer-5/
+	// writer-7 (retired Spot ordinals beyond writer_max) every 5-minute
+	// pass and then REFUSED to drop them — `host not in inventory` —
+	// because DropReplica gated the dropped name on inventory
+	// membership. A stale registration exists precisely because its
+	// host left the inventory; the ghosts wedged the fleet's
+	// replication queues for hours. The gate is now lexical
+	// (saneReplicaName), not inventory membership: the retired name
+	// MUST reach the SQL, verified over the wire — the drop statement
+	// issued, and the run-on host still inventory-resolved.
+	var captured []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.Header().Set("Content-Type", "text/tab-separated-values; charset=UTF-8")
+		// The driver's pool ping and version probe answer scalar 1.
+		if !strings.Contains(string(query), "DROP REPLICA") {
+			_, _ = w.Write([]byte("1\n"))
+			return
+		}
+		captured = append(captured, string(query))
+		_, _ = w.Write([]byte("\n"))
+	}))
+	t.Cleanup(server.Close)
+	host, httpPort := splitAddr(t, server.URL)
+
+	cr := loadCHIFromFile(t, "example", "")
+	runnerAny, err := NewSchemaClientFactory().NewClient(context.Background(), port.NewSchemaClientRequest{
+		ClusterName:  "demo",
+		Credentials:  domain.Credentials{Username: "default"},
+		Hosts:        []domain.HostIdentity{{Name: "0-0", Address: host}},
+		HTTPPort:     httpPort,
+		NormalizedCR: cr,
+	})
+	require.NoError(t, err)
+
+	err = runnerAny.DropReplica(context.Background(), domain.ReplicaDropRequest{
+		HostName: "writer-7",
+		RunOn:    "0-0",
+	})
+	require.NoError(t, err,
+		"a retired ordinal absent from the inventory is exactly what the GC exists to drop")
+	// The table-replica drop issued over the wire with the retired
+	// name verbatim inside the quoted literal. (The follow-on
+	// database-replica drop is best-effort and its transport errors
+	// are swallowed by contract — never asserted here.)
+	require.NotEmpty(t, captured)
+	require.Contains(t, captured[0], "SYSTEM DROP REPLICA 'writer-7'")
+}
+
+func TestSchemaRunnerDropReplicaRunOnMustResolve(t *testing.T) {
+	// The RUN-ON peer keeps the inventory gate: the drop executes on a
+	// host the caller must know how to reach — an unresolvable peer
+	// refuses before any SQL, with the names-it-could-be suffix.
 	runner := newGCRunner(t)
 	err := runner.DropReplica(context.Background(), domain.ReplicaDropRequest{
-		HostName: "reader-9",
-		RunOn:    "writer-0",
+		HostName: "writer-7",
+		RunOn:    "peer-that-does-not-exist",
 	})
 	require.ErrorContains(t, err, "not in inventory")
+}
+
+func TestSchemaRunnerDropReplicaGuardsSQLInjectionShapedNames(t *testing.T) {
+	// The dropped name no longer resolves through the inventory, so
+	// saneReplicaName is the only gate between the caller and a
+	// single-quoted SQL literal. Injection-shaped tokens must die
+	// BEFORE any query is issued. The refusal is purely local: this
+	// test's server fails the test if it ever receives a request.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("server must never be reached for an injection-shaped name")
+	}))
+	t.Cleanup(server.Close)
+	runner := newGCRunner(t)
+	for _, name := range []string{
+		"writer-5'; DROP TABLE events; --",
+		`writer-5"; SELECT 1`,
+		`writer-5\`,
+		"writer 5",
+		"",
+		strings.Repeat("w", 65),
+	} {
+		err := runner.DropReplica(context.Background(), domain.ReplicaDropRequest{
+			HostName: name,
+			RunOn:    "writer-0",
+		})
+		require.Error(t, err, "name %q must be refused", name)
+		require.ErrorContains(t, err, "invalid replica name")
+	}
 }
 
 // userPasswordSpec is the shared fixture for user-password injection
