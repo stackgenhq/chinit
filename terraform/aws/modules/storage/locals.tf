@@ -17,11 +17,11 @@ locals {
   bootstrap_prefix_normalized = "${var.bootstrap_prefix}/"
 
   # Staging-drain grant surface (empty when staging_bucket_name is unset):
-  # the S3Queue engine drains <staging_key_prefix>/* and deletes each file
-  # on successful ingest (after_processing='delete'). The pattern keeps
-  # the draining role's grant surface identical across consumers
-  # (instance-role and IRSA users share one IAM contract).
-  staging_drain_roles       = var.staging_bucket_name == "" ? [] : ["writer", "reader"]
+  # the S3Queue engine drains <staging_key_prefix>/* on writer nodes ONLY
+  # and deletes each file on successful ingest (after_processing='delete').
+  # Readers and backup nodes receive rows via ClickHouse replication and
+  # must never hold S3 permissions on the staging prefix.
+  staging_drain_roles       = var.staging_bucket_name == "" ? [] : ["writer"]
   staging_arn               = "arn:aws:s3:::${var.staging_bucket_name}"
   staging_prefix_normalized = var.staging_key_prefix == "" ? "" : "${var.staging_key_prefix}/"
 

@@ -103,3 +103,61 @@ func TestDetectSoftwareVersionQueriesVersionOnWire(t *testing.T) {
 	require.True(t, sawVersionQuery, "detection must query SELECT version(), got %q", fake.captured)
 	_ = swversion.MinVersion()
 }
+
+func TestIsNonWriterHost(t *testing.T) {
+	runner := &SchemaRunner{
+		roles: map[string]domain.Role{
+			"01-0": domain.RoleWriter,
+			"01-5": domain.RoleReader,
+			"01-9": domain.RoleBackup,
+		},
+	}
+
+	writerHost := &v1.Host{}
+	writerHost.Runtime.Address.HostName = "01-0"
+	writerHost.Runtime.Address.FQDN = "writer-0.ch.internal"
+	require.False(t, runner.isNonWriterHost(writerHost, "writer-0"))
+
+	readerHost := &v1.Host{}
+	readerHost.Runtime.Address.HostName = "01-5"
+	readerHost.Runtime.Address.FQDN = "reader-0.ch.internal"
+	require.True(t, runner.isNonWriterHost(readerHost, "reader-0"))
+
+	backupHost := &v1.Host{}
+	backupHost.Runtime.Address.HostName = "01-9"
+	backupHost.Runtime.Address.FQDN = "backup-0.ch.internal"
+	require.True(t, runner.isNonWriterHost(backupHost, "backup-0"))
+
+	// Fallback when Role map is not populated (e.g., CLI subcommand inventory).
+	untypedRunner := &SchemaRunner{}
+	require.False(t, untypedRunner.isNonWriterHost(writerHost, "writer-0"))
+	require.True(t, untypedRunner.isNonWriterHost(readerHost, "reader-0"))
+	require.True(t, untypedRunner.isNonWriterHost(backupHost, "backup-0"))
+}
+
+func TestDropIngestQueuesOnHostDropsViewsThenQueues(t *testing.T) {
+	fake := &healthFakeServer{responses: map[string]string{
+		"FROM system.tables": "drop_sql\nString\nDROP TABLE IF EXISTS \"default\".\"staging_to_events_synth\" SYNC\nDROP TABLE IF EXISTS \"default\".\"staging_synth\" SYNC\n",
+	}}
+	hostAddr, httpPort := startHealthServer(t, fake)
+
+	params := clickhouse.NewClusterConnectionParams(
+		v1.ChSchemeHTTP, "default", "", "", httpPort,
+	)
+	runner := &SchemaRunner{params: params}
+	target := &v1.Host{}
+	target.Runtime.Address.FQDN = hostAddr
+
+	runner.dropIngestQueuesOnHost(context.Background(), target)
+
+	var drops []string
+	for _, q := range fake.captured {
+		if strings.HasPrefix(q, "DROP TABLE IF EXISTS") {
+			drops = append(drops, q)
+		}
+	}
+	require.Equal(t, []string{
+		`DROP TABLE IF EXISTS "default"."staging_to_events_synth" SYNC`,
+		`DROP TABLE IF EXISTS "default"."staging_synth" SYNC`,
+	}, drops)
+}
