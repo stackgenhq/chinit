@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 	"github.com/stackgenhq/chinit/pkg/chinit/logger"
@@ -150,4 +152,95 @@ func (r *PersistentEpochReconciler) driftReason(spec *model.BootSpec) string {
 		return "legacy non-CAS disks/s3/store residue detected on CAS-enabled backup replica"
 	}
 	return ""
+}
+
+// StoragePolicyStore inspects and updates local ClickHouse table metadata files.
+type StoragePolicyStore interface {
+	IsCASActive() bool
+	DiskMetadataPaths() []string
+	ReadMetadataFile(path string) (string, fs.FileMode, error)
+	WriteMetadataFile(path, content string, perm fs.FileMode) error
+}
+
+// StoragePolicyReconciler aligns on-disk table metadata files with whether CAS
+// metadata is active in storage.xml before clickhouse-server starts.
+type StoragePolicyReconciler struct {
+	store StoragePolicyStore
+}
+
+// NewStoragePolicyReconciler constructs a StoragePolicyReconciler backed by store.
+func NewStoragePolicyReconciler(store StoragePolicyStore) *StoragePolicyReconciler {
+	return &StoragePolicyReconciler{store: store}
+}
+
+// Reconcile rewrites on-disk .sql metadata files so storage_policy matches
+// whether CAS metadata is enabled in storage.xml.
+func (r *StoragePolicyReconciler) Reconcile(ctx context.Context) {
+	if r.store == nil {
+		return
+	}
+	casActive := r.store.IsCASActive()
+	fromPolicy, toPolicy := "storage_policy = 'tiered_cas'", "storage_policy = 'tiered'"
+	if casActive {
+		fromPolicy, toPolicy = "storage_policy = 'tiered'", "storage_policy = 'tiered_cas'"
+	}
+	for _, path := range r.store.DiskMetadataPaths() {
+		raw, perm, err := r.store.ReadMetadataFile(path)
+		if err != nil || !strings.Contains(raw, fromPolicy) {
+			continue
+		}
+		updated := strings.ReplaceAll(raw, fromPolicy, toPolicy)
+		if err := r.store.WriteMetadataFile(path, updated, perm); err == nil {
+			logger.GetLogger(ctx).Info("reconciled table metadata storage_policy on disk",
+				"path", path, "cas_active", casActive)
+		}
+	}
+}
+
+type localStoragePolicyStore struct{}
+
+func (localStoragePolicyStore) IsCASActive() bool {
+	storageXML, err := os.ReadFile(filepath.Join(ConfigDir, "storage.xml"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(storageXML), "<metadata_type>cas</metadata_type>")
+}
+
+func (localStoragePolicyStore) DiskMetadataPaths() []string {
+	patterns := []string{
+		"/var/lib/clickhouse/store/*/*/*.sql",
+		"/var/lib/clickhouse/metadata/*/*.sql",
+	}
+	var paths []string
+	for _, pat := range patterns {
+		matches, _ := filepath.Glob(pat)
+		for _, p := range matches {
+			info, err := os.Lstat(p)
+			if err != nil || info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+func (localStoragePolicyStore) ReadMetadataFile(path string) (string, fs.FileMode, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", 0, err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0, err
+	}
+	return string(raw), info.Mode().Perm(), nil
+}
+
+func (localStoragePolicyStore) WriteMetadataFile(path, content string, perm fs.FileMode) error {
+	if perm == 0 {
+		perm = 0o640
+	}
+	return os.WriteFile(path, []byte(content), perm)
 }

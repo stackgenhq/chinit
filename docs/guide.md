@@ -36,7 +36,7 @@ Running a replicated analytical database on elastic cloud VMs means dealing with
 | **Cluster maintenance stops** if `writer-0` is terminated during churn | **Vacancy election**: when `writer-0` has no active lease, the lowest-ordinal live writer automatically assumes coordinator duties |
 | **Rolling updates lack a Kubernetes controller** to sequence changes | Epoch-fenced compare-and-swap task rows in the lease table (`fleet-converge` + `task-poll`) coordinate cluster-wide rollouts |
 | **Voluntary rollouts take down the last healthy writer** | Disruption budgets (`min_healthy_writers`, `min_healthy_readers`) gate every task against live peer health status rows |
-| **Re-imaged VMs hit `REPLICA_ALREADY_EXISTS`** against old Keeper metadata | `detect_storage_loss` + `bootstrap_schema` detect empty local disks under existing Keeper paths, re-register cleanly, and re-sync parts from peers |
+| **Re-imaged VMs hit `REPLICA_ALREADY_EXISTS`** against old Keeper metadata | `detect_storage_loss` + `sync_schema` (`HostCreateTables` with stale-self pruning) detect empty local disks under existing Keeper paths, re-register cleanly, and re-sync parts from peers |
 
 ---
 

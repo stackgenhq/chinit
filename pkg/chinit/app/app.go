@@ -64,7 +64,6 @@ type command struct {
 var commands = []command{
 	{Name: "boot", Run: runBoot, Usage: "[-spec chinit.yaml] [-cloud aws|azure|compose] [-dry-run] [-refresh]", Boot: true},
 	{Name: "schema-sync", Run: runSchemaSync, Usage: "[-retries N] [-prune-stale-self]"},
-	{Name: "schema-bootstrap", Run: runSchemaBootstrap},
 	{Name: "replica-sync", Run: runReplicaSync},
 	{Name: "queue-heal", Run: runQueueHeal, Usage: "[-stuck-tries N] [-no-busy-skip]"},
 	{Name: "autoscale", Run: runAutoscale, Usage: "[-state FILE] (keeper-0 self-resize; the ordinal-0 writer rolls the fleet)"},

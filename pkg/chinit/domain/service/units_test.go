@@ -260,23 +260,14 @@ var _ = Describe("chinitUnits", func() {
 	})
 
 	Context("backup replica", func() {
-		It("installs the schema-bootstrap, spec-sync, queue-heal, and static peer-convergence pairs", func() {
+		It("installs the schema-sync, spec-sync, queue-heal, and static peer-convergence pairs", func() {
 			spec := baseSpec()
 			spec.Role = model.RoleBackup
 			spec.IdentityMode = model.IdentityStatic
 			b := &Boot{Spec: &spec}
 
-			// The backup replica materializes the same replicated
-			// tables, so it carries the DDL convergence unit; the
-			// queue-heal pair heals its OWN read-only/stuck tables
-			// (the 2026-11-17 finding: 3 summary tables sat readonly
-			// with no unit on the role to issue the heal); the
-			// lease-renew pair runs the STATIC peer convergence
-			// (convergeStaticNodePeers heals /etc/hosts + DNS for a
-			// lease-less role — the same finding: zero hosts entries
-			// and DNS_ERROR part fetches for hours).
 			Expect(unitNames(b.chinitUnits())).To(ConsistOf(
-				"schema-bootstrap.service", "schema-bootstrap.timer",
+				"schema-sync.service", "schema-sync.timer",
 				"spec-sync.service", "spec-sync.timer",
 				"queue-heal.service", "queue-heal.timer",
 				"lease-renew.service", "lease-renew.timer",

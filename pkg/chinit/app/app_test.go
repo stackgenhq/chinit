@@ -129,7 +129,7 @@ var _ = Describe("the command registry", func() {
 		// exist in the dispatch registry — a renamed subcommand that
 		// misses a unit shows up here as an unknown command.
 		unitCommands := []string{
-			"schema-sync", "schema-bootstrap", "replica-sync", "queue-heal",
+			"schema-sync", "replica-sync", "queue-heal",
 			"lease-renew", "keeper-health", "dead-replica-gc", "orphaned-gc",
 			"backup-daily", "backup-wake", "spot-watch", "drain", "drain-shutdown",
 			"disk-autoscale", "span-ship",

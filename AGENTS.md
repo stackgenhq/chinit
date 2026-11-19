@@ -17,7 +17,8 @@ cmd/chinit  ──▶  pkg/chinit/app  ──▶  pkg/chinit/domain/service  ─
 
 - **`pkg/chinit/domain/model`**: Pure value objects and aggregates (`BootSpec`, `NodeIdentity`, `PersistentEpoch`). Zero cloud SDK, OS, or systemd dependencies.
 - **`pkg/chinit/domain/port`**: Narrow capability interfaces (`Provider`, `OrdinalClaimer`, `LeaseLister`, `DNSRegistrar`, `ClickHouseDataStore`, `InstanceLifecycle`). Optional cloud capabilities are probed via `port.As<Capability>(provider)` and degrade loudly with a warning rather than failing silently.
-- **`pkg/chinit/domain/service`**: Cohesive domain services and reconcilers (`Boot`, `LeaseRecovery`, `PersistentEpochReconciler`, `SelfFenceService`, `ConvergePeerHosts`).
+- **`pkg/chinit/domain/service`**: Cohesive domain services and reconcilers (`Boot`, `LeaseRecovery`, `PersistentEpochReconciler`, `StoragePolicyReconciler`, `DDLSeedService`, `SelfFenceService`, `ConvergePeerHosts`).
+  - **Follow DDD with clear struct and interface boundaries; avoid package-level functions as much as possible.** Model domain concepts as value objects, aggregates, and services with narrow, explicit interfaces (such as `ClickHouseDataStore`, `StoragePolicyStore`, `DDLSeedSource`, `SQLFileExecutor`), and keep methods small, single-purpose, and easy to understand.
   - Keep filesystem/process side effects behind narrow store interfaces or package-level test seams (e.g., `clickhouseDataDir`, `serverUUIDPath`, `peerHostsPath`, `execClientFn`, `runCommandFn`).
   - The operator-as-library is domain-legal where it is pure logic with no cloud/k8s-runtime coupling: `configureBackup` builds clickhouse-backup's config.yml via `pkg/model/chi/backupconfig` (stdlib-only builder), and the boot's CHI spec loads pass the provider secret store into the normalizer's SecretGetter seam. Anything needing a Kubernetes API server stays behind `infra/operator`.
 - **`pkg/chinit/app`**: Thin CLI subcommand coordinators (`leaseRenewCoordinator`, `runBoot`, `runBackupDaily`) that wire state loading, provider construction, and domain services. Do **not** embed business policies or multi-step raw file/SQL logic directly in `app/` handlers.
@@ -34,6 +35,9 @@ cmd/chinit  ──▶  pkg/chinit/app  ──▶  pkg/chinit/domain/service  ─
 - **Keep cyclomatic complexity low**:
   - Break multi-stage flows (like `runLeaseRenew`) into small coordinator structs with single-purpose methods (`<= 30–40` lines, early returns, flat nesting).
   - Extract predicate helpers (`usesLeaseInventory()`, `driftReason()`) and switch/policy objects instead of deep `if/else` trees.
+- **Keep godoc, comments, and Terraform descriptions clean and contract-focused**:
+  - Write concise, idiomatic godoc (`// TypeName ...`, `// MethodName ...`) that explains the behavioral contract, inputs, and invariants rather than implementation minutiae.
+  - **Do not leak internal cluster health issues or incident postmortems that prompted a fix** (no dated soak runs, internal node outage timelines, or debugging war stories) in godoc, inline comments, error messages, logs, or Terraform alarm/variable descriptions. Document the technical invariant and failure mode generically.
 - **Error classification is contractual**:
   - Wrap unrecoverable config/invariant errors with `fail.Fatal(err)` so the retry engine aborts immediately rather than masking a bug for 15 minutes.
   - Leave transient infrastructure/network errors unwrapped so the step's retry policy (`apiRetry`, `bootWait`, `ebsAttachWait`, `claimSweep`) retries cleanly.
@@ -50,13 +54,13 @@ cmd/chinit  ──▶  pkg/chinit/app  ──▶  pkg/chinit/domain/service  ─
    - Altinity Antalya CAS anchors each `cas_server_root_id` to `server_uuid` in S3 (`gc/server-roots/<id>/owner`). Rewriting `/var/lib/clickhouse/uuid` on a node that already has `first_boot_done` and non-empty `/var/lib/clickhouse/store` causes `Code: 246` on the very next start.
 4. **Persistent EBS bucket/epoch drift (`backup-0`)**:
    - Unlike ASG writers/readers (ephemeral EBS), `backup-0` re-attaches persistent EBS metadata volumes across replacements. Switching `s3_data_bucket` (non-CAS ↔ CAS bucket) or downgrading ClickHouse (e.g. `26.8` → `26.6`, where `PackedFilesReader` throws `Code: 287 Unknown format (1) of packed data`) leaves broken stubs referencing missing keys (`Code: 499`, `Code: 107`, `Code: 231` > 100 broken parts).
-   - `PersistentEpochReconciler` (`boot_epoch.json`) must run **before** `clickhouse-server` starts and reset stale local metadata/caches (preserving `uuid`) on bucket switches or legacy non-CAS residue, and `reconcileStoragePolicyMetadata` must run **before** `systemctl start/restart clickhouse-server`.
+   - `PersistentEpochReconciler` (`boot_epoch.json`) must run **before** `clickhouse-server` starts and reset stale local metadata/caches (preserving `uuid`) on bucket switches or legacy non-CAS residue, and `StoragePolicyReconciler.Reconcile` must run **before** `systemctl start/restart clickhouse-server`.
 5. **Static nodes in lease fleets (`backup-0`)**:
    - `RoleBackup` has `identity_mode: static`, yet writers/readers use DynamoDB leases. `clusterHostsWithSource()` must query `ListActiveClaims` whenever `claimer_table_name` + `writer_max > 0` are configured; falling back to `staticSpecInventory` writes vacant slots (`writer-4..8`) into `remote_servers.xml` and floods logs with `Code: 198 DNS_ERROR`.
 6. **Flush ClickHouse DNS cache when `/etc/hosts` changes**:
    - Updating `/etc/hosts` via `ConvergePeerHosts` is insufficient on its own if ClickHouse's `DNSResolver` already cached a terminated peer's IP (`:9010` timeouts). Issue `SYSTEM DROP DNS CACHE` whenever `/etc/hosts` bytes change.
 7. **Resumed `chinit boot` skips `settle_identity`**:
-   - Always hydrate identity from `/var/lib/chinit/state.json` (`Boot.HydrateIdentityFromState`) before `engine.Run` so `configure_keeper` and `bootstrap_schema` never observe an empty hostname.
+   - Always hydrate identity from `/var/lib/chinit/state.json` (`Boot.HydrateIdentityFromState`) before `engine.Run` so `configure_keeper`, `bootstrap_schema`, and `sync_schema` never observe an empty hostname.
 8. **HTTP responses & replica sync**:
    - Drain HTTP response bodies to `EOF` before `Close()` (`Code: 210 Broken pipe` / `Code: 236`).
    - Use `SYSTEM SYNC REPLICA ... LIGHTWEIGHT` (bounded timeout) rather than full sync (`Code: 159 TIMEOUT_EXCEEDED` behind heavy background merges).

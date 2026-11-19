@@ -129,12 +129,11 @@ Rolling ClickHouse Keeper nodes carelessly can destroy cluster consensus. When y
 | **Every 1 min** | `keeper-health` | `keeper` | Probes Keeper via `mntr` and emits `chinit_keeper_up` health metrics. |
 | **Every 2 min** | `task-poll` | `writer`, `reader`, `keeper` | Claims and runs rolling refresh/rollout tasks behind the cluster disruption budget. |
 | **Every 5 min** | `lease-renew` | `writer`, `reader` | Extends ordinal lease TTL; heals `/etc/hosts`, Private DNS `A` records, and `remote_servers`; publishes node health status. |
-| **Every 5 min** | `schema-sync` | `writer`, `reader`, `backup` | Pulls missed DDL from live peers so late-joining or rebooted nodes converge automatically. |
+| **Hourly** | `schema-sync` | `writer`, `reader`, `backup` | Propagates DDL from live peers via `HostCreateTables` so late-joining or rebuilt nodes converge automatically. |
 | **Every 5 min** | `replica-sync` | `writer`, `reader`, `backup` | Runs `SYSTEM SYNC REPLICA` across local replicated tables. |
 | **Every 5 min** | `disk-autoscale` | `writer`, `reader`, `keeper`, `backup` | Expands cloud volumes and filesystems online before disks fill up. |
 | **Every 5 min** | `fleet-converge` | Coordinator `writer` | Sweeps fleet tasks, re-dispatches timed-out executors with bumped `epoch`, fails exhausted tasks. |
 | **Every 10 min** | `spec-sync` | All roles | Watches object storage for `chinit.yaml` / bundle updates and triggers an in-place `--refresh` on drift. |
-| **Every 15 min** | `schema-bootstrap` | `writer`, `reader` | Re-applies `bootstrap-ddl.sql` idempotently in case peers were unreachable at initial boot. |
 | **Hourly** | `queue-heal` | `writer`, `reader` | Unsticks wedged replication queues and restores read-only replicas when merges are idle. |
 | **Hourly** | `dead-replica-gc` | Coordinator `writer` | Drops lingering Keeper replica registrations for ordinals with no active lease. |
 | **Daily** | `orphaned-gc` | Coordinator `writer` | Cleans up dropped bundle tables and unattached, untagged cloud volumes past retention age. |
