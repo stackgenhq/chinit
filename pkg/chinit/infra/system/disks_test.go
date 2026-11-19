@@ -191,6 +191,45 @@ var _ = Describe("DiskManager.ResolveDevice cache enumeration (the 2026-11-17 wr
 			"metadata must claim the 256 GiB volume on nvme2n1 rather than the 32 GiB cache volume on nvme1n1")
 	})
 
+	It("adopts the blank metadata EBS on nvme2n1 when ephemeral store takes nvme0n1 (the 2026-11-19 writer-2 finding)", func() {
+		// i-0210b3b358196bdd5 (m8gd.4xlarge): ephemeral 884.8G
+		// instance store enumerated as nvme0n1, ROOT as nvme1n1
+		// (GPT), and the blank 256G metadata EBS as nvme2n1 — a
+		// layout the old metadata candidates (/dev/sdf /dev/sdb
+		// /dev/nvme0n1 /dev/nvme1n1 ...) never probed: the resolver
+		// returned "" and the boot crash-looped with "metadata disk
+		// not found" while the volume sat attached.
+		r := newFakeRunner().
+			script("blkid -l -o device -t LABEL=ch-metadata", "").
+			fail("test -b /dev/sdf").fail("test -b /dev/sdb").
+			// nvme0n1: ephemeral instance store — must be skipped
+			// for metadata even though it is the FIRST nvme
+			// candidate and larger than the EBS volume.
+			script("test -b /dev/nvme0n1", "").
+			fail("blkid /dev/nvme0n1").
+			script("lsblk -d -n -o MODEL /dev/nvme0n1", "Amazon EC2 NVMe Instance Storage\n").
+			// nvme1n1: ROOT disk (GPT) — must be skipped.
+			script("test -b /dev/nvme1n1", "").
+			script("blkid /dev/nvme1n1", `UUID="..." TYPE="gpt"`).
+			// nvme2n1: the blank 256G metadata EBS.
+			script("test -b /dev/nvme2n1", "").
+			fail("blkid /dev/nvme2n1").
+			script("lsblk -d -n -o MODEL /dev/nvme2n1", "Amazon Elastic Block Store\n").
+			script("lsblk -b -d -n -o SIZE /dev/nvme2n1", "274877906944\n").
+			fail("test -b /dev/nvme3n1")
+
+		dm := NewDiskManager(r)
+		metaDev, err := dm.ResolveDevice(context.Background(), "ch-metadata", awsMetadataCandidates)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(metaDev).To(Equal("/dev/nvme2n1"),
+			"the metadata resolver must reach nvme2n1 when ephemeral takes nvme0n1 and root takes nvme1n1")
+
+		cacheDev, err := dm.ResolveCacheDevice(context.Background(), "ch-cache", awsCacheCandidates, metaDev)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cacheDev).To(Equal("/dev/nvme0n1"),
+			"ch-cache must still land on the ephemeral instance store")
+	})
+
 	It("never selects a larger ephemeral NVMe instance-store disk for ch-metadata, and prefers it for ch-cache", func() {
 		r := newFakeRunner().
 			script("blkid -l -o device -t LABEL=ch-metadata", "").
@@ -369,6 +408,8 @@ var _ = Describe("DiskManager.MountAll", func() {
 			fail("test -b /dev/sdb").
 			fail("test -b /dev/nvme0n1").
 			fail("test -b /dev/nvme1n1").
+			fail("test -b /dev/nvme2n1").
+			fail("test -b /dev/nvme3n1").
 			fail("test -b /dev/xvdf").
 			fail("test -b /dev/xvdb")
 		d := NewDiskManager(r)

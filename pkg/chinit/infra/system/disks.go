@@ -70,10 +70,20 @@ func NewDiskManager(runner Runner) *DiskManager {
 // partition-table guard protects the root disk here: root carries a
 // GPT signature and is skipped, so adding the remaining nvme names
 // cannot adopt it.
+//
+// nvme2n1 and nvme3n1 join the METADATA/KEEPER lists (the 2026-11-19
+// writer-2 i-0210b3b358196bdd5 live finding): on an m8gd.4xlarge the
+// ephemeral instance-store enumerated as nvme0n1, the ROOT as
+// nvme1n1, and the blank 256G metadata EBS as nvme2n1 — a layout none
+// of the metadata candidates probed, so the resolver returned "" and
+// the boot crashed with "metadata disk not found" while the volume
+// sat attached. resolveFirstExisting's guards (GPT root skip,
+// ephemeral skip, hasFilesystem, size-pick) make widening the list
+// safe: only a blank or already-labeled data disk can win.
 const (
-	awsMetadataCandidates = "/dev/sdf /dev/sdb /dev/nvme0n1 /dev/nvme1n1 /dev/xvdf /dev/xvdb"
-	awsCacheCandidates    = "/dev/sdg /dev/sdc /dev/nvme2n1 /dev/nvme1n1 /dev/nvme3n1 /dev/xvdg /dev/xvdc"
-	awsKeeperCandidates   = "/dev/sdf /dev/sdb /dev/nvme0n1 /dev/nvme1n1 /dev/xvdf /dev/xvdb"
+	awsMetadataCandidates = "/dev/sdf /dev/sdb /dev/nvme0n1 /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1 /dev/xvdf /dev/xvdb"
+	awsCacheCandidates    = "/dev/sdg /dev/sdc /dev/nvme2n1 /dev/nvme1n1 /dev/nvme3n1 /dev/nvme0n1 /dev/xvdg /dev/xvdc"
+	awsKeeperCandidates   = "/dev/sdf /dev/sdb /dev/nvme0n1 /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1 /dev/xvdf /dev/xvdb"
 
 	azureMetadataCandidates = "/dev/disk/azure/scsi1/lun0"
 	azureCacheCandidates    = "/dev/disk/azure/scsi1/lun1"
