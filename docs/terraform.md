@@ -77,8 +77,8 @@ If you already manage your own VPCs, buckets, and policies, call the contract mo
 
 | Module | Use it to… |
 |---|---|
-| `terraform/modules/chinit/aws` | Integrate `chinit` into a custom AWS stack |
-| `terraform/modules/chinit/azure` | Integrate `chinit` into a custom Azure stack |
+| `terraform/aws/modules/chinit` | Integrate `chinit` into a custom AWS stack |
+| `terraform/azure/modules/chinit` | Integrate `chinit` into a custom Azure stack |
 
 Three extension hooks adapt the rendered artifacts to your environment: `config_files` (extra files folded into the verified bundle), `chi_spec` / `keeper_spec` (override the default topology templates), and `wrapper_extra` (extra shell lines in each role's user-data wrapper).
 
