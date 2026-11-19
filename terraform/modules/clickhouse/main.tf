@@ -64,9 +64,16 @@ module "chinit" {
   fluentbit_output      = var.fluentbit_output
   lifecycle_hooks       = local.telemetry_lifecycle_hooks
 
-  config_files = {
-    "configs/storage.xml" = local.config_files_all["configs/storage.xml"]
-  }
+  config_files = merge(
+    {
+      "configs/storage.xml" = local.config_files_all["configs/storage.xml"]
+    },
+    # Caller DDL (or any other bundle-member override) — e.g. a stack's own
+    # S3Queue staging pipeline as configs/bootstrap-ddl.sql. The contract
+    # module merges these OVER its static defaults, and the SHA gate digest
+    # covers the closed bundle-member key list either way.
+    var.extra_config_files,
+  )
   chi_spec    = local.chi_spec
   keeper_spec = local.keeper_spec
 
@@ -94,10 +101,15 @@ module "chinit" {
   #    fast remounts across restarts/reboots of the same instance.
   # 2. Set LimitNPROC=65536 + TasksMax=infinity so 8 GiB readers never emit
   #    the "Maximum number of threads is lower than 30000" Context warning.
-  wrapper_extra = trimspace(join("\n", [
+  # Drop the SPDX/doc comment lines, then trim only LEADING blank lines:
+  # the value must keep its trailing newline so the contract template's
+  # "wrapper_extra + a blank line" render stays byte-identical to the
+  # original heredoc (a spurious user-data diff would force an LT roll
+  # on every adopter).
+  wrapper_extra = "${join("\n", compact([
     for line in split("\n", templatefile("${path.module}/templates/wrapper-extra.tftpl.sh", {})) :
     line if !startswith(line, "#")
-  ]))
+  ]))}\n"
 
   tags = var.tags
 }

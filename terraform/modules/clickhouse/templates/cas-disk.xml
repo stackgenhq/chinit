@@ -1,8 +1,3 @@
-<!--
-  Copyright (C) 2026 StackGen, Inc. All rights reserved.
-  SPDX-License-Identifier: Apache-2.0
--->
-
 <!-- Shared CAS pool disk (Altinity Antalya `metadata_type = cas`).
      Rendered only when cas_enabled = true (modules/clickhouse/locals.tf).
 

@@ -925,10 +925,27 @@ resource "aws_cloudwatch_metric_alarm" "writers_asg_idle" {
   treat_missing_data  = "notBreaching"
 
   metric_query {
-    id          = "idle_signal"
-    expression  = "IF(FILL(RATE(m_ins), 0) > 100, 100, IF(FILL(DIFF(m_s3q), 0) > 0, 100, m_cpu))"
-    label       = "Ingest-gated writers ASG CPU (100% while ClickHouse inserts or S3Queue commits are active)"
+    id = "idle_signal"
+    # Delay gate FIRST: while any writer replica's absolute replication delay
+    # exceeds scale_down_delay_gate_seconds, synthesize 100% (never breach) —
+    # a catching-up replica is mid-fetch and holds parts its peers may not
+    # have yet, so scale-in is deferred until the fleet is current.
+    expression  = "IF(FILL(m_delay, 0) > ${var.scale_down_delay_gate_seconds}, 100, IF(FILL(RATE(m_ins), 0) > 100, 100, IF(FILL(DIFF(m_s3q), 0) > 0, 100, m_cpu)))"
+    label       = "Ingest+delay-gated writers ASG CPU (100% while inserts/S3Queue active OR any replica catching up)"
     return_data = true
+  }
+
+  metric_query {
+    id = "m_delay"
+    metric {
+      metric_name = "ClickHouseAsyncMetrics_ReplicasMaxAbsoluteDelay"
+      namespace   = "ClickHouse/Server"
+      period      = 60
+      stat        = "Maximum"
+      dimensions = {
+        ClusterName = var.cluster_name
+      }
+    }
   }
 
   metric_query {

@@ -1,8 +1,3 @@
-<!--
-  Copyright (C) 2026 StackGen, Inc. All rights reserved.
-  SPDX-License-Identifier: Apache-2.0
--->
-
 <!-- Per-tenant CAS policy. Hot tier unchanged (local `default` disk);
      cold tier is the tenant's shared CAS pool behind its cache wrapper.
      Same volume names as `tenant_<tenant>` so the TTL `TO VOLUME 'cold'`

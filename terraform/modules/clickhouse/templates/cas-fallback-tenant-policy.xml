@@ -1,7 +1,3 @@
-<!--
-  Copyright (C) 2026 StackGen, Inc. All rights reserved.
-  SPDX-License-Identifier: Apache-2.0
--->
 <!-- Fallback per-tenant cold tier when cas_config.enabled=false: cold
      reads route through the tenant's cache_<tenant> wrapper (the
      non-CAS storage path) so tables created under cas_tenant_<tenant>

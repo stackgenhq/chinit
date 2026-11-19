@@ -1,7 +1,3 @@
-<!--
-  Copyright (C) 2026 StackGen, Inc. All rights reserved.
-  SPDX-License-Identifier: Apache-2.0
--->
 <!-- Fallback alias when cas_config.enabled=false so tables created
      under tiered_cas attach cleanly. Rendered only when CAS is disabled:
      cold tier routes through the shared s3_cache wrapper instead of a

@@ -365,6 +365,12 @@ variable "cache_disk_size_gb" {
   default     = 500
 }
 
+variable "extra_config_files" {
+  description = "Additional bundle members merged OVER this module's config_files before they reach the contract module (which merges them over its own static defaults). Keys must be among chinit's hashed bundle members — use configs/bootstrap-ddl.sql for a caller's own bootstrap DDL (e.g. an S3Queue staging pipeline). Each entry joins the SHA gate digest exactly like the module-rendered files."
+  type        = map(string)
+  default     = {}
+}
+
 variable "nlb_subnet_cidr" {
   description = "CIDR of the subnet where the NLBs live. NLBs do NOT preserve client source IP - forwarded requests arrive from this subnet, so every ClickHouse user's <networks> must include it (mirrors the SG rules)."
   type        = string

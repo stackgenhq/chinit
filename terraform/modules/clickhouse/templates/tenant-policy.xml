@@ -1,8 +1,3 @@
-<!--
-  Copyright (C) 2026 StackGen, Inc. All rights reserved.
-  SPDX-License-Identifier: Apache-2.0
--->
-
             <!-- Per-tenant storage policy: hot (local) -> cold (S3, TTL-moved).
                  Two volumes following Altinity's CAS-ready shape
                  (cas_with_ttl pattern from docs.altinity.com/altinityantalya/using_cas):

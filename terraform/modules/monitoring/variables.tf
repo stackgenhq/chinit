@@ -84,6 +84,12 @@ variable "scale_down_cpu_threshold" {
   default     = 20
 }
 
+variable "scale_down_delay_gate_seconds" {
+  description = "ReplicasMaxAbsoluteDelay gate on writers scale-in (seconds): while ANY writer replica's absolute replication delay exceeds this, the writers-asg-idle alarm synthesizes 100% (never breaching) — a catching-up replica is mid-fetch and holds parts its peers may not have yet, so scale-in is deferred. 60s keeps normal fleet convergence from triggering; the queue drain after a burst takes minutes, and the gate holds the fleet until every replica is current."
+  type        = number
+  default     = 60
+}
+
 # ----------------------------------------------------------------------------
 # Writers ASG — step-scaling actions + at-max guidance
 # ----------------------------------------------------------------------------

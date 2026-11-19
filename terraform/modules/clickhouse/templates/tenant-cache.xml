@@ -1,8 +1,3 @@
-<!--
-  Copyright (C) 2026 StackGen, Inc. All rights reserved.
-  SPDX-License-Identifier: Apache-2.0
--->
-
 <!-- Per-tenant cache wrapper over the tenant's raw S3 disk.
      Why: the tenant cold volume used to point at disk_${tenant} (raw S3)
      — every tenant cold read was an S3 GET with zero local reuse, while
