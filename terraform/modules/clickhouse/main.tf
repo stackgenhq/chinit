@@ -80,7 +80,9 @@ module "chinit" {
   multi_az_cold_tier    = var.multi_az_cold_tier
   subnet_cidrs_multi_az = var.subnet_cidrs_multi_az
 
-  # Stage-0 node tuning for ASG replacements + Antalya CAS:
+  # Stage-0 node tuning for ASG replacements + Antalya CAS (the script
+  # itself lives in templates/wrapper-extra.sh.tftpl; the leading comment
+  # block is stripped so the user-data stays minimal):
   # 1. Bind CH_CAS_SERVER_ROOT_ID in /etc/default/clickhouse (loaded by stock
   #    clickhouse-server.service alongside /etc/default/clickhouse-server) to
   #    the EC2 instance ID on ephemeral-EBS ASG writers/readers (and stable
@@ -89,18 +91,10 @@ module "chinit" {
   #    fast remounts across restarts/reboots of the same instance.
   # 2. Set LimitNPROC=65536 + TasksMax=infinity so 8 GiB readers never emit
   #    the "Maximum number of threads is lower than 30000" Context warning.
-  wrapper_extra = <<-EOT
-    IMDS_TOK=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
-    EC2_IID=$(curl -sS -H "X-aws-ec2-metadata-token: $IMDS_TOK" "http://169.254.169.254/latest/meta-data/instance-id" || hostname)
-    if [ "$CHINIT_SPEC_KEY" = "chinit-backup.yaml" ]; then
-      printf 'CH_CAS_SERVER_ROOT_ID="backup-0"\n' > /etc/default/clickhouse
-    else
-      printf 'CH_CAS_SERVER_ROOT_ID="%s"\n' "$EC2_IID" > /etc/default/clickhouse
-    fi
-    chmod 0644 /etc/default/clickhouse
-    mkdir -p /etc/systemd/system/clickhouse-server.service.d
-    printf '[Service]\nLimitNOFILE=262144\nLimitNPROC=65536\nTasksMax=infinity\nExecStartPre=-/bin/sh -c "mkdir -p /var/lib/clickhouse/disks/hot; if [ -f /var/lib/clickhouse/uuid ]; then tr -d '\''\\r\\n'\'' < /var/lib/clickhouse/uuid > /var/lib/clickhouse/uuid.tmp && mv /var/lib/clickhouse/uuid.tmp /var/lib/clickhouse/uuid; fi"\n' > /etc/systemd/system/clickhouse-server.service.d/limits.conf
-  EOT
+  wrapper_extra = trimspace(join("\n", [
+    for line in split("\n", templatefile("${path.module}/templates/wrapper-extra.tftpl.sh", {})) :
+    line if !startswith(line, "#")
+  ]))
 
   tags = var.tags
 }

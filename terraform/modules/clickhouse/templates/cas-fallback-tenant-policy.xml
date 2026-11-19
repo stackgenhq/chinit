@@ -1,0 +1,23 @@
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<!-- Fallback per-tenant cold tier when cas_config.enabled=false: cold
+     reads route through the tenant's cache_<tenant> wrapper (the
+     non-CAS storage path) so tables created under cas_tenant_<tenant>
+     still have a valid policy shape. -->
+<cas_tenant_${tenant}>
+    <volumes>
+        <hot>
+            ${cas_hot_disks_xml}
+            <volume_priority>1</volume_priority>
+        </hot>
+        <cold>
+            <disk>cache_${tenant}</disk>
+            <volume_priority>2</volume_priority>
+            <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+            <prefer_not_to_merge>true</prefer_not_to_merge>
+        </cold>
+    </volumes>
+    <move_factor>0.1</move_factor>
+</cas_tenant_${tenant}>

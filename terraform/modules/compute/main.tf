@@ -684,21 +684,20 @@ resource "terraform_data" "writers_ami_roll" {
   ]
 
   provisioner "local-exec" {
-    command = <<-EOT
-      set -euo pipefail
-      aws autoscaling update-auto-scaling-group \
-        --auto-scaling-group-name "${aws_autoscaling_group.writers.name}" \
-        --launch-template "LaunchTemplateId=${aws_launch_template.writer.id},Version='${aws_launch_template.writer.latest_version}'" \
-        --region "${var.aws_region}"
-      REFRESH_CONFIG='${local.writer_refresh_config}'
-      aws autoscaling start-instance-refresh \
-        --auto-scaling-group-name "${aws_autoscaling_group.writers.name}" \
-        --region "${var.aws_region}" \
-        --strategy Rolling \
-        --desired-configuration "$REFRESH_CONFIG" \
-        --preferences '{"InstanceWarmup":${var.refresh_instance_warmup_seconds},"MinHealthyPercentage":${var.refresh_min_healthy_percentage},"AutoRollback":true}'
-    EOT
-    when    = create
+    # Script body lives in templates/writers-ami-roll.tftpl.sh (the
+    # leading comment block is stripped so the command stays minimal).
+    command = trimspace(join("\n", [
+      for line in split("\n", templatefile("${path.module}/templates/writers-ami-roll.tftpl.sh", {
+        asg_name               = aws_autoscaling_group.writers.name
+        lt_id                  = aws_launch_template.writer.id
+        lt_version             = aws_launch_template.writer.latest_version
+        aws_region             = var.aws_region
+        refresh_config         = local.writer_refresh_config
+        warmup_seconds         = var.refresh_instance_warmup_seconds
+        min_healthy_percentage = var.refresh_min_healthy_percentage
+      })) : line if !startswith(line, "#")
+    ]))
+    when = create
   }
 }
 

@@ -16,7 +16,8 @@
 # AWS only ships PREDEFINED rotation Lambdas for RDS. For custom passwords
 # like ClickHouse's, a custom Lambda is REQUIRED — there is no
 # aws_secretsmanager_secret_rotation without a rotation_lambda_arn for
-# non-RDS secrets. This module therefore deploys one small inline-code Lambda
+# non-RDS secrets. This module therefore deploys one small custom Lambda
+# (templates/rotation-lambda.tftpl.py, zipped by the archive provider)
 # that implements the four-step Secrets Manager rotation protocol:
 #   createSecret -> put_secret_value (new AWSPENDING password version)
 #   setSecret    -> SSM SendCommand (AWS-RunShellScript) to the instance

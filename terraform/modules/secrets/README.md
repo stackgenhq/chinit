@@ -18,7 +18,7 @@ rotates the passwords on a schedule — built on AWS-native primitives
 | `aws_secretsmanager_secret_version` ×3 | The Terraform-created initial value (user-provided or generated) |
 | `aws_secretsmanager_secret_policy` ×3 | GetSecretValue granted ONLY to `allowed_role_arns` (instance roles) |
 | `random_password` ×3 | 16-char alphanumeric passwords for null inputs |
-| `aws_lambda_function` + role/policy/log-group | The rotation engine (python3.12, inline source zipped via the archive provider) |
+| `aws_lambda_function` + role/policy/log-group | The rotation engine (python3.12, `templates/rotation-lambda.tftpl.py` zipped via the archive provider) |
 | `aws_lambda_permission` ×3 | Lets Secrets Manager invoke the Lambda, scoped per secret ARN |
 | `aws_secretsmanager_secret_rotation` ×3 | Attaches the Lambda + `rate(<rotation_days> days)` schedule to each secret |
 

@@ -40,6 +40,9 @@ locals {
     }))],
   )) : ""
   cas_hot_disks_xml = var.nvme_hot_enabled ? "<disk>nvme_hot</disk>\n                        <disk>default</disk>\n                        <load_balancing>least_used</load_balancing>" : "<disk>default</disk>"
+  # CAS disabled: render the tiered_cas alias + per-tenant cas_tenant_<tenant>
+  # policies through the same non-CAS storage path (cache wrappers), so tables
+  # created under the CAS policy names still attach cleanly.
   cas_policies = var.cas_enabled ? join("\n", concat(
     [trimspace(templatefile("${path.module}/templates/cas-policy.xml", {
       nvme_hot_enabled = var.nvme_hot_enabled
@@ -49,44 +52,13 @@ locals {
       nvme_hot_enabled = var.nvme_hot_enabled
     }))],
     )) : join("\n", concat(
-    [trimspace(<<-EOT
-            <!-- Fallback alias when cas_config.enabled=false so tables created under tiered_cas attach cleanly -->
-            <tiered_cas>
-                <volumes>
-                    <hot>
-                        ${local.cas_hot_disks_xml}
-                        <volume_priority>1</volume_priority>
-                        <prefer_not_to_merge>false</prefer_not_to_merge>
-                    </hot>
-                    <cold>
-                        <disk>s3_cache</disk>
-                        <volume_priority>2</volume_priority>
-                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
-                        <prefer_not_to_merge>true</prefer_not_to_merge>
-                    </cold>
-                </volumes>
-                <move_factor>0.1</move_factor>
-            </tiered_cas>
-    EOT
-    )],
-    [for tenant in var.tenants : trimspace(<<-EOT
-            <cas_tenant_${tenant}>
-                <volumes>
-                    <hot>
-                        ${local.cas_hot_disks_xml}
-                        <volume_priority>1</volume_priority>
-                    </hot>
-                    <cold>
-                        <disk>cache_${tenant}</disk>
-                        <volume_priority>2</volume_priority>
-                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
-                        <prefer_not_to_merge>true</prefer_not_to_merge>
-                    </cold>
-                </volumes>
-                <move_factor>0.1</move_factor>
-            </cas_tenant_${tenant}>
-    EOT
-    )],
+    [trimspace(templatefile("${path.module}/templates/cas-fallback-policy.xml", {
+      cas_hot_disks_xml = local.cas_hot_disks_xml
+    }))],
+    [for tenant in var.tenants : trimspace(templatefile("${path.module}/templates/cas-fallback-tenant-policy.xml", {
+      tenant            = tenant
+      cas_hot_disks_xml = local.cas_hot_disks_xml
+    }))],
   ))
 
   tenant_policies = join("\n", [

@@ -625,7 +625,7 @@ locals {
   # digest over EXACTLY those keys at boot.
   config_files_all = merge(local.static_config_files, var.config_files)
 
-  default_chi_spec = templatefile("${path.module}/templates/chi.yaml.tftpl", {
+  default_chi_spec = templatefile("${path.module}/templates/chi.tftpl.yaml", {
     cluster_name                 = var.cluster_name
     replica_count                = var.writer_max + var.reader_max + (var.enable_backup ? 1 : 0)
     keepers                      = [for h in var.keeper_hostnames : "${h}.${var.dns_zone_name}"]
@@ -646,7 +646,7 @@ locals {
 
   chi_spec = var.chi_spec != null ? var.chi_spec : local.default_chi_spec
 
-  default_keeper_spec = templatefile("${path.module}/templates/keeper.yaml.tftpl", {
+  default_keeper_spec = templatefile("${path.module}/templates/keeper.tftpl.yaml", {
     cluster_name = var.cluster_name
     keeper_count = length(var.keeper_hostnames)
   })
@@ -753,19 +753,19 @@ locals {
   }
 
   chinit_specs = {
-    writer = templatefile("${path.module}/templates/chinit.yaml.tftpl", merge(local.chinit_spec_common, {
+    writer = templatefile("${path.module}/templates/chinit.tftpl.yaml", merge(local.chinit_spec_common, {
       role          = "writer"
       identity_mode = "lease"
     }))
-    reader = templatefile("${path.module}/templates/chinit.yaml.tftpl", merge(local.chinit_spec_common, {
+    reader = templatefile("${path.module}/templates/chinit.tftpl.yaml", merge(local.chinit_spec_common, {
       role          = "reader"
       identity_mode = "lease"
     }))
-    keeper = templatefile("${path.module}/templates/chinit.yaml.tftpl", merge(local.chinit_spec_common, {
+    keeper = templatefile("${path.module}/templates/chinit.tftpl.yaml", merge(local.chinit_spec_common, {
       role          = "keeper"
       identity_mode = "static"
     }))
-    backup = templatefile("${path.module}/templates/chinit.yaml.tftpl", merge(local.chinit_spec_common, {
+    backup = templatefile("${path.module}/templates/chinit.tftpl.yaml", merge(local.chinit_spec_common, {
       role              = "backup"
       identity_mode     = "static"
       is_backup_replica = "true"
@@ -779,7 +779,7 @@ locals {
   # The per-role user-data wrappers (stage-0). The caller injects them
   # into its own launch templates / EC2 user_data.
   bootstrap_script = {
-    for role, _spec in local.chinit_specs : role => templatefile("${path.module}/templates/user-data.sh.tftpl", {
+    for role, _spec in local.chinit_specs : role => templatefile("${path.module}/templates/user-data.tftpl.sh", {
       chinit_spec_key = "chinit-${role}.yaml"
       bundle_bucket   = var.bootstrap_bucket
       bundle_prefix   = var.bootstrap_prefix

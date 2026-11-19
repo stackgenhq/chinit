@@ -1,0 +1,24 @@
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<!-- Fallback alias when cas_config.enabled=false so tables created
+     under tiered_cas attach cleanly. Rendered only when CAS is disabled:
+     cold tier routes through the shared s3_cache wrapper instead of a
+     CAS pool. -->
+<tiered_cas>
+    <volumes>
+        <hot>
+            ${cas_hot_disks_xml}
+            <volume_priority>1</volume_priority>
+            <prefer_not_to_merge>false</prefer_not_to_merge>
+        </hot>
+        <cold>
+            <disk>s3_cache</disk>
+            <volume_priority>2</volume_priority>
+            <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+            <prefer_not_to_merge>true</prefer_not_to_merge>
+        </cold>
+    </volumes>
+    <move_factor>0.1</move_factor>
+</tiered_cas>
