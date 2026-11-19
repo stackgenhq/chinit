@@ -1,0 +1,36 @@
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+
+<!-- Per-tenant S3 disk: data/<tenant>/<replica>/ prefix isolation.
+     The bucket endpoint comes from CH_S3_ENDPOINT (bucket root, per-node env);
+     the tenant AND replica segments live in endpoint_subpath because:
+     1. <key_prefix> is NOT a supported element for s3-type disks - ClickHouse
+        silently ignores it (verified against 26.8.34.13 source:
+        src/Disks/DiskObjectStorage/ObjectStorages/ObjectStorageFactory.cpp
+        reads only endpoint / endpoint_subpath / key_template /
+        key_compatibility_prefix). The previous
+        <key_prefix>data/<tenant>/</key_prefix> therefore put EVERY tenant's
+        parts in the bucket root - tenant isolation and the per-tenant IAM
+        scopes in iam.tf (data/<tenant>/*) matched nothing ClickHouse wrote.
+     2. Zero-copy replication is deprecated upstream (ClickHouse PR #82250
+        removed its tests; physical re-copying is the designed behavior
+        without it). Replicas sharing one prefix therefore overwrite/delete
+        each other's parts on merge/TTL, orphaning metadata references.
+        endpoint/endpoint_subpath are macro-expanded ({replica} resolves from
+        config.d/macros.xml rendered by cloud-init configure_macros), which is
+        the Altinity-documented way to give each replica its own S3 path.
+     Per-tenant IAM (iam.tf data_prefix_scopes) already scopes data/<tenant>/*
+     - the {replica} segment nests inside it. CAS adoption (Altinity Antalya
+     26.6.8+) renders a SEPARATE cas_<tenant> disk on a SHARED prefix (no
+     {replica} segment) under <cas_prefix>/<tenant>/ - see cas-tenant-disk.xml
+     and cas-tenant-policy.xml, gated on var.cas_enabled. -->
+            <disk_${tenant}>
+                <type>s3</type>
+                <endpoint from_env="CH_S3_ENDPOINT" />
+                <!-- Tenant + replica isolation, macro-expanded per node -->
+                <endpoint_subpath>${data_prefix}/${tenant}/{replica}/</endpoint_subpath>
+                <use_environment_credentials>true</use_environment_credentials>
+                <skip_bucket_creation>true</skip_bucket_creation>
+            </disk_${tenant}>

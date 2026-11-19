@@ -49,6 +49,25 @@ azure/                   Self-contained Azure cluster module
   examples/cluster/      Minimal Azure example
 ```
 
+### Ecosystem Modules (`modules/<name>/`)
+
+Opinionated, production-hardened modules extracted from real cluster
+deployments. They pair with the contract module for stacks that want more
+of the surrounding infrastructure managed:
+
+| Module | Purpose |
+|---|---|
+| [`modules/clickhouse`](./modules/clickhouse) | Multi-tenant S3/CAS tiered storage (`storage.xml`, CHI/CHK specs) fed into the contract module's `config_files`/`chi_spec` hooks |
+| [`modules/compute`](./modules/compute) | EC2 nodes, writers/readers ASGs (Spot-diversified readers, on-demand writers), NLBs, node-claims identity |
+| [`modules/network`](./modules/network) | VPC (aws-ia/vpc pinned), per-role security groups, S3 gateway endpoint, flow logs |
+| [`modules/storage`](./modules/storage) | Data/backup buckets, lifecycle tiering, per-tenant IAM policy documents |
+| [`modules/secrets`](./modules/secrets) | Secrets Manager passwords + custom rotation Lambda |
+| [`modules/dns_tls`](./modules/dns_tls) | Route53 zones/records, ACM or ACME (Let's Encrypt) certs |
+| [`modules/monitoring`](./modules/monitoring) | CloudWatch alarms, scaling guidance, budgets |
+| [`modules/security`](./modules/security) | GuardDuty + Security Hub + findings delivery |
+
+Each validates standalone: `cd modules/<name> && tofu init -backend=false && tofu validate`.
+
 All modules can be validated offline with OpenTofu or Terraform:
 
 ```bash

@@ -1,0 +1,37 @@
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+
+<!-- Per-tenant cache wrapper over the tenant's raw S3 disk.
+     Why: the tenant cold volume used to point at disk_${tenant} (raw S3)
+     — every tenant cold read was an S3 GET with zero local reuse, while
+     the tiered policy's cold volume reads through s3_cache. The wrapper
+     gives each tenant the same cached-read path: repeated cold reads hit
+     the local cache disk instead of the network. One wrapper per tenant
+     (each cache disk has its own metadata namespace and max_size, so a
+     noisy tenant's cache footprint cannot evict another tenant's).
+     max_size sizing: rendered by locals.tf so the sum over all tenants
+     fits inside 90% of the provisioned cache volume (the same 0.9
+     headroom factor the s3_cache wrapper uses for ext4/decimal-GB
+     overhead) — per tenant it is
+       floor(cache_disk_size_gb * 0.9 / tenant_count) GiB (binary)
+     A tenant added later shrinks each wrapper's max_size (config
+     reload + restart); the cache is a refilled-anyway tier, so no data
+     is at risk.
+     cache_on_write_operations is ON and pairs with the query-level
+     enable_filesystem_cache_on_write_operations profile setting in
+     chi-spec.yaml — BOTH are required (the disk flag arms the cache's
+     write path; the query flag rides in WriteSettings and defaults
+     false). Local->S3 part moves copy through the destination disk's
+     writeFile (IDisk::copyFile, not the S3 server-side copy shortcut,
+     which only applies S3->S3), so TTL-moved parts pass through this
+     wrapper and stay locally readable without a re-download on first
+     query after the move. -->
+            <cache_${tenant}>
+                <type>cache</type>
+                <disk>disk_${tenant}</disk>
+                <path>/var/lib/clickhouse/disks/tenant_cache_${tenant}/</path>
+                <max_size>${cache_max_size_bytes}</max_size>
+                <cache_on_write_operations>true</cache_on_write_operations>
+            </cache_${tenant}>

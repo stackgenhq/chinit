@@ -1,0 +1,45 @@
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+
+            <!-- Per-tenant storage policy: hot (local) -> cold (S3, TTL-moved).
+                 Two volumes following Altinity's CAS-ready shape
+                 (cas_with_ttl pattern from docs.altinity.com/altinityantalya/using_cas):
+                 - hot: local default disk, inserts land here (S3 writes are
+                   the expensive path; write locally, move merged parts after)
+                 - cold: the tenant's S3 disk READ THROUGH its cache wrapper
+                   (cache_<tenant>, defined in tenant-cache.xml) so repeated
+                   cold reads are served from the local cache disk — the same
+                   cached-read path the tiered policy gives its cold volume.
+                   The raw disk_<tenant> stays the S3 truth; the wrapper only
+                   caches. perform_ttl_move_on_insert=false so inserts never
+                   wait on S3; a background job TTL-moves merged parts
+                 - volume_priority is EXPLICIT (Altinity's CAS example sets it
+                   because some builds fall back to alphabetical volume
+                   order, where "cold" would beat "hot"; on 26.8 config order
+                   is preserved when NO volume sets it, but once ANY does,
+                   priorities must cover 1..N) - explicit removes the
+                   ambiguity for future editors
+                 - move_factor stays as a disk-pressure escape hatch
+                 - prefer_not_to_merge on cold: merges must not rewrite S3
+                   objects on every merge fan-in; TTL moves handle decay
+                 CAS adoption (Antalya 26.6+) later swaps ONLY the disk
+                 definition (type=s3 -> object_storage + metadata_type=cas,
+                 shared prefix, no {replica} segment) - this policy and every
+                 table's DDL stay unchanged. -->
+            <tenant_${tenant}>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                        <volume_priority>1</volume_priority>
+                    </hot>
+                    <cold>
+                        <disk>cache_${tenant}</disk>
+                        <volume_priority>2</volume_priority>
+                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+                        <prefer_not_to_merge>true</prefer_not_to_merge>
+                    </cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </tenant_${tenant}>

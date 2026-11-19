@@ -1,0 +1,40 @@
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+
+<!-- Per-tenant CAS policy. Hot tier unchanged (local `default` disk);
+     cold tier is the tenant's shared CAS pool behind its cache wrapper.
+     Same volume names as `tenant_<tenant>` so the TTL `TO VOLUME 'cold'`
+     expression keeps working. A live table CANNOT be switched between the
+     two policies with ALTER ... MODIFY SETTING storage_policy (the new
+     policy would not contain the old disks); adopting CAS for an existing
+     table is per-partition `ALTER TABLE ... MOVE PARTITION ... TO DISK
+     'cas_cache_<tenant>'` - see the CAS runbook. -->
+            <cas_tenant_${tenant}>
+                <volumes>
+                    <hot>
+%{if nvme_hot_enabled ~}
+                        <disk>nvme_hot</disk>
+%{endif ~}
+                        <disk>default</disk>
+%{if nvme_hot_enabled ~}
+                        <load_balancing>least_used</load_balancing>
+%{endif ~}
+                        <volume_priority>1</volume_priority>
+                    </hot>
+                    <cold>
+                        <disk>cas_cache_${tenant}</disk>
+                        <volume_priority>2</volume_priority>
+                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+                        <prefer_not_to_merge>true</prefer_not_to_merge>
+                    </cold>
+                    <cold_legacy>
+                        <disk>cache_${tenant}</disk>
+                        <volume_priority>3</volume_priority>
+                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+                        <prefer_not_to_merge>true</prefer_not_to_merge>
+                    </cold_legacy>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </cas_tenant_${tenant}>

@@ -1,0 +1,128 @@
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+
+<?xml version="1.0"?>
+<!--
+  ClickHouse S3 Storage Configuration (AWS port)
+  ============================================================================
+  Why: Defines ClickHouse disks and storage policies for the separated
+       compute/storage architecture on AWS. The COLD tier lives in S3
+       (multi-tenant growth needs no disk resizing); inserts land on the
+       local default disk (hot volume) and merged parts TTL-move to S3 in
+       the background (perform_ttl_move_on_insert=false - inserts never
+       wait on S3). Local disks hold metadata, hot parts and the S3 read
+       cache. Uses the separate-cache-disk pattern (v22.8+) for cache
+       observability and flexible management. Credentials come from the
+       EC2 instance role via environment credentials - NO static AWS keys.
+  Without it: ClickHouse cannot store data in S3; the separated architecture
+             is non-functional and data does not survive node replacement.
+  Reference: https://clickhouse.com/docs/en/operations/storing-data#storing-data-on-s3
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Default Local Disk (metadata/hot tier on persistent gp3) -->
+            <!-- keep_free_space_bytes prevents OS disk exhaustion crashes -->
+            <default>
+                <keep_free_space_bytes>10737418240</keep_free_space_bytes>
+            </default>
+%{if nvme_hot_enabled ~}
+
+            <nvme_hot>
+                <type>local</type>
+                <path>/var/lib/clickhouse/disks/hot/</path>
+                <!-- 10 TiB default keeps small/reader/backup mounts at 0 unreserved space (100% routed to `default` via least_used); chinit z_hardware-sizing.xml lowers this to 45% of mount on >=400 GiB NVMe writers to unlock ~485 GiB of 3 GB/s NVMe hot storage! -->
+                <keep_free_space_bytes>10995116277760</keep_free_space_bytes>
+            </nvme_hot>
+%{endif ~}
+
+            <!-- Raw S3 disk (no caching) -->
+            <!-- Why: S3 is the unbounded primary tier. The bucket already
+                 exists (Terraform-created), hence skip_bucket_creation.
+                 use_environment_credentials pulls creds from the instance
+                 role at runtime.
+                 NOTE: the endpoint env is the bucket ROOT; the cold-tier
+                 path for the tiered policy lives in endpoint_subpath with
+                 the {replica} macro so every replica writes its own prefix
+                 (zero-copy is deprecated - see tenant-disk.xml). -->
+            <s3>
+                <type>s3</type>
+                <!-- bucket endpoint WITHOUT key prefix -->
+                <endpoint from_env="CH_S3_ENDPOINT" />
+                <endpoint_subpath>${s3_data_prefix}/tiered/{replica}/</endpoint_subpath>
+                <use_environment_credentials>true</use_environment_credentials>
+                <skip_bucket_creation>true</skip_bucket_creation>
+            </s3>
+
+            <!-- Cached wrapper disk - use this in policies for best performance -->
+            <!-- Why: The cache wrapper serves S3 reads from the local NVMe/gp3
+                 cache disk, cutting S3 GET latency for hot data to local-SSD
+                 levels. Cache size is provisioned by Terraform.
+                 NOTE: 26.8 cache disks take <max_size> and <max_elements>;
+                 cache_file_write_* settings do not exist (UNKNOWN_SETTING).
+                 cache_on_write_operations=true: TTL-moved parts are uploaded
+                 to S3 THROUGH this wrapper, so the just-moved (recently-hot)
+                 bytes stay locally readable — without it the first query
+                 after a move re-downloads everything it needs. Costs cache
+                 space for data that may never be read again; the SLRU
+                 eviction (26.8 default policy) ages it out naturally. -->
+            <s3_cache>
+                <type>cache</type>
+                <disk>s3</disk>
+                <path>/var/lib/clickhouse/disks/s3_cache/</path>
+                <max_size>${cache_max_size_bytes}</max_size>
+                <cache_on_write_operations>true</cache_on_write_operations>
+            </s3_cache>
+${tenant_disks}
+${tenant_caches}${cas_disks}
+        </disks>
+
+        <policies>
+            <default>
+                <volumes>
+                    <default>
+                        <disk>default</disk>
+                    </default>
+                </volumes>
+            </default>
+
+            <!-- Tiered policy: Hot data on local SSD, Cold data on S3 -->
+            <!-- Why: New parts land on local SSD (fast merges) and TTL moves /
+                 move_factor push cold parts to S3. Pairs with the S3
+                 lifecycle rule (Standard -> Standard-IA after 30d) so cold
+                 data also gets cheaper at rest.
+                 CAS-ready shape (Altinity cas_with_ttl pattern):
+                 - volume_priority EXPLICIT: order is only config-order when
+                   NO volume sets it; once any does, priorities must cover
+                   1..N (26.8 validates). Explicit here prevents surprises
+                   when a future editor adds a volume.
+                 - perform_ttl_move_on_insert=false on cold: inserts never
+                   wait on S3; merged parts TTL-move in the background.
+                 - move_factor stays as the disk-pressure escape hatch.
+                 CAS (Altinity Antalya, opt-in) lives BESIDE this policy as
+                 `tiered_cas` / `cas_tenant_<tenant>` (see cas-policy.xml,
+                 rendered only when var.cas_enabled). Existing tables keep
+                 their policy untouched; adopting CAS is per-partition
+                 MOVE PARTITION (see the CAS runbook), not a policy
+                 switch. -->
+            <tiered>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                        <volume_priority>1</volume_priority>
+                        <prefer_not_to_merge>false</prefer_not_to_merge>
+                    </hot>
+                    <cold>
+                        <disk>s3_cache</disk>
+                        <volume_priority>2</volume_priority>
+                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+                        <prefer_not_to_merge>true</prefer_not_to_merge>
+                    </cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </tiered>${tenant_policies}${cas_policies}
+        </policies>
+    </storage_configuration>
+</clickhouse>

@@ -1,0 +1,36 @@
+<!--
+  Copyright (C) 2026 StackGen, Inc. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+
+<!-- Shared CAS cold tier for the `tiered_cas` policy. Same two-volume shape
+     as `tiered` (hot local -> cold CAS), differing only in the cold disk:
+     prefer_not_to_merge stays (CAS GC, not merges, retires cold parts). -->
+            <tiered_cas>
+                <volumes>
+                    <hot>
+%{if nvme_hot_enabled ~}
+                        <disk>nvme_hot</disk>
+%{endif ~}
+                        <disk>default</disk>
+%{if nvme_hot_enabled ~}
+                        <load_balancing>least_used</load_balancing>
+%{endif ~}
+                        <volume_priority>1</volume_priority>
+                        <prefer_not_to_merge>false</prefer_not_to_merge>
+                    </hot>
+                    <cold>
+                        <disk>cas_cache</disk>
+                        <volume_priority>2</volume_priority>
+                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+                        <prefer_not_to_merge>true</prefer_not_to_merge>
+                    </cold>
+                    <cold_legacy>
+                        <disk>s3_cache</disk>
+                        <volume_priority>3</volume_priority>
+                        <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+                        <prefer_not_to_merge>true</prefer_not_to_merge>
+                    </cold_legacy>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </tiered_cas>
