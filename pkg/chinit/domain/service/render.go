@@ -595,11 +595,11 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 var bootstrapAdminPasswordPath = func() string { return filepath.Join(BootstrapDir, "admin-password") }
 
 // bootstrapSchema executes the optional cold-start bootstrap-ddl.sql file via
-// clickhouse-client on writer nodes without parsing SQL statements. Non-writer
-// roles materialize their replicated schema from peers via sync_schema
-// (HostCreateTables) so writer-only S3Queue objects never start on readers.
+// clickhouse-client on roles that allow cold-start DDL seeding (writers).
+// Non-writer roles materialize their replicated schema from peers via
+// sync_schema (HostCreateTables).
 func (b *Boot) bootstrapSchema(ctx context.Context) error {
-	if b.Spec.Role != model.RoleWriter {
+	if !b.Spec.Role.AllowsColdStartDDLSeed() {
 		return nil
 	}
 	return NewDDLSeedService().Apply(ctx)

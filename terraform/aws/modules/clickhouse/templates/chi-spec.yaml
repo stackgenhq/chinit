@@ -40,6 +40,20 @@ spec:
           shards:
             - name: "01"
               replicasCount: ${replica_count}
+              replicas:
+%{for i in range(replica_count)~}
+%{if i < writer_count~}
+                - name: "01-${i}"
+%{else~}
+                - name: "01-${i}"
+                  files:
+                    z_replica-streaming-off.xml: |
+                      <clickhouse>
+                          <s3queue_disable_streaming>1</s3queue_disable_streaming>
+                          <message_queue_disable_insertion>1</message_queue_disable_insertion>
+                      </clickhouse>
+%{endif~}
+%{endfor~}
     # Keeper ensemble (renders per host into chop-generated-zookeeper.xml
     # together with the distributed_ddl queue path): coordination is
     # ClickHouse-domain data; the DNS names are the stack's private zone.
