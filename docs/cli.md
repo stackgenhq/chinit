@@ -101,6 +101,7 @@ chinit boot [-spec /var/lib/clickhouse-bootstrap/chinit.yaml] [-cloud aws|azure]
 | `spot-watch` | Every 2 s | Watches AWS Spot Instance Action / Azure Scheduled Events on `writer` and `reader` nodes and triggers an immediate graceful drain on preemption notice. |
 | `drain` | On demand | Manually drains the node (`-reason`, `-timeout`): stops replication queues and distributed sends, drops replica metadata on a live peer, removes Private DNS, and releases the lease. |
 | `drain-shutdown` | OS Shutdown | Invoked by `chinit-shutdown-drain.service` (`After=clickhouse-server`) during VM termination; automatically skips cleanup on normal OS reboots (`reboot.target`). |
+| `volume-release` | OS Shutdown | Invoked by `chinit-volume-release.service` (`Before=clickhouse-server`) after the server stops: deletes this writer/reader node's own non-root EBS volumes so a wedged termination leaves no orphan. Skips on reboot; falls back to the state file's tracked volume IDs when live cloud discovery is unreachable mid-teardown. |
 
 ---
 

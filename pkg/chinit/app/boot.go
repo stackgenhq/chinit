@@ -137,6 +137,10 @@ func runBoot(args []string) error {
 	// the state file (never re-claimed) — see Boot.Refresh.
 	engine = engine.WithIdentity(nil, detected.Provider, specHash).WithRefresh(flags.refresh)
 	boot.PersistIdentity = engine.IdentityPersister(detected.Provider)
+	// The volume tracker persists through the same shared-state path
+	// (the shutdown release's state fallback depends on it landing
+	// in state.json the moment the listing finishes).
+	boot.PersistVolumes = engine.VolumesPersister()
 	if !flags.refresh {
 		boot.HydrateIdentityFromState(flags.statePath)
 	}

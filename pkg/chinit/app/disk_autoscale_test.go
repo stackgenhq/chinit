@@ -168,6 +168,12 @@ var _ = Describe("runDiskAutoscale wiring", func() {
 		fakes.provider = &diskAutoscaleProvider{name: "aws", grower: fakes.grower, pusher: fakes.pusher}
 
 		// The admin password file seam (the probe's credential source).
+		// MkdirAll first: on a fresh runner the scratch dir does not
+		// exist until diskAutoscaleState creates it for the state file,
+		// and the FIRST spec in a random order writes the password
+		// BEFORE any state file lands — the bare WriteFile failed with
+		// ENOENT and the whole Describe failed on cold CI.
+		Expect(os.MkdirAll(diskAutoscaleDir, 0755)).To(Succeed())
 		passwordPath := filepath.Join(diskAutoscaleDir, "admin-password")
 		Expect(os.WriteFile(passwordPath, []byte("sekrit\n"), 0644)).To(Succeed())
 		origPassword := adminPasswordPath

@@ -18,8 +18,9 @@ Bootstrapping a stateful, replicated database cluster on auto-scaling cloud VMs 
 | Node configuration varies by instance (identity, IP, role) while needing identical bootstrap logic | `chinit.yaml` is a typed, validated spec fetched from object storage and verified by SHA-256; the binary is identical across roles and clouds |
 | Cloud APIs can fail transiently, while configuration errors should fail fast | Built-in retry engine with `Retryable` vs. `Fatal` error classification, exponential backoff with jitter, per-step deadlines, and `Critical` vs. `BestEffort` step handling |
 | Re-running a partially completed boot from scratch is slow and can re-claim identity mid-flight | Convergent execution: each step inspects real machine state first, records completion in `state.json`, and resumes cleanly; bundle hash changes invalidate and re-render configs |
-| Post-boot tasks (schema sync, replica sync, queue healing, lease renewal, backups, spot draining) must run reliably with the right node identity | Built-in subcommands (`schema-sync`, `replica-sync`, `queue-heal`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch`, `drain-shutdown`) wired as one-line systemd units |
+| Post-boot tasks (schema sync, replica sync, queue healing, lease renewal, backups, spot draining) must run reliably with the right node identity | Built-in subcommands (`schema-sync`, `replica-sync`, `queue-heal`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch`, `drain-shutdown`, `volume-release`) wired as one-line systemd units |
 | Terminating instances must release their ordinal lease, DNS record, and replica registration even when external lifecycle hooks fail or are skipped | `chinit-shutdown-drain.service` runs `chinit drain-shutdown` inside systemd's shutdown transaction (`After=clickhouse-server`), covering scale-in, spot preemption, and health-check replacements while skipping normal reboots |
+| A terminated node's stateless volumes can outlive it when `delete_on_termination` cannot act (a wedged instance) or drifts | `chinit-volume-release.service` runs `chinit volume-release` in the same shutdown transaction (`Before=clickhouse-server`), deleting the node's own non-root volumes after the server stops; `track_own_volumes` records them in `state.json` at boot as the mid-teardown fallback |
 | Terminated nodes can leave stale DNS records, `/etc/hosts` entries, or `remote_servers` entries that stall cluster queries | Every 5-minute `lease-renew` tick reconciles `/etc/hosts`, private DNS `A` records, and rendered `remote_servers` configs against the live claims table |
 | Replication queues can stall on parts belonging to a replaced peer (`NO_REPLICA_HAS_PART`) or lost Keeper sessions | The hourly `queue-heal` timer syncs or restarts stuck replica queues when merges are idle and restores read-only replicas after Keeper session recovery |
 | Cluster-wide maintenance tasks gated on `writer-0` would stop running if `writer-0` is temporarily absent during churn | Vacancy election: if `writer-0` has no active lease, the lowest-ordinal live writer automatically assumes cluster maintenance duties |
@@ -86,6 +87,19 @@ stop replication queues → stop distributed sends → peer DROP REPLICA
 - **Reboots are preserved**: If `reboot.target` is active in `systemctl list-jobs`, `drain-shutdown` exits without releasing the lease or dropping the replica so the node retains its identity across reboots.
 - **No systemd deadlock**: Because the drain runs inside systemd's shutdown transaction, it skips issuing a separate `systemctl stop clickhouse-server` call.
 - **Covers every termination path**: Whether an instance is terminated by an ASG scale-in, an EC2/VMSS health check, a spot interruption, or a manual stop, the OS shutdown transaction runs the drain reliably.
+
+### Shutdown Volume Release
+
+Writers and readers also install `chinit-volume-release.service`, ordered `Before=clickhouse-server` so its `ExecStop` (`chinit volume-release`) runs after the server has stopped and the drain has released the identity:
+
+```
+reboot guard → role gate (writers/readers) → live-list own non-root volumes
+→ force-detach + delete each (state-file tracked_volumes as the fallback list)
+```
+
+- **No orphaned EBS**: a wedged termination or a drifted `delete_on_termination` flag leaves no unattached volume billing until the daily orphan sweep finds it.
+- **Persistent roles untouched**: keepers and the backup replica keep their standalone, re-attached volumes — the release is a stateless-role concern.
+- **Reboot-aware**: the same `reboot.target` guard as the drain; a reboot keeps its volumes.
 
 ### In-Place Configuration Refresh (`chinit boot --refresh`)
 

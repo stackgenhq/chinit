@@ -58,10 +58,11 @@ Draining a stateful ClickHouse replica on an Auto Scaling Group VM is surprising
 - EC2 and VMSS **health-check replacements** often skip scale-in lifecycle hooks altogether, going straight to OS `SIGTERM` / ACPI shutdown.
 - If your shutdown script calls `systemctl stop clickhouse-server` *while* `systemd` is already executing a shutdown transaction, `systemd` can deadlock waiting on conflicting job dependencies — or stop ClickHouse *before* your drain script can issue `SYSTEM STOP REPLICATION QUEUES`!
 
-`chinit` eliminates all three traps with two complementary mechanisms that invoke the exact same drain logic:
+`chinit` eliminates all three traps with complementary in-node mechanisms that need no external lifecycle infrastructure:
 
 1. **Early Spot Preemption (`chinit spot-watch`)**: On Spot writer + reader nodes, a lightweight daemon polls the cloud metadata preemption endpoint every 2 seconds (AWS IMDS `spot/instance-action` or Azure Scheduled Events `Preempt`), starting the drain the instant the 2-minute cloud warning arrives.
 2. **Universal OS Shutdown Hook (`chinit-shutdown-drain.service`)**: Installed inside `systemd`'s shutdown transaction with `After=clickhouse-server.service`. Because `systemd` stops units in **reverse** `After=` order, `ExecStop=/usr/local/bin/chinit drain-shutdown` is guaranteed to run *while `clickhouse-server` is still alive and accepting SQL commands*, across scale-ins, Spot kills, and health-check terminations alike.
+3. **Shutdown Volume Release (`chinit-volume-release.service`)**: The same transaction, ordered the other way (`Before=clickhouse-server.service`), so its `ExecStop=/usr/local/bin/chinit volume-release` runs *after* the server has stopped: the dying writer/reader deletes its OWN non-root volumes (live discovery first, the state file's `tracked_volumes` fallback), so a wedged termination or a drifted `delete_on_termination` flag leaves nothing for the daily orphan sweep to find. The reboot guard applies identically — a reboot keeps its volumes.
 
 ```mermaid
 sequenceDiagram
@@ -71,6 +72,7 @@ sequenceDiagram
     participant DR as chinit drain-shutdown
     participant Peer as Surviving Peer Node
     participant CL as clickhouse-server
+    participant VR as chinit volume-release
 
     T->>SD: initiate OS shutdown
     SD->>DR: ExecStop runs BEFORE clickhouse-server stops
@@ -83,6 +85,8 @@ sequenceDiagram
         DR-->>SD: exit 0
     end
     SD->>CL: cleanly stop clickhouse-server
+    SD->>VR: ExecStop of chinit-volume-release (Before=CL: runs after)
+    VR->>VR: delete own non-root volumes (live list, tracked fallback)
 ```
 
 <div class="callout callout-ok">
@@ -140,6 +144,7 @@ Rolling ClickHouse Keeper nodes carelessly can destroy cluster consensus. When y
 | **Daily** | `backup-daily` | `backup` | Runs `clickhouse-backup` full and incremental snapshots to S3 or Azure Blob Storage. |
 | **Daemon** | `exporter` | All roles | Serves fleet & ClickHouse Prometheus metrics on `:9150` (`/metrics` and `/clickhouse-metrics`). |
 | **OS Shutdown** | `drain-shutdown` | `writer`, `reader` | Stops queues, drops peer replica metadata, deletes DNS, and releases lease on termination. |
+| **OS Shutdown** | `volume-release` | `writer`, `reader` | Deletes the node's own non-root volumes after the server stops (live discovery, tracked-state fallback); reboot-aware. |
 
 ---
 

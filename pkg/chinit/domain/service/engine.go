@@ -305,6 +305,22 @@ type Engine struct {
 	shared *modelState
 }
 
+// VolumesPersister returns a closure the boot's track_own_volumes
+// step calls with this node's own volume IDs: they merge into the
+// shared state and save immediately, the same contract as the
+// identity persister (a later crash must not lose them). No-op when
+// the engine has no store (unit tests).
+func (e *Engine) VolumesPersister() func([]string) {
+	if e.stateStore == nil {
+		return nil
+	}
+	return func(ids []string) {
+		state := e.writableState()
+		state.TrackedVolumes = ids
+		e.saveState(state)
+	}
+}
+
 // StateStore persists the boot state file.
 type StateStore interface {
 	Load() (*modelState, error)
@@ -356,20 +372,33 @@ func (e *Engine) IdentityPersister(cloud string) func(model.NodeIdentity) {
 		// run's next per-step Save must carry the identity, not
 		// clobber it. A nil shared state (persister called outside
 		// a run) falls back to a fresh load.
-		var state *modelState
-		if e.shared != nil {
-			state = e.shared
-		} else if loaded, err := e.stateStore.Load(); err == nil && loaded != nil {
-			state = loaded
-		} else {
-			state = &modelState{}
-		}
+		state := e.writableState()
 		state.Identity = toBootIdentity(&identity, cloud)
-		if e.specHash != "" {
-			state.SpecHash = e.specHash
-		}
-		_ = e.stateStore.Save(state)
+		e.saveState(state)
 	}
+}
+
+// writableState resolves the ONE in-memory state object the run and
+// the persisters mutate: the run's shared copy when a run is active,
+// a fresh load otherwise (persister called outside a run), an empty
+// state when nothing loads (first boot).
+func (e *Engine) writableState() *modelState {
+	if e.shared != nil {
+		return e.shared
+	}
+	if loaded, err := e.stateStore.Load(); err == nil && loaded != nil {
+		return loaded
+	}
+	return &modelState{}
+}
+
+// saveState persists the persister's mutation, carrying the current
+// spec hash so resume invalidation survives the snapshot.
+func (e *Engine) saveState(state *modelState) {
+	if e.specHash != "" {
+		state.SpecHash = e.specHash
+	}
+	_ = e.stateStore.Save(state)
 }
 
 // toBootIdentity maps the domain identity onto the storage shape.
@@ -647,8 +676,13 @@ type modelState struct {
 	Identity *bootIdentity `json:"identity,omitempty"`
 	// SpecHash is the config bundle SHA the steps ran against; a new
 	// hash invalidates prior results so the pipeline re-renders.
-	SpecHash string       `json:"spec_hash,omitempty"`
-	Steps    []stepRecord `json:"steps"`
+	SpecHash string `json:"spec_hash,omitempty"`
+	// TrackedVolumes are this node's own non-root volume IDs recorded
+	// at boot (the track_own_volumes step): the shutdown volume-release
+	// path's fallback list when live discovery cannot reach the cloud
+	// API mid-teardown.
+	TrackedVolumes []string     `json:"tracked_volumes,omitempty"`
+	Steps          []stepRecord `json:"steps"`
 }
 
 // bootIdentity is the persisted subset of model.NodeIdentity (kept

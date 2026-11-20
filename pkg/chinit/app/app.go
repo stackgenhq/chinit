@@ -87,6 +87,7 @@ var commands = []command{
 	{Name: "spot-watch", Run: runSpotWatch},
 	{Name: "drain", Run: runDrain, Usage: "[-reason spot|shutdown|termination-hook] [-timeout seconds]"},
 	{Name: "drain-shutdown", Run: runDrainShutdown},
+	{Name: "volume-release", Run: runVolumeRelease, Usage: "(the shutdown unit's ExecStop; deletes this node's own volumes at termination)"},
 }
 
 // commandByName answers the registry entry for a CLI word.
