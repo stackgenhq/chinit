@@ -64,7 +64,7 @@ variable "chinit_version" {
   description = "chinit release version to pre-install (from stackgenhq/chinit releases)"
   # Version history lives in CHANGELOG.md next to this template.
   # Keep `default = "<semver>"` on a single line for the release workflow.
-  default = "0.2.6"
+  default = "0.2.18"
 }
 
 variable "clickhouse_version" {
