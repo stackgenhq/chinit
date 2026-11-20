@@ -87,6 +87,7 @@ locals {
   chi_spec = templatefile("${path.module}/templates/chi-spec.yaml", {
     cluster_name      = var.cluster_name
     insert_quorum     = var.insert_quorum
+    writer_count      = length(var.writer_hostnames)
     replica_count     = length(var.writer_hostnames) + var.reader_count + (var.backup_replica_enabled ? 1 : 0)
     keepers           = [for h in var.keeper_hostnames : "${h}.${var.dns_zone_name}"]
     log_level         = var.ch_log_level

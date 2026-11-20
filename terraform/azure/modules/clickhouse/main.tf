@@ -24,6 +24,7 @@ locals {
   # scale-out and orphan keeper-path data.
   chi_spec = templatefile("${path.module}/templates/chi-spec.yaml", {
     cluster_name                 = var.cluster_name
+    writer_count                 = var.writer_count
     replica_count                = var.writer_count + var.reader_count
     keepers                      = [for i in range(var.keeper_count) : "${var.keeper_hostname_prefix}${i}.${var.dns_zone_name}"]
     default_password_secret_name = "clickhouse-default-password"

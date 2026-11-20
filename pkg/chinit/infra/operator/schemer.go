@@ -30,8 +30,6 @@ type SchemaRunner struct {
 	params *clickhouse.ClusterConnectionParams
 	// hosts maps cluster host names to operator Host values.
 	hosts map[string]*v1.Host
-	// roles maps cluster host names to their declared node roles when provided.
-	roles map[string]domain.Role
 	// clusterName is the ClickHouse cluster name from the factory
 	// request; interpolated into the GC detection SQL only after being
 	// confirmed to be one of the CR's declared clusters.
@@ -121,15 +119,11 @@ func (f *SchemaClientFactory) NewClient(ctx context.Context, request port.NewSch
 
 	// Address overrides: cloud name=address pairs over the CR's FQDNs.
 	addresses := make(map[string]string, len(request.Hosts))
-	roles := make(map[string]domain.Role, len(request.Hosts))
 	for _, h := range request.Hosts {
 		if h.Name == "" || h.Address == "" {
 			return nil, fmt.Errorf("host inventory entry requires Name and Address, got %+v", h)
 		}
 		addresses[h.Name] = h.Address
-		if h.Role != "" {
-			roles[h.Name] = h.Role
-		}
 	}
 
 	scheme := v1.ChSchemeHTTP
@@ -190,7 +184,6 @@ func (f *SchemaClientFactory) NewClient(ctx context.Context, request port.NewSch
 		schemer:     s,
 		params:      params,
 		hosts:       make(map[string]*v1.Host),
-		roles:       roles,
 		clusterName: request.ClusterName,
 	}
 	// Collect the CR's normalized hosts for the requested cluster and
@@ -220,12 +213,9 @@ func (f *SchemaClientFactory) NewClient(ctx context.Context, request port.NewSch
 }
 
 // SyncSchema creates all replicated and distributed objects on a host from
-// cluster peers (HostCreateTables), then removes any streaming ingest queue
-// tables (and their dependent materialized views) on non-writer hosts so read
-// replicas never poll external object-storage queues.
+// cluster peers (HostCreateTables).
 //
-// Without it: a scaled-in reader serves queries with missing tables, or
-// materializes writer-only S3Queue tables copied from Atomic databases.
+// Without it: a scaled-in reader serves queries with missing tables.
 func (r *SchemaRunner) SyncSchema(ctx context.Context, request domain.SchemaSyncRequest) error {
 	host, err := r.host(request.HostName)
 	if err != nil {
@@ -233,76 +223,7 @@ func (r *SchemaRunner) SyncSchema(ctx context.Context, request domain.SchemaSync
 	}
 	ctx, cancel := context.WithTimeout(ctx, defaultSchemaTimeout)
 	defer cancel()
-	if err := r.schemer.HostCreateTables(ctx, host); err != nil {
-		return err
-	}
-	if r.isNonWriterHost(host, request.HostName) {
-		r.dropIngestQueuesOnHost(ctx, host)
-	}
-	return nil
-}
-
-// isNonWriterHost reports whether target host belongs to a non-writer role
-// (reader or backup) that must not run streaming ingest queues (S3Queue).
-func (r *SchemaRunner) isNonWriterHost(host *v1.Host, requestedName string) bool {
-	if role, ok := r.roles[host.Runtime.Address.HostName]; ok && role != "" {
-		return role != domain.RoleWriter
-	}
-	for _, candidate := range []string{
-		strings.Split(host.Runtime.Address.FQDN, ".")[0],
-		strings.Split(requestedName, ".")[0],
-	} {
-		if strings.HasPrefix(candidate, "reader-") || strings.HasPrefix(candidate, "backup-") {
-			return true
-		}
-		if strings.HasPrefix(candidate, "writer-") {
-			return false
-		}
-	}
-	return false
-}
-
-// dropIngestQueuesOnHost queries ClickHouse's system.tables catalog on host to
-// locate any *Queue tables (such as S3Queue) and MaterializedViews reading from
-// them, and drops them in dependency order (views first, then queue tables).
-func (r *SchemaRunner) dropIngestQueuesOnHost(ctx context.Context, host *v1.Host) {
-	cluster := clickhouse.NewCluster()
-	cluster.ClusterConnectionParams = r.params
-	cluster.SetHosts([]string{host.Runtime.Address.FQDN})
-
-	qCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	res, err := cluster.QueryAny(qCtx, `
-		SELECT
-			concat('DROP TABLE IF EXISTS "', database, '"."', name, '" SYNC') AS drop_sql
-		FROM system.tables
-		WHERE database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
-			AND (
-				engine LIKE '%Queue'
-				OR (
-					engine = 'MaterializedView'
-					AND arrayExists(q -> position(create_table_query, q) > 0, (
-						SELECT groupArray(name)
-						FROM system.tables
-						WHERE database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
-							AND engine LIKE '%Queue'
-					))
-				)
-			)
-		ORDER BY engine = 'MaterializedView' DESC
-	`)
-	if err != nil || res == nil {
-		return
-	}
-	var dropSQLs []string
-	scanErr := res.UnzipColumnsAsStrings(&dropSQLs)
-	res.Close()
-	if scanErr != nil || len(dropSQLs) == 0 {
-		return
-	}
-	opts := clickhouse.NewQueryOptions().SetRetry(false).SetLogQueries(true)
-	_ = cluster.ExecAll(qCtx, dropSQLs, opts)
+	return r.schemer.HostCreateTables(ctx, host)
 }
 
 // DropReplica removes a dead replica's Keeper registration

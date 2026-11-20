@@ -19,6 +19,14 @@ const (
 	RoleBackup Role = "backup"
 )
 
+// AllowsColdStartDDLSeed reports whether nodes of this role execute the
+// cold-start bootstrap-ddl.sql bundle directly at boot. Only writers seed
+// initial DDL; readers and backup replicas materialize replicated tables from
+// peers via schema synchronization.
+func (r Role) AllowsColdStartDDLSeed() bool {
+	return r == RoleWriter
+}
+
 // IdentityMode selects how the node derives its hostname:
 //   - static: derives the hostname from the private IP's last octet.
 //   - lease: claims a stable ordinal from the cloud provider's lease table before rendering configuration.
