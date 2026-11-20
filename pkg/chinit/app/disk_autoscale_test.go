@@ -17,12 +17,13 @@ import (
 	chinitport "github.com/stackgenhq/chinit/pkg/chinit/domain/port"
 )
 
-// This file pins `chinit disk-autoscale` — the every-5-minute timer the
-// units matrix installs on writers AND readers. The job keeps EFFECTIVE
-// disk headroom above the floor by growing the node's own data volume +
-// filesystem online — without it, keep_free_space on a small volume can
-// leave ~1 MiB effective, merges stall on NOT_ENOUGH_SPACE, and parts
-// climb toward the parts_to_throw_insert hard reject.
+// This file pins `chinit disk-autoscale`'s app-layer wiring — the
+// exec-backed adapters the domain service drives. The POLICY specs
+// (floor derivation, grow-or-relieve) live in the service package's
+// own suite; here the contract is transport: the probe runs
+// clickhouse-client with credentials on ENV (never argv), the df
+// probe feeds the fs size, the resizer shells findmnt/resize2fs, and
+// the outcome reaches the metric pusher.
 
 // diskAutoscaleDir is this suite's scratch dir (state files) — never
 // /var/lib.
@@ -40,7 +41,6 @@ func diskAutoscaleState(identity model.NodeIdentity) string {
 
 // diskAutoscaleFakes records the exec + provider surface.
 type diskAutoscaleFakes struct {
-	runner   *fakeRunner
 	grower   *fakeVolumeGrower
 	pusher   *fakeMetricPusher
 	provider *diskAutoscaleProvider
@@ -150,27 +150,20 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
-var _ = Describe("runDiskAutoscale", func() {
+var _ = Describe("runDiskAutoscale wiring", func() {
 	var fakes *diskAutoscaleFakes
 	var statePath string
 
 	var probedArgs [][]string
 	var probedEnv [][]string
 
-	seed := func(freeGB float64) {
-		fakes = &diskAutoscaleFakes{runner: &fakeRunner{}}
-		identity := model.NodeIdentity{
-			Role:        model.RoleWriter,
-			Hostname:    "writer-0",
-			InstanceID:  "i-0cf1cda168d841a50",
-			Region:      "us-west-2",
-			ClusterName: "example",
-		}
-		statePath = diskAutoscaleState(identity)
-
-		fakes.grower = &fakeVolumeGrower{volume: &chinitport.VolumeInfo{
-			VolumeID: "vol-test", SizeGB: 32, AttachedTo: identity.InstanceID,
-		}}
+	// seedWithFs fakes the exec seam: the reservation-book probe answers
+	// <unreserved> <keep_free>, the df probe answers the fs size
+	// (fsSizeGB 0 = emulated df failure → the fixed-headroom floor).
+	seedWithFs := func(freeGB float64, fsSizeGB uint64) {
+		fakes = &diskAutoscaleFakes{grower: &fakeVolumeGrower{volume: &chinitport.VolumeInfo{
+			VolumeID: "vol-test", SizeGB: 32, AttachedTo: "i-0cf1cda168d841a50",
+		}}}
 		fakes.pusher = &fakeMetricPusher{}
 		fakes.provider = &diskAutoscaleProvider{name: "aws", grower: fakes.grower, pusher: fakes.pusher}
 
@@ -184,6 +177,19 @@ var _ = Describe("runDiskAutoscale", func() {
 		origRun := runCommand
 		origRunWithEnv := runCommandWithEnv
 		origBuild := buildProvider
+		runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			switch name {
+			case "df":
+				if fsSizeGB == 0 {
+					return nil, fmt.Errorf("df: emulated failure")
+				}
+				return []byte(fmt.Sprintf("1B-blocks\n%d", fsSizeGB*(1<<30))), nil
+			case "findmnt":
+				return []byte("/dev/nvme1n1"), nil
+			default:
+				return []byte(""), nil
+			}
+		}
 		runCommandWithEnv = func(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 			probedArgs = append(probedArgs, args)
 			probedEnv = append(probedEnv, env)
@@ -201,22 +207,31 @@ var _ = Describe("runDiskAutoscale", func() {
 			buildProvider = origBuild
 		})
 	}
+	seed := func(freeGB float64) { seedWithFs(freeGB, 256) }
 
-	It("is a no-op above the floor", func() {
-		seed(40) // 40 GiB unreserved > derived floor (keep_free 10 + headroom 2 = 12 GiB)
+	identity := model.NodeIdentity{
+		Role:        model.RoleWriter,
+		Hostname:    "writer-0",
+		InstanceID:  "i-0cf1cda168d841a50",
+		Region:      "us-west-2",
+		ClusterName: "example",
+	}
+
+	It("runs the SQL probe with credentials on env, never argv", func() {
+		seed(60) // above the proportional floor (48.4 GiB): idle tick
+		statePath = diskAutoscaleState(identity)
 		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
 		Expect(fakes.grower.grew).To(BeEmpty())
 		Expect(fakes.grower.described).To(BeEmpty())
 
 		// The probe must authenticate as admin with the password file's
 		// value — the bare client's `default` user is refused outright
-		// (every timer start failed on
-		// AUTHENTICATION_FAILED until the credentials were threaded).
-		// Credentials ride ENV, never argv: argv is world-readable in
-		// /proc/<pid>/cmdline for the process's whole lifetime.
-		// The fs-converge step (findmnt/resize2fs) runs FIRST via the
-		// same exec seam, so the SQL probe is located by its --query
-		// element, not by position.
+		// (every timer start failed on AUTHENTICATION_FAILED until the
+		// credentials were threaded). Credentials ride ENV, never argv:
+		// argv is world-readable in /proc/<pid>/cmdline for the
+		// process's whole lifetime. The fs-converge step
+		// (findmnt/resize2fs) and the df probe run through the same exec
+		// seams, so the SQL probe is located by its --query element.
 		Expect(probedArgs).NotTo(BeEmpty())
 		var probe []string
 		for _, p := range probedArgs {
@@ -242,22 +257,23 @@ var _ = Describe("runDiskAutoscale", func() {
 		Expect(probeEnv).To(ContainElement("CLICKHOUSE_PASSWORD=sekrit"))
 	})
 
-	It("grows the volume and resizes the filesystem below the floor", func() {
-		seed(2) // 2 GiB unreserved < derived floor (12 GiB): must grow 3x to 96
+	It("grows the volume and filesystem below the floor", func() {
+		// 30 GiB unreserved < proportional floor (48.4 GiB) on a 256 GiB
+		// fs: the 3x grow lands at 96, the fs is resized, the outcome
+		// published.
+		seed(30)
+		statePath = diskAutoscaleState(identity)
 		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
 		Expect(fakes.grower.described).To(HaveLen(1))
-		Expect(fakes.grower.described[0].InstanceID).To(Equal("i-0cf1cda168d841a50"))
+		Expect(fakes.grower.described[0].InstanceID).To(Equal(identity.InstanceID))
 		Expect(fakes.grower.described[0].Device).To(Equal("/dev/sdb"))
 		// 3x the CURRENT size (32 -> 96): one grow event buys days of
 		// scratch headroom instead of hours, staying far from AWS's
-		// per-volume modification rate limit (the 2026-11-17 finding:
-		// +32 linear steps burned the budget and locked a writer out
-		// of modifications for 19 hours).
+		// per-volume modification rate limit (linear steps burn the
+		// modification budget and lock a node out of resizes for
+		// hours).
 		Expect(fakes.grower.grew).To(Equal([]int32{96}))
 		Expect(fakes.grower.waited).To(Equal([]string{"vol-test"}))
-		// The fs step shells findmnt/resize2fs: the exec fake answered
-		// with the seeded bytes for every call, so success means the
-		// commands ran and were tolerated.
 		autoScaled := false
 		for _, p := range fakes.pusher.pushed {
 			if p.Name == "DiskAutoscaled" {
@@ -268,9 +284,8 @@ var _ = Describe("runDiskAutoscale", func() {
 	})
 
 	It("fails loudly when the provider cannot grow volumes", func() {
-		seed(2)
-		// Capability absent: a provider type with no grow methods
-		// (AsVolumeGrower returns nil), not a nil grower field.
+		seed(2) // below any floor: grow path entered
+		statePath = diskAutoscaleState(identity)
 		origBuild := buildProvider
 		buildProvider = func(string, string) (chinitport.Provider, error) {
 			return &noGrowProvider{name: "aws", pusher: fakes.pusher}, nil
@@ -290,30 +305,61 @@ var _ = Describe("runDiskAutoscale", func() {
 		Expect(pressurePushed).To(BeTrue(), "the disk-pressure signal must reach CloudWatch even when the remedy is absent")
 	})
 
-	It("never grows past the ceiling", func() {
-		seed(2)
-		fakes.grower.volume.SizeGB = 250 // near the 512 GiB ceiling
+	It("degrades to the fixed-headroom floor when the df probe fails", func() {
+		// df failing must NEVER disable growth: the floor falls back to
+		// keep_free 10 + fixed 2 = 12 GiB. 5 GiB unreserved must grow.
+		seedWithFs(5, 0)
+		statePath = diskAutoscaleState(identity)
 		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
-		Expect(fakes.grower.grew).To(Equal([]int32{512}))
+		Expect(fakes.grower.grew).To(Equal([]int32{96}))
 	})
 
-	It("reports the pressure without growing when already at the ceiling", func() {
-		seed(2)
-		fakes.grower.volume.SizeGB = 512
+	It("derives the floor proportionally on large volumes", func() {
+		// The 40TB-run blind spot: a 256 GiB volume at 40 GiB unreserved
+		// — ABOVE the old fixed floor (12 GiB), BELOW the proportional
+		// one (48.4 GiB): the grow must trigger several ticks before the
+		// disk is critical.
+		seed(40)
+		statePath = diskAutoscaleState(identity)
+		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
+		Expect(fakes.grower.grew).To(Equal([]int32{96}))
+	})
+
+	It("keeps the idle tick metric-free (log-only above the floor)", func() {
+		seed(60) // above the proportional floor: idle
+		statePath = diskAutoscaleState(identity)
+		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
+		Expect(fakes.pusher.pushed).To(BeEmpty(), "an idle tick must not publish grow/pressure metrics")
+	})
+
+	It("does not publish a zero reading when the probe fails", func() {
+		// A failed probe must not reach the alarm side as a zero gauge —
+		// the alarm's missing-data treatment owns the gap (a zero
+		// would false-page while the node may be perfectly healthy).
+		seed(60)
+		origRun := runCommandWithEnv
+		runCommandWithEnv = func(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+			probedArgs = append(probedArgs, args)
+			probedEnv = append(probedEnv, env)
+			return nil, fmt.Errorf("clickhouse-client: emulated probe failure")
+		}
+		DeferCleanup(func() { runCommandWithEnv = origRun })
+
+		statePath = diskAutoscaleState(identity)
 		err := runDiskAutoscale([]string{"-state", statePath})
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("ceiling"))
-		Expect(fakes.grower.grew).To(BeEmpty())
+		Expect(err.Error()).To(ContainSubstring("probe failed"))
+		Expect(fakes.pusher.pushed).To(BeEmpty(), "a failed probe must not publish a zero gauge")
 	})
+})
 
-	It("triples an already-large volume in one event (the rate-limit budget)", func() {
-		// The 2026-11-17 live shape: a 160 GiB hot volume at the floor
-		// under 60TB/day ingest. The 3x step lands at 480 — days of
-		// headroom in ONE modification slot; the old +32 step needed
-		// ten rate-limited slots to converge the same distance.
-		seed(2)
-		fakes.grower.volume.SizeGB = 160
-		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
-		Expect(fakes.grower.grew).To(Equal([]int32{480}))
+// diskAutoscaleTimeout pins the tick's deadline: 15 minutes from the
+// timer unit (systemd's own OnCalendar is the outer bound; the job
+// self-bounds for the cloud API waits).
+var _ = Describe("diskAutoscaleConfig", func() {
+	It("follows the launch-template mount/device convention", func() {
+		cfg := defaultDiskAutoscaleConfig()
+		Expect(cfg.DataDiskDevice).To(Equal("/dev/sdb"))
+		Expect(cfg.DataMountPoint).To(Equal("/var/lib/clickhouse"))
 	})
 })
