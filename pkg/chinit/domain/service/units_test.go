@@ -323,6 +323,42 @@ var _ = Describe("shutdownDrainUnit", func() {
 	})
 })
 
+var _ = Describe("volumeReleaseUnit", func() {
+	// The in-node shutdown volume release (the dying node deletes its
+	// OWN stateless volumes after the server stops). The ordering is
+	// the inverse of the drain unit's: Before=clickhouse-server makes
+	// systemd stop THIS unit first in the shutdown transaction, so the
+	// volume delete runs only once no writer remains above it.
+
+	It("orders the release BEFORE clickhouse-server stops", func() {
+		// A unit whose ExecStop deletes the volumes the server writes
+		// to must not run while the server is still writing:
+		// Before=clickhouse-server means systemd stops this unit
+		// FIRST (ExecStop fires), then the server's own stop — the
+		// delete lands on quiescent volumes.
+		u := (&Boot{Spec: &model.BootSpec{}}).volumeReleaseUnit()
+		Expect(u.Name).To(Equal("chinit-volume-release.service"))
+		Expect(u.Content).To(ContainSubstring("Before=clickhouse-server.service"))
+	})
+
+	It("runs the volume-release subcommand at ExecStop and stays quiescent at start", func() {
+		u := (&Boot{Spec: &model.BootSpec{}}).volumeReleaseUnit()
+		Expect(u.Content).To(ContainSubstring("ExecStart=/bin/true"))
+		Expect(u.Content).To(ContainSubstring("ExecStop=/usr/local/bin/chinit volume-release"))
+		Expect(u.Content).To(ContainSubstring("RemainAfterExit=yes"))
+	})
+
+	It("bounds the release under the drain's and EC2's windows", func() {
+		// The subcommand's budget is 80s; the unit bound (90s) sits
+		// above it and under EC2's 180s shutdown window — a release
+		// that overruns gets the instance killed mid-delete, and the
+		// drain (170s unit bound) must always be able to finish first
+		// in the same transaction.
+		u := (&Boot{Spec: &model.BootSpec{}}).volumeReleaseUnit()
+		Expect(u.Content).To(ContainSubstring("TimeoutStopSec=90"))
+	})
+})
+
 var _ = Describe("spotWatchEligible", func() {
 	// The 2026-11-19 writer-5/writer-7 finding: dev runs writer-1..N
 	// 100% Spot (writer_spot_ratio = 1.0 above the on-demand base), and

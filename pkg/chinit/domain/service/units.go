@@ -948,9 +948,7 @@ WantedBy=multi-user.target
 // installShutdownDrain writes the in-node shutdown drain unit
 // (writers + readers) and enables it.
 func (b *Boot) installShutdownDrain(ctx context.Context) error {
-	switch b.Spec.Role {
-	case model.RoleWriter, model.RoleReader:
-	default:
+	if !b.Spec.Role.HasStatelessVolumes() {
 		return nil
 	}
 	installer := system.NewUnitInstaller("/etc/systemd/system")
@@ -964,6 +962,107 @@ func (b *Boot) installShutdownDrain(ctx context.Context) error {
 	if out, err := runCommand(ctx, "systemctl", "enable", "--now", "chinit-shutdown-drain.service"); err != nil {
 		return fmt.Errorf("enable chinit-shutdown-drain: %w: %s", err, out)
 	}
+	return nil
+}
+
+// volumeReleaseUnit is the pure unit builder for the shutdown volume
+// release (the shutdownDrainUnit pattern — split out so the
+// unit-content contract is testable without executing systemctl).
+//
+// The ordering is the design: Before=clickhouse-server means the unit
+// is stopped BEFORE the server on shutdown (a unit whose ExecStop
+// deletes the volumes the server writes to MUST NOT run while the
+// server is still writing). systemd stops Before=-ordered units
+// first in the shutdown transaction, so the sequence is:
+// drain-shutdown's ExecStop (After=clickhouse-server — identity
+// release against a LIVE server) → clickhouse-server stops → this
+// unit's ExecStop deletes the now-quiescent volumes.
+func (b *Boot) volumeReleaseUnit() system.UnitFile {
+	return system.UnitFile{
+		Name: "chinit-volume-release.service",
+		Content: `[Unit]
+Description=In-node shutdown volume release (chinit volume-release)
+# Before=clickhouse-server: systemd stops Before=-ordered units FIRST
+# on shutdown, so the volume delete runs only after the server (and
+# every writer above it) has stopped. The reboot guard lives in the
+# subcommand (reboot.target in list-jobs skips the release).
+Before=clickhouse-server.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/chinit volume-release
+# The release is bounded under EC2's 180s shutdown window with
+# headroom for the detach settle; EC2 remains the outer bound.
+TimeoutStopSec=90
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+`,
+	}
+}
+
+// installVolumeRelease writes the in-node shutdown volume-release
+// unit (writers + readers — the stateless-volume roles) and enables
+// it. The subcommand carries the reboot guard; the unit's only
+// purpose is to be active so systemd runs ExecStop at shutdown.
+func (b *Boot) installVolumeRelease(ctx context.Context) error {
+	if !b.Spec.Role.HasStatelessVolumes() {
+		return nil
+	}
+	installer := system.NewUnitInstaller("/etc/systemd/system")
+	units := []system.UnitFile{b.volumeReleaseUnit()}
+	if _, err := installer.InstallUnits(units); err != nil {
+		return err
+	}
+	if out, err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+		return fmt.Errorf("daemon-reload: %w: %s", err, out)
+	}
+	if out, err := runCommand(ctx, "systemctl", "enable", "--now", "chinit-volume-release.service"); err != nil {
+		return fmt.Errorf("enable chinit-volume-release: %w: %s", err, out)
+	}
+	return nil
+}
+
+// trackOwnVolumes records this node's own volume IDs into the
+// persisted state (writers/readers — the roles whose volumes are
+// stateless by contract). Live discovery is authoritative; the
+// recorded list is the shutdown path's fallback for the window where
+// the cloud API is unreachable mid-teardown. No capability, no
+// instance id, or a listing failure degrades to an empty recording
+// (loud warning) — the release path and the orphan sweep both have
+// live-discovery paths of their own.
+func (b *Boot) trackOwnVolumes(ctx context.Context) error {
+	if !b.Spec.Role.HasStatelessVolumes() {
+		return nil
+	}
+	releaser := chinitport.AsVolumeReleaser(b.Provider)
+	if releaser == nil {
+		logger.GetLogger(ctx).Info("track-own-volumes: provider has no volume-release capability; nothing recorded",
+			"cloud", b.Provider.Name())
+		return nil
+	}
+	vols, err := releaser.ListOwnVolumes(ctx, chinitport.VolumeReleaseRequest{InstanceID: b.Meta.InstanceID})
+	if err != nil {
+		logger.GetLogger(ctx).Warn("track-own-volumes: listing failed; the shutdown release path falls back to live discovery",
+			"err", err.Error())
+		return nil
+	}
+	ids := make([]string, 0, len(vols))
+	for _, v := range vols {
+		if v.VolumeID != "" {
+			ids = append(ids, v.VolumeID)
+		}
+	}
+	if b.PersistVolumes != nil {
+		b.PersistVolumes(ids)
+	}
+	logger.GetLogger(ctx).Info("track-own-volumes: recorded own volumes",
+		"count", len(ids),
+		"instance_id", b.Meta.InstanceID)
 	return nil
 }
 

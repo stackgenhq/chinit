@@ -132,6 +132,7 @@ var _ = Describe("the command registry", func() {
 			"schema-sync", "replica-sync", "queue-heal",
 			"lease-renew", "keeper-health", "dead-replica-gc", "orphaned-gc",
 			"backup-daily", "backup-wake", "spot-watch", "drain", "drain-shutdown",
+			"volume-release",
 			"disk-autoscale", "span-ship",
 		}
 		byName := map[string]bool{}

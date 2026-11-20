@@ -293,6 +293,53 @@ func AsVolumeGrower(p Provider) VolumeGrower {
 	return nil
 }
 
+// AttachedVolume is one non-root volume attached to this instance,
+// as the volume-release path sees it.
+type AttachedVolume struct {
+	// VolumeID is the provider's volume identifier.
+	VolumeID string
+	// Device is the EC2 attachment device ("/dev/sdb").
+	Device string
+	// SizeGB is the capacity (context for the release log).
+	SizeGB int32
+	// DeleteOnTermination reports the attachment's flag: a false
+	// value is the orphan-leak class (the volume would outlive the
+	// instance), the release path's primary target.
+	DeleteOnTermination bool
+}
+
+// VolumeReleaseRequest names the instance whose volumes release.
+type VolumeReleaseRequest struct {
+	// InstanceID is THIS node's identifier (the releaser only ever
+	// returns volumes attached to it).
+	InstanceID string
+}
+
+// VolumeReleaser is the optional capability the shutdown volume-release
+// path calls: delete this node's own stateless volumes at termination
+// so nothing is left for the orphan sweep to find.
+//
+// Why a port: the release is provider-specific (EC2 Detach+Delete
+// vs Azure managed-disk detach+delete), while the policy — release
+// only at termination, never on reboot, only the volumes attached to
+// THIS instance — is domain logic every cloud shares.
+type VolumeReleaser interface {
+	// ListOwnVolumes returns every volume attached to this instance
+	// (the caller decides which qualify for release).
+	ListOwnVolumes(ctx context.Context, req VolumeReleaseRequest) ([]AttachedVolume, error)
+	// ReleaseVolume force-detaches and deletes one volume. Idempotent:
+	// an already-deleted volume is a success, not an error.
+	ReleaseVolume(ctx context.Context, volumeID string) error
+}
+
+// AsVolumeReleaser returns the volume-release capability, or nil.
+func AsVolumeReleaser(p Provider) VolumeReleaser {
+	if c, ok := p.(VolumeReleaser); ok {
+		return c
+	}
+	return nil
+}
+
 // Claim is one live ordinal-lease row (see LeaseLister): the identity a
 // cluster member currently holds — hostname reader-N/writer-N with the
 // instance that owns it.

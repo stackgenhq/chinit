@@ -30,6 +30,10 @@ type nodeState struct {
 	// key): the config-check job compares it against the fingerprint
 	// over freshly-fetched spec+bundle to decide a refresh.
 	SpecHash string `json:"spec_hash,omitempty"`
+	// TrackedVolumes are this node's own volume IDs the boot recorded
+	// (the shutdown volume-release path's fallback when live cloud
+	// discovery cannot reach the API mid-teardown).
+	TrackedVolumes []string `json:"tracked_volumes,omitempty"`
 }
 
 // clusterName returns the cluster the node serves (identity snapshot).

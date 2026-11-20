@@ -35,6 +35,7 @@ type Provider struct {
 	spot            *SpotWatcher
 	metrics         *CloudWatchPusher
 	volumes         *VolumeGrower
+	releaser        *VolumeReleaser
 	metricStore     *MetricStore
 	resizer         *EC2Resizer
 	roller          *FleetRoller
@@ -67,6 +68,7 @@ var (
 	_ port.RoleSpecSource     = (*Provider)(nil)
 	_ port.RefreshLock        = (*Provider)(nil)
 	_ port.OrphanSweeper      = (*Provider)(nil)
+	_ port.VolumeReleaser     = (*Provider)(nil)
 	_ port.FleetTaskStore     = (*Provider)(nil)
 	_ port.StatusPublisher    = (*Provider)(nil)
 )
@@ -91,6 +93,7 @@ func New(cfg port.Config) port.Provider {
 	p.spot = NewSpotWatcher()
 	p.metrics = NewCloudWatchPusher(region)
 	p.volumes = NewVolumeGrower(region)
+	p.releaser = NewVolumeReleaser(region)
 	p.metricStore = NewMetricStore(region)
 	p.resizer = NewEC2Resizer(region)
 	p.roller = NewFleetRoller(region)
@@ -194,6 +197,16 @@ func (p *Provider) MarkCooldown(ctx context.Context, req port.CooldownRequest) e
 // SweepOrphans implements port.OrphanSweeper (delegated).
 func (p *Provider) SweepOrphans(ctx context.Context, req port.OrphanSweepRequest) (*port.OrphanSweepResult, error) {
 	return p.sweeper.SweepOrphans(ctx, req)
+}
+
+// ListOwnVolumes implements port.VolumeReleaser (delegated).
+func (p *Provider) ListOwnVolumes(ctx context.Context, req port.VolumeReleaseRequest) ([]port.AttachedVolume, error) {
+	return p.releaser.ListOwnVolumes(ctx, req)
+}
+
+// ReleaseVolume implements port.VolumeReleaser (delegated).
+func (p *Provider) ReleaseVolume(ctx context.Context, volumeID string) error {
+	return p.releaser.ReleaseVolume(ctx, volumeID)
 }
 
 // FleetTaskStore implementation (delegated): the epoch-fenced task

@@ -27,6 +27,16 @@ func (r Role) AllowsColdStartDDLSeed() bool {
 	return r == RoleWriter
 }
 
+// HasStatelessVolumes reports whether nodes of this role own only
+// re-derivable, stateless volumes: table data lives in object storage and
+// the metadata catalog re-warms via replication on a replacement. Writers
+// and readers may release their own volumes at termination; keepers and the
+// backup replica re-attach standalone persistent volumes across replacements
+// (raft logs, backup lineage) and must never release them.
+func (r Role) HasStatelessVolumes() bool {
+	return r == RoleWriter || r == RoleReader
+}
+
 // IdentityMode selects how the node derives its hostname:
 //   - static: derives the hostname from the private IP's last octet.
 //   - lease: claims a stable ordinal from the cloud provider's lease table before rendering configuration.

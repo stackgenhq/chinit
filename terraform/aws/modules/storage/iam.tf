@@ -654,6 +654,76 @@ data "aws_iam_policy_document" "node_self_heal" {
 
 data "aws_region" "current" {}
 
+# ----------------------------------------------------------------------------
+# Volume Release Policy (the chinit volume-release shutdown path's grants)
+# ----------------------------------------------------------------------------
+# Why: the chinit-volume-release.service unit's ExecStop deletes the
+#      dying node's OWN stateless volumes inside systemd's shutdown
+#      transaction, so a volume whose delete_on_termination flag cannot
+#      act (a wedged instance, a drifted flag) leaves no orphan behind.
+#      The grant is writer+reader ONLY — keepers and the backup replica
+#      carry standalone Terraform-managed volumes whose persistence IS
+#      the design (raft logs, backup lineage), and the subcommand's
+#      role gate double-enforces the same boundary in code.
+#
+# LEAST-PRIVILEGE SHAPE:
+#   - ec2:DescribeVolumes: read-only discovery filtered by the node's
+#     OWN instance-id attachment (the call's filter is the scope;
+#     Describe* has no resource-level support).
+#   - ec2:DetachVolume + ec2:DeleteVolume: the two mutations, scoped
+#     to this deployment's volume ARNs AND the NodeType tag condition
+#     the launch templates stamp on every fleet volume
+#     (tag_specifications resource_type="volume"). The subcommand only
+#     ever passes the volume IDs it found attached to its OWN
+#     instance id — three independent gates.
+# Without it: the release path logs "AccessDenied" at shutdown and the
+#             daily orphan sweep (untagged+unattached census) remains
+#             the only reclaim — with up to 24h of billing per leak.
+data "aws_iam_policy_document" "node_volume_release" {
+  for_each = { for role in local.node_roles : role => role if contains(["writer", "reader"], role) }
+
+  statement {
+    sid    = "FindOwnVolumes"
+    effect = "Allow"
+
+    actions   = ["ec2:DescribeVolumes"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "ReleaseOwnVolumes"
+    effect = "Allow"
+
+    actions = [
+      "ec2:DetachVolume",
+      "ec2:DeleteVolume",
+    ]
+
+    # This deployment's volumes only: ASG-created volume IDs are
+    # unknowable at policy time, so scope to the region's volume
+    # namespace and gate on the NodeType tag the launch templates
+    # stamp on every fleet volume. The tag condition keeps the grant
+    # inert for anything else in the account; the subcommand adds
+    # its own gate (it only ever passes the volume IDs it found
+    # attached to its OWN instance id).
+    resources = ["arn:aws:ec2:${data.aws_region.current.name}:*:volume/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/NodeType"
+      values   = [each.key]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "node_volume_release" {
+  for_each = { for role in local.node_roles : role => role if contains(["writer", "reader"], role) }
+
+  name   = "volume-release"
+  role   = aws_iam_role.node[each.key].id
+  policy = data.aws_iam_policy_document.node_volume_release[each.key].json
+}
+
 resource "aws_iam_role_policy" "node_self_heal" {
   for_each = { for role in local.node_roles : role => role }
 

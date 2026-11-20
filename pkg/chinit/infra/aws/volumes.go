@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
+	awsapi "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
@@ -72,12 +72,12 @@ func (g *VolumeGrower) DescribeOwnVolume(ctx context.Context, req port.VolumeGro
 		return nil, fmt.Errorf("volume grower: instance id required")
 	}
 	filters := []types.Filter{{
-		Name:   aws.String("attachment.instance-id"),
+		Name:   awsapi.String("attachment.instance-id"),
 		Values: []string{req.InstanceID},
 	}}
 	if req.Device != "" {
 		filters = append(filters, types.Filter{
-			Name:   aws.String("attachment.device"),
+			Name:   awsapi.String("attachment.device"),
 			Values: []string{req.Device},
 		})
 	}
@@ -89,8 +89,8 @@ func (g *VolumeGrower) DescribeOwnVolume(ctx context.Context, req port.VolumeGro
 		return nil, fmt.Errorf("no volume attached to %s at %s", req.InstanceID, req.Device)
 	}
 	return &port.VolumeInfo{
-		VolumeID:   aws.ToString(out.Volumes[0].VolumeId),
-		SizeGB:     aws.ToInt32(out.Volumes[0].Size),
+		VolumeID:   awsapi.ToString(out.Volumes[0].VolumeId),
+		SizeGB:     awsapi.ToInt32(out.Volumes[0].Size),
 		AttachedTo: req.InstanceID,
 	}, nil
 }
@@ -114,12 +114,12 @@ func (g *VolumeGrower) GrowVolume(ctx context.Context, volumeID string, targetSi
 	if len(cur.Volumes) == 0 {
 		return false, fmt.Errorf("volume %s not found", volumeID)
 	}
-	if aws.ToInt32(cur.Volumes[0].Size) >= targetSizeGB {
+	if awsapi.ToInt32(cur.Volumes[0].Size) >= targetSizeGB {
 		return false, nil // already big enough
 	}
 	_, err = c.ModifyVolume(ctx, &ec2.ModifyVolumeInput{
-		VolumeId: aws.String(volumeID),
-		Size:     aws.Int32(targetSizeGB),
+		VolumeId: awsapi.String(volumeID),
+		Size:     awsapi.Int32(targetSizeGB),
 	})
 	if err != nil {
 		// IncorrectModificationState (volume OPTIMIZING) is the

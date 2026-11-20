@@ -81,6 +81,12 @@ type Boot struct {
 	// the hostnamectl/hostname sequence — best-effort by design); tests
 	// inject a recorder so specs never rename the machine they run on.
 	SetHostname func(ctx context.Context, hostname string) error
+
+	// PersistVolumes is called by the track_own_volumes step with this
+	// node's own non-root volume IDs: the app wires it to the engine's
+	// VolumesPersister so the shutdown volume-release path always has
+	// a fallback list in state.json. Nil (tests) = no persistence.
+	PersistVolumes func([]string)
 }
 
 // StaticHostname derives writer-N, keeper-N, or backup-0 from the private

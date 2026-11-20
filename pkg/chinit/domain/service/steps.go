@@ -106,6 +106,17 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 				return err
 			}),
 
+			// 4b. Record this node's own volumes (writers/readers):
+			// the state file carries the IDs the shutdown
+			// volume-release path needs when live cloud discovery
+			// cannot run mid-teardown. Critical with phase 1's
+			// contract (every child the phase depends on); the
+			// release path re-discovers live first and falls back
+			// to this list only when the cloud API is unreachable.
+			StepFunc("track_own_volumes", Critical, apiRetry, func(ctx context.Context) error {
+				return b.trackOwnVolumes(ctx)
+			}),
+
 			// 6. Identity settles BEFORE any render (the ip-* macro bug:
 			// ASG members must claim their ordinal before macros render). The
 			// claimer is an optional capability — static identity (keepers,
@@ -175,6 +186,13 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		// settles so any termination during or after boot releases the
 		// node's ordinal lease and DNS record.
 		StepFunc("install_shutdown_drain", Critical, onceFatal, b.installShutdownDrain),
+
+		// 10c. Install the volume-release unit (writers/readers): the
+		// dying node deletes its OWN stateless volumes after the drain,
+		// inside the same systemd shutdown transaction. Critical for
+		// the same reason as the drain unit — a node that boots without
+		// the release path re-creates the orphan-volume leak class.
+		StepFunc("install_volume_release", Critical, onceFatal, b.installVolumeRelease),
 
 		// 11. Start clickhouse-server (CRITICAL; keepers skip inside).
 		StepFunc("start_clickhouse", Critical, onceFatal, b.startClickhouse),
