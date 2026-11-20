@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stackgenhq/chinit/pkg/chinit/domain/model"
 	"github.com/stackgenhq/chinit/pkg/chinit/domain/port"
 	"github.com/stackgenhq/chinit/pkg/chinit/logger"
 )
@@ -88,7 +87,7 @@ type volumeReleaseCoordinator struct {
 // resolve the release list (live discovery, state fallback), release
 // each volume best-effort.
 func (c *volumeReleaseCoordinator) run(ctx context.Context) error {
-	if !model.Role(c.state.Identity.Role).HasStatelessVolumes() {
+	if !c.state.Identity.Role.HasStatelessVolumes() {
 		// The role gate: keepers and the backup replica re-attach
 		// standalone persistent volumes across replacements —
 		// releasing them would be data loss by design.
