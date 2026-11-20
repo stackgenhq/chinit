@@ -699,14 +699,24 @@ data "aws_iam_policy_document" "node_volume_release" {
       "ec2:DeleteVolume",
     ]
 
-    # This deployment's volumes only: ASG-created volume IDs are
-    # unknowable at policy time, so scope to the region's volume
-    # namespace and gate on the NodeType tag the launch templates
-    # stamp on every fleet volume. The tag condition keeps the grant
-    # inert for anything else in the account; the subcommand adds
-    # its own gate (it only ever passes the volume IDs it found
-    # attached to its OWN instance id).
-    resources = ["arn:aws:ec2:${data.aws_region.current.name}:*:volume/*"]
+    # Two ARN shapes because the two actions authorize differently:
+    # - DeleteVolume evaluates against the VOLUME ARN (scoped to this
+    #   deployment's volume namespace; ASG-created volume IDs are
+    #   unknowable at policy time).
+    # - DetachVolume evaluates against the INSTANCE ARN (the API
+    #   authorizes the detach on the volume's ATTACHMENT — the
+    #   instance the volume hangs off), so the instance namespace
+    #   must be in scope too. A volume-only statement leaves the
+    #   detach dead: the release path 403s on DetachVolume and the
+    #   volumes never release.
+    # The NodeType tag condition gates BOTH shapes (the launch
+    # templates stamp it on instances and volumes alike); the
+    # subcommand adds its own gate — it only ever passes the volume
+    # IDs it found attached to its OWN instance id.
+    resources = [
+      "arn:aws:ec2:${data.aws_region.current.name}:*:volume/*",
+      "arn:aws:ec2:${data.aws_region.current.name}:*:instance/*",
+    ]
 
     condition {
       test     = "StringEquals"
